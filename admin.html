@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BlockFork Admin</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07101f;
+      --panel: rgba(11, 19, 36, 0.92);
+      --panel-strong: rgba(16, 25, 47, 0.98);
+      --line: rgba(140, 160, 255, 0.18);
+      --text: #f4f7ff;
+      --muted: #9aa8cb;
+      --accent: #7ec8ff;
+      --success: #7ef0b0;
+      --danger: #ff8da1;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(126, 200, 255, 0.12), transparent 35%),
+        linear-gradient(180deg, #06101d 0%, #09111f 100%);
+      color: var(--text);
+    }
+
+    .wrap {
+      width: min(1200px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .brand {
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+
+    .muted { color: var(--muted); }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: var(--panel);
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+    }
+
+    .hero {
+      padding: 22px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr 1fr 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    input, button {
+      font: inherit;
+    }
+
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      outline: none;
+    }
+
+    input:focus {
+      border-color: rgba(126, 200, 255, 0.55);
+      box-shadow: 0 0 0 3px rgba(126, 200, 255, 0.12);
+    }
+
+    button {
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 16px;
+      background: linear-gradient(180deg, #95abff, #7ec8ff);
+      color: #09111f;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .button-secondary {
+      background: rgba(255,255,255,0.08);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .status {
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .grid {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .card {
+      padding: 18px;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    .card .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .card .value {
+      margin-top: 10px;
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .section {
+      margin-top: 18px;
+      padding: 18px;
+    }
+
+    .filters {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr auto;
+      gap: 10px;
+      align-items: end;
+      margin-bottom: 14px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 12px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      font-size: 13px;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      font-size: 12px;
+    }
+
+    .pill.success { color: var(--success); }
+    .pill.danger { color: var(--danger); }
+    .pill.neutral { color: var(--accent); }
+
+    .table-wrap {
+      overflow: auto;
+    }
+
+    .footnote {
+      margin-top: 12px;
+      font-size: 12px;
+    }
+
+    @media (max-width: 960px) {
+      .grid, .controls, .filters {
+        grid-template-columns: 1fr 1fr;
+      }
+      .controls button, .filters button {
+        grid-column: span 2;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+      .controls, .filters {
+        grid-template-columns: 1fr;
+      }
+      .controls button, .filters button {
+        grid-column: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <div class="brand">BlockFork Admin</div>
+        <div class="muted">Internal billing and request observability</div>
+      </div>
+      <div class="pill neutral">/admin</div>
+    </div>
+
+    <section class="panel hero">
+      <div class="controls">
+        <label>
+          Admin Secret
+          <input id="secret" type="password" placeholder="Shared secret from the server env" />
+        </label>
+        <label>
+          Session ID
+          <input id="sessionId" type="text" placeholder="Optional filter" />
+        </label>
+        <label>
+          From
+          <input id="fromDate" type="datetime-local" />
+        </label>
+        <label>
+          To
+          <input id="toDate" type="datetime-local" />
+        </label>
+        <button id="saveSecret" type="button" class="button-secondary">Save Secret</button>
+      </div>
+      <div class="status" id="status">Enter the shared secret to load usage data.</div>
+    </section>
+
+    <section class="grid" aria-label="Billing summary">
+      <article class="card">
+        <div class="label">Total Credits</div>
+        <div class="value" id="totalCredits">$0.00</div>
+      </article>
+      <article class="card">
+        <div class="label">Used</div>
+        <div class="value" id="usedCredits">$0.00</div>
+      </article>
+      <article class="card">
+        <div class="label">Remaining</div>
+        <div class="value" id="remainingCredits">$0.00</div>
+      </article>
+      <article class="card">
+        <div class="label">% Used</div>
+        <div class="value" id="percentUsed">0%</div>
+      </article>
+    </section>
+
+    <section class="panel section">
+      <div class="filters">
+        <label>
+          Status
+          <input id="statusFilter" type="text" placeholder="success, failed, rejected" />
+        </label>
+        <label>
+          Limit
+          <input id="limit" type="number" min="1" max="250" value="50" />
+        </label>
+        <label>
+          Offset
+          <input id="offset" type="number" min="0" value="0" />
+        </label>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Request</th>
+              <th>Session</th>
+              <th>Route</th>
+              <th>Primary</th>
+              <th>Model</th>
+              <th>Fallback</th>
+              <th>Reason</th>
+              <th>In</th>
+              <th>Out</th>
+              <th>Cost</th>
+              <th>Status</th>
+              <th>HTTP</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody id="logRows">
+            <tr><td colspan="13" class="muted">No data loaded yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="footnote muted" id="requestCount"></div>
+    </section>
+  </div>
+
+  <script>
+    const secretEl = document.getElementById('secret');
+    const sessionIdEl = document.getElementById('sessionId');
+    const fromDateEl = document.getElementById('fromDate');
+    const toDateEl = document.getElementById('toDate');
+    const statusFilterEl = document.getElementById('statusFilter');
+    const limitEl = document.getElementById('limit');
+    const offsetEl = document.getElementById('offset');
+    const statusEl = document.getElementById('status');
+    const totalCreditsEl = document.getElementById('totalCredits');
+    const usedCreditsEl = document.getElementById('usedCredits');
+    const remainingCreditsEl = document.getElementById('remainingCredits');
+    const percentUsedEl = document.getElementById('percentUsed');
+    const logRowsEl = document.getElementById('logRows');
+    const requestCountEl = document.getElementById('requestCount');
+
+    const STORAGE_KEY = 'blockfork_admin_secret';
+
+    function money(value) {
+      return `$${Number(value || 0).toFixed(2)}`;
+    }
+
+    function getSecret() {
+      return secretEl.value.trim() || localStorage.getItem(STORAGE_KEY) || '';
+    }
+
+    function authHeaders() {
+      const secret = getSecret();
+      return secret ? { 'x-admin-secret': secret } : {};
+    }
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+    }
+
+    function formatValue(value) {
+      if (value === null || value === undefined || value === '') {
+        return '—';
+      }
+      return String(value);
+    }
+
+    function renderRows(rows) {
+      if (!rows.length) {
+        logRowsEl.innerHTML = '<tr><td colspan="13" class="muted">No matching requests.</td></tr>';
+        return;
+      }
+
+      logRowsEl.innerHTML = rows.map((row) => {
+        const statusClass = row.status === 'success'
+          ? 'success'
+          : row.status === 'failed'
+            ? 'danger'
+          : row.status === 'rejected'
+            ? 'danger'
+            : 'neutral';
+        return `
+          <tr>
+            <td>${formatValue(row.timestamp)}</td>
+            <td><code>${formatValue(row.request_id)}</code></td>
+            <td><code>${formatValue(row.session_id)}</code></td>
+            <td>${formatValue(row.route)}</td>
+            <td>${formatValue(row.primary_model)}</td>
+            <td>${formatValue(row.model_used)}</td>
+            <td>${formatValue(Number(row.fallback_triggered) ? 'yes' : 'no')}</td>
+            <td>${formatValue(row.failure_reason)}</td>
+            <td>${formatValue(row.input_tokens)}</td>
+            <td>${formatValue(row.output_tokens)}</td>
+            <td>${money(row.estimated_cost_usd)}</td>
+            <td><span class="pill ${statusClass}">${formatValue(row.status)}</span></td>
+            <td>${formatValue(row.status_code)}</td>
+            <td>${formatValue(row.error_code)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url, { headers: authHeaders() });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error?.message || payload?.error || 'Request failed');
+      }
+      return payload;
+    }
+
+    async function loadSummary() {
+      const summary = await fetchJson('/admin/api/summary');
+      totalCreditsEl.textContent = money(summary.total_credits_usd);
+      usedCreditsEl.textContent = money(summary.used_usd);
+      remainingCreditsEl.textContent = money(summary.remaining_usd);
+      percentUsedEl.textContent = `${Number(summary.percent_used || 0).toFixed(1)}%`;
+    }
+
+    function buildRequestUrl() {
+      const params = new URLSearchParams();
+      if (sessionIdEl.value.trim()) params.set('session_id', sessionIdEl.value.trim());
+      if (fromDateEl.value) params.set('from', new Date(fromDateEl.value).toISOString());
+      if (toDateEl.value) params.set('to', new Date(toDateEl.value).toISOString());
+      if (statusFilterEl.value.trim()) params.set('status', statusFilterEl.value.trim());
+      params.set('limit', limitEl.value || '50');
+      params.set('offset', offsetEl.value || '0');
+      return `/admin/api/requests?${params.toString()}`;
+    }
+
+    async function loadRequests() {
+      const payload = await fetchJson(buildRequestUrl());
+      renderRows(payload.data || []);
+      requestCountEl.textContent = `${payload.count || 0} request rows shown.`;
+    }
+
+    async function refresh() {
+      const secret = getSecret();
+      if (!secret) {
+        setStatus('Enter the shared secret before loading data.', true);
+        return;
+      }
+      localStorage.setItem(STORAGE_KEY, secret);
+      secretEl.value = secret;
+      try {
+        setStatus('Loading admin data...');
+        await Promise.all([loadSummary(), loadRequests()]);
+        setStatus('Admin data loaded.');
+      } catch (error) {
+        setStatus(error.message || 'Unable to load admin data.', true);
+      }
+    }
+
+    document.getElementById('saveSecret').addEventListener('click', () => {
+      const secret = secretEl.value.trim();
+      if (secret) {
+        localStorage.setItem(STORAGE_KEY, secret);
+        setStatus('Shared secret saved locally in this browser.');
+        refresh();
+      }
+    });
+
+    document.getElementById('refresh').addEventListener('click', refresh);
+    [sessionIdEl, fromDateEl, toDateEl, statusFilterEl, limitEl, offsetEl].forEach((el) => {
+      el.addEventListener('change', () => refresh());
+    });
+
+    const savedSecret = localStorage.getItem(STORAGE_KEY);
+    if (savedSecret) {
+      secretEl.value = savedSecret;
+      refresh();
+    }
+  </script>
+</body>
+</html>

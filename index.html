@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BlockFork Compute — AI Session Runtime</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="page-bg"></div>
+  <div class="ambient ambient-left"></div>
+  <div class="ambient ambient-right"></div>
+
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a class="brand" href="/" aria-label="BlockFork home">
+        <span class="brand-icon">⚡</span>
+        <span class="brand-text">BlockFork Compute</span>
+      </a>
+      <div class="header-note">AI Session Runtime</div>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero section-pad">
+      <div class="container hero-shell panel">
+        <div class="hero-copy">
+          <p class="eyebrow">Plug-and-play AI runtime</p>
+          <h1>Run an AI backend in seconds.</h1>
+          <p class="hero-text">Start a session, copy the endpoint, and plug it into your tool. No APIs. No setup.</p>
+          <p class="hero-support">For OpenClaw, LangChain, agents, and custom AI tools.</p>
+
+          <div class="hero-actions">
+            <button id="start-session" class="btn btn-primary">Start Session</button>
+            <button id="view-example" class="btn btn-ghost" type="button">View Example</button>
+          </div>
+
+          <div class="hero-inline-status">
+            <span id="hero-status-dot" class="status-dot status-idle"></span>
+            <span id="hero-status">No live session yet. Click once and we will guide the rest.</span>
+          </div>
+        </div>
+
+        <div class="hero-preview">
+          <div class="preview-window">
+            <div class="preview-bar">
+              <span></span><span></span><span></span>
+            </div>
+            <div class="preview-lines">
+              <p>1. Start Session</p>
+              <p>2. Copy endpoint</p>
+              <p>3. Paste into your tool</p>
+              <p>4. Test instantly</p>
+            </div>
+            <div class="preview-card">
+              <div class="preview-label">Ready in under 30 seconds</div>
+              <div class="preview-endpoint">/session/&lt;id&gt;/v1/chat/completions</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="live-session" class="section-pad panel-section is-hidden" aria-live="polite">
+      <div class="container live-shell">
+        <div class="section-heading">
+          <p class="eyebrow">Live session panel</p>
+          <h2>Your runtime is ready.</h2>
+          <p>Everything you need is below. Copy it, test it, and move on.</p>
+        </div>
+
+        <div class="dashboard-grid">
+          <article class="panel dashboard-card glow-card">
+            <div class="card-head">
+              <div>
+                <p class="card-kicker">Section 1</p>
+                <h3>Status</h3>
+              </div>
+              <span class="badge badge-live"><span class="status-dot status-live"></span>Session Live</span>
+            </div>
+            <div class="status-grid">
+              <div class="status-block">
+                <span class="status-label">Time remaining</span>
+                <strong id="countdown">60:00</strong>
+              </div>
+              <div class="status-block">
+                <span class="status-label">Connection</span>
+                <strong id="session-state">Ready</strong>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel dashboard-card">
+            <div class="card-head">
+              <div>
+                <p class="card-kicker">Section 2</p>
+                <h3>Connect your tool</h3>
+              </div>
+            </div>
+            <div class="field-list">
+              <div class="field-row">
+                <div class="field-copy">
+                  <span class="field-label">Base URL</span>
+                  <code id="base-url">Not started</code>
+                </div>
+                <button class="copy-btn" data-copy-target="base-url" type="button">Copy</button>
+              </div>
+
+              <div class="field-row">
+                <div class="field-copy">
+                  <span class="field-label">API Key</span>
+                  <code id="api-key">Not started</code>
+                </div>
+                <button class="copy-btn" data-copy-target="api-key" type="button">Copy</button>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <article id="usage-guide" class="panel guide-card">
+          <div class="card-head">
+            <div>
+              <p class="card-kicker">Section 3</p>
+              <h3>Use in your tool</h3>
+            </div>
+          </div>
+
+          <div class="tab-bar" role="tablist" aria-label="Usage examples">
+            <button class="tab-btn is-active" type="button" data-tab="curl" role="tab" aria-selected="true">cURL</button>
+            <button class="tab-btn" type="button" data-tab="sdk" role="tab" aria-selected="false">OpenAI SDK</button>
+            <button class="tab-btn" type="button" data-tab="langchain" role="tab" aria-selected="false">LangChain</button>
+          </div>
+
+          <div class="tab-panels">
+            <section class="tab-panel is-active" data-panel="curl" role="tabpanel">
+              <div class="snippet-head">
+                <p>Paste this into your terminal and you are live.</p>
+                <button class="copy-btn" data-copy-target="curl-snippet" type="button">Copy All</button>
+              </div>
+              <pre id="curl-snippet" class="snippet"></pre>
+            </section>
+
+            <section class="tab-panel" data-panel="sdk" role="tabpanel" hidden>
+              <div class="snippet-head">
+                <p>Use the OpenAI SDK with your session endpoint as the base URL.</p>
+                <button class="copy-btn" data-copy-target="sdk-snippet" type="button">Copy All</button>
+              </div>
+              <pre id="sdk-snippet" class="snippet"></pre>
+            </section>
+
+            <section class="tab-panel" data-panel="langchain" role="tabpanel" hidden>
+              <div class="snippet-head">
+                <p>Drop the same session into LangChain and start invoking immediately.</p>
+                <button class="copy-btn" data-copy-target="langchain-snippet" type="button">Copy All</button>
+              </div>
+              <pre id="langchain-snippet" class="snippet"></pre>
+            </section>
+          </div>
+        </article>
+
+        <article class="panel test-card">
+          <div class="card-head">
+            <div>
+              <p class="card-kicker">Section 4</p>
+              <h3>Test your session</h3>
+            </div>
+          </div>
+
+          <form id="test-form" class="test-form">
+            <label class="sr-only" for="test-input">Test your AI session</label>
+            <input id="test-input" name="prompt" type="text" autocomplete="off" placeholder="Type something..." />
+            <button id="run-test" class="btn btn-primary" type="submit">Run Test →</button>
+          </form>
+
+          <div class="response-shell">
+            <div class="response-head">
+              <span>Response</span>
+              <span id="response-state" class="response-state">Waiting for your first prompt.</span>
+            </div>
+            <div id="response-output" class="response-output">Hello! I'm running from your session.</div>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      sessionId: '',
+      endpoint: '',
+      apiKey: '',
+      expiresAt: '',
+      countdownTimer: null,
+      activeTab: 'curl'
+    };
+
+    const startButton = document.getElementById('start-session');
+    const viewExampleButton = document.getElementById('view-example');
+    const liveSession = document.getElementById('live-session');
+    const heroStatus = document.getElementById('hero-status');
+    const heroStatusDot = document.getElementById('hero-status-dot');
+    const sessionStateEl = document.getElementById('session-state');
+    const countdownEl = document.getElementById('countdown');
+    const baseUrlEl = document.getElementById('base-url');
+    const apiKeyEl = document.getElementById('api-key');
+    const responseOutputEl = document.getElementById('response-output');
+    const responseStateEl = document.getElementById('response-state');
+    const testForm = document.getElementById('test-form');
+    const testInput = document.getElementById('test-input');
+    const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
+    const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
+    const copyButtons = Array.from(document.querySelectorAll('.copy-btn'));
+
+    function formatCountdown(expiresAt) {
+      const remainingMs = Math.max(0, new Date(expiresAt).getTime() - Date.now());
+      const totalSeconds = Math.floor(remainingMs / 1000);
+      const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+      const seconds = String(totalSeconds % 60).padStart(2, '0');
+      return `${minutes}:${seconds}`;
+    }
+
+    function updateCountdown() {
+      if (!state.expiresAt) {
+        countdownEl.textContent = '60:00';
+        sessionStateEl.textContent = state.sessionId ? 'Live' : 'Ready';
+        return;
+      }
+
+      countdownEl.textContent = formatCountdown(state.expiresAt);
+
+      if (new Date(state.expiresAt).getTime() <= Date.now()) {
+        clearInterval(state.countdownTimer);
+        heroStatus.textContent = 'Session expired. Start a new one to continue.';
+        responseStateEl.textContent = 'Session expired.';
+        sessionStateEl.textContent = 'Expired';
+      }
+    }
+
+    function buildSnippets() {
+      const endpoint = state.endpoint || 'http://127.0.0.1:3000/session/your-session-id';
+      const apiKey = state.apiKey || 'sk_sess_your_api_key';
+      const model = 'managed';
+      const curlSnippet = `curl ${endpoint}/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{\n    "model": "${model}",\n    "messages": [{"role": "user", "content": "Hello"}]\n  }'`;
+
+      const sdkSnippet = `import OpenAI from "openai";\n\nconst client = new OpenAI({\n  apiKey: "${apiKey}",\n  baseURL: "${endpoint}/v1"\n});\n\nconst completion = await client.chat.completions.create({\n  model: "${model}",\n  messages: [{ role: "user", content: "Hello" }]\n});\n\nconsole.log(completion.choices[0].message.content);`;
+
+      const langchainSnippet = `import { ChatOpenAI } from "@langchain/openai";\n\nconst model = new ChatOpenAI({\n  apiKey: "${apiKey}",\n  model: "${model}",\n  configuration: {\n    baseURL: "${endpoint}/v1"\n  }\n});\n\nconst response = await model.invoke("Hello");\nconsole.log(response.content);`;
+
+      document.getElementById('curl-snippet').textContent = curlSnippet;
+      document.getElementById('sdk-snippet').textContent = sdkSnippet;
+      document.getElementById('langchain-snippet').textContent = langchainSnippet;
+    }
+
+    function revealSessionPanel() {
+      liveSession.classList.remove('is-hidden');
+      requestAnimationFrame(() => liveSession.classList.add('is-visible'));
+    }
+
+    function setSession(session) {
+      state.sessionId = session.session_id;
+      state.endpoint = session.endpoint;
+      state.apiKey = session.api_key;
+      state.expiresAt = session.expires_at;
+
+      baseUrlEl.textContent = session.endpoint;
+      apiKeyEl.textContent = session.api_key;
+      sessionStateEl.textContent = 'Live';
+      updateCountdown();
+      buildSnippets();
+      revealSessionPanel();
+
+      heroStatus.textContent = 'Session live. Copy the endpoint, paste it into your tool, or test it below.';
+      heroStatusDot.classList.remove('status-idle');
+      heroStatusDot.classList.add('status-live');
+
+      clearInterval(state.countdownTimer);
+      state.countdownTimer = setInterval(updateCountdown, 1000);
+    }
+
+    async function copyText(text, button) {
+      await navigator.clipboard.writeText(text);
+      const previous = button.textContent;
+      button.textContent = 'Copied ✓';
+      setTimeout(() => {
+        button.textContent = previous.includes('All') ? 'Copy All' : 'Copy';
+      }, 1400);
+    }
+
+    async function handleCopy(event) {
+      const button = event.currentTarget;
+      const targetId = button.dataset.copyTarget;
+      const target = document.getElementById(targetId);
+      const text = target ? target.textContent : '';
+      if (!text) {
+        return;
+      }
+
+      try {
+        await copyText(text, button);
+      } catch (error) {
+        button.textContent = 'Copy failed';
+        setTimeout(() => {
+          button.textContent = button.textContent.includes('All') ? 'Copy All' : 'Copy';
+        }, 1400);
+      }
+    }
+
+    function setActiveTab(tabName) {
+      state.activeTab = tabName;
+      tabButtons.forEach((button) => {
+        const isActive = button.dataset.tab === tabName;
+        button.classList.toggle('is-active', isActive);
+        button.setAttribute('aria-selected', String(isActive));
+      });
+
+      tabPanels.forEach((panel) => {
+        const isActive = panel.dataset.panel === tabName;
+        panel.classList.toggle('is-active', isActive);
+        panel.hidden = !isActive;
+      });
+    }
+
+    async function startSession() {
+      startButton.disabled = true;
+      heroStatus.textContent = 'Creating session...';
+
+      try {
+        const response = await fetch('/session', { method: 'POST' });
+        const payload = await response.json();
+
+        if (!response.ok) {
+          throw new Error(payload.error || 'Failed to create session');
+        }
+
+        setSession(payload);
+        liveSession.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (error) {
+        heroStatus.textContent = error.message;
+      } finally {
+        startButton.disabled = false;
+      }
+    }
+
+    async function readStreamingResponse(stream) {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let combined = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n');
+        buffer = parts.pop() || '';
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) {
+            continue;
+          }
+
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') {
+            continue;
+          }
+
+          try {
+            const parsed = JSON.parse(payload);
+            const delta = parsed?.choices?.[0]?.delta?.content;
+            if (typeof delta === 'string') {
+              combined += delta;
+              responseOutputEl.textContent = combined;
+            }
+          } catch (error) {
+            // Ignore partial stream data.
+          }
+        }
+      }
+
+      return combined;
+    }
+
+    async function runTest(event) {
+      event.preventDefault();
+
+      if (!state.sessionId || !state.apiKey) {
+        heroStatus.textContent = 'Start a session first.';
+        return;
+      }
+
+      const prompt = testInput.value.trim();
+      if (!prompt) {
+        testInput.focus();
+        return;
+      }
+
+      const runButton = document.getElementById('run-test');
+      runButton.disabled = true;
+      responseStateEl.textContent = 'Streaming response...';
+      responseOutputEl.textContent = 'Thinking';
+      responseOutputEl.classList.add('is-loading');
+
+      try {
+        const response = await fetch(`${state.endpoint}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${state.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'managed',
+            messages: [{ role: 'user', content: prompt }],
+            stream: true
+          })
+        });
+
+        if (!response.ok || !response.body) {
+          const payload = await response.text();
+          throw new Error(payload || 'Test request failed');
+        }
+
+        responseOutputEl.textContent = '';
+        const combined = await readStreamingResponse(response.body);
+        responseOutputEl.textContent = combined || 'No response content returned.';
+        responseStateEl.textContent = 'Session responded successfully.';
+        responseOutputEl.classList.remove('is-loading');
+      } catch (error) {
+        responseOutputEl.classList.remove('is-loading');
+        responseOutputEl.textContent = 'Unable to complete the test request.';
+        responseStateEl.textContent = error.message;
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    viewExampleButton.addEventListener('click', () => {
+      revealSessionPanel();
+      heroStatus.textContent = state.sessionId
+        ? 'Session live. Copy the endpoint, paste it into your tool, or test it below.'
+        : 'Previewing the exact setup flow. Start a session when you are ready.';
+      document.getElementById('usage-guide').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    startButton.addEventListener('click', startSession);
+    testForm.addEventListener('submit', runTest);
+    tabButtons.forEach((button) => button.addEventListener('click', () => setActiveTab(button.dataset.tab)));
+    copyButtons.forEach((button) => button.addEventListener('click', handleCopy));
+
+    buildSnippets();
+  </script>
+</body>
+</html>

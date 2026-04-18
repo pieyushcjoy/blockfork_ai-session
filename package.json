@@ -1,0 +1,16 @@
+{
+  "name": "blockfork-ai-session-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "sql.js": "^1.14.1"
+  },
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "smoke:test": "bash smoke-test.sh"
+  }
+}
