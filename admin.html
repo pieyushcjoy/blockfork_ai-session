@@ -203,6 +203,33 @@
       font-size: 12px;
     }
 
+    .codebox {
+      margin-top: 12px;
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: pre-wrap;
+      overflow-x: auto;
+    }
+
+    .livekey-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .livekey-item {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
     @media (max-width: 960px) {
       .grid, .controls, .filters {
         grid-template-columns: 1fr 1fr;
@@ -280,6 +307,26 @@
     <section class="panel section">
       <div class="filters">
         <label>
+          Live Key User ID
+          <input id="liveKeyUserId" type="text" placeholder="Optional owner for a new sk_live_* key" />
+        </label>
+        <label>
+          Budget Limit
+          <input id="liveKeyBudget" type="number" min="0" step="0.01" placeholder="Optional budget limit" />
+        </label>
+        <button id="mintLiveKey" type="button">Mint Live Key</button>
+        <button id="backfillLiveKeys" type="button" class="button-secondary">Backfill Active Sessions</button>
+      </div>
+      <div class="codebox" id="liveKeyResult">Mint or backfill live keys to see the response here.</div>
+      <div class="filters" style="margin-top: 16px;">
+        <button id="refreshLiveKeys" type="button" class="button-secondary">Refresh Live Keys</button>
+      </div>
+      <div class="livekey-list" id="liveKeyList"></div>
+    </section>
+
+    <section class="panel section">
+      <div class="filters">
+        <label>
           Status
           <input id="statusFilter" type="text" placeholder="success, failed, rejected" />
         </label>
@@ -331,6 +378,10 @@
     const statusFilterEl = document.getElementById('statusFilter');
     const limitEl = document.getElementById('limit');
     const offsetEl = document.getElementById('offset');
+    const liveKeyUserIdEl = document.getElementById('liveKeyUserId');
+    const liveKeyBudgetEl = document.getElementById('liveKeyBudget');
+    const liveKeyResultEl = document.getElementById('liveKeyResult');
+    const liveKeyListEl = document.getElementById('liveKeyList');
     const statusEl = document.getElementById('status');
     const totalCreditsEl = document.getElementById('totalCredits');
     const usedCreditsEl = document.getElementById('usedCredits');
@@ -410,6 +461,22 @@
       return payload;
     }
 
+    async function postJson(url, body = {}) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error?.message || payload?.error || 'Request failed');
+      }
+      return payload;
+    }
+
     async function loadSummary() {
       const summary = await fetchJson('/admin/api/summary');
       totalCreditsEl.textContent = money(summary.total_credits_usd);
@@ -433,6 +500,63 @@
       const payload = await fetchJson(buildRequestUrl());
       renderRows(payload.data || []);
       requestCountEl.textContent = `${payload.count || 0} request rows shown.`;
+    }
+
+    function renderLiveKeys(rows) {
+      if (!rows.length) {
+        liveKeyListEl.innerHTML = '<div class="livekey-item">No live keys loaded yet.</div>';
+        return;
+      }
+
+      liveKeyListEl.innerHTML = rows.map((row) => `
+        <div class="livekey-item">
+          <div><strong>${formatValue(row.key)}</strong></div>
+          <div>ID: ${formatValue(row.id)}</div>
+          <div>User: ${formatValue(row.user_id)}</div>
+          <div>Created: ${formatValue(row.created_at)}</div>
+          <div>Last session: ${formatValue(row.last_session_id)}</div>
+          <div>Budget: ${formatValue(row.budget_limit)}</div>
+        </div>
+      `).join('');
+    }
+
+    async function loadLiveKeys() {
+      const payload = await fetchJson('/admin/api/live-keys');
+      renderLiveKeys(payload.data || []);
+    }
+
+    async function mintLiveKey() {
+      const userId = liveKeyUserIdEl.value.trim();
+      const budgetValue = liveKeyBudgetEl.value.trim();
+      const body = {};
+      if (userId) {
+        body.user_id = userId;
+      }
+      if (budgetValue !== '') {
+        body.budget_limit = Number(budgetValue);
+      }
+
+      try {
+        setStatus('Minting live key...');
+        const payload = await postJson('/admin/api/live-keys', body);
+        liveKeyResultEl.textContent = JSON.stringify(payload, null, 2);
+        setStatus('Live key minted.');
+      } catch (error) {
+        setStatus(error.message || 'Unable to mint live key.', true);
+      }
+    }
+
+    async function backfillLiveKeys() {
+      try {
+        setStatus('Backfilling live keys...');
+        const payload = await postJson('/admin/api/live-keys/backfill', {});
+        liveKeyResultEl.textContent = JSON.stringify(payload, null, 2);
+        setStatus(`Backfill completed. Created ${Number(payload.created_count || 0)} live keys.`);
+        await loadLiveKeys();
+        await refresh();
+      } catch (error) {
+        setStatus(error.message || 'Unable to backfill live keys.', true);
+      }
     }
 
     async function refresh() {
@@ -462,6 +586,17 @@
     });
 
     document.getElementById('refresh').addEventListener('click', refresh);
+    document.getElementById('mintLiveKey').addEventListener('click', mintLiveKey);
+    document.getElementById('backfillLiveKeys').addEventListener('click', backfillLiveKeys);
+    document.getElementById('refreshLiveKeys').addEventListener('click', async () => {
+      try {
+        setStatus('Loading live keys...');
+        await loadLiveKeys();
+        setStatus('Live keys loaded.');
+      } catch (error) {
+        setStatus(error.message || 'Unable to load live keys.', true);
+      }
+    });
     [sessionIdEl, fromDateEl, toDateEl, statusFilterEl, limitEl, offsetEl].forEach((el) => {
       el.addEventListener('change', () => refresh());
     });
@@ -470,6 +605,7 @@
     if (savedSecret) {
       secretEl.value = savedSecret;
       refresh();
+      loadLiveKeys().catch(() => {});
     }
   </script>
 </body>

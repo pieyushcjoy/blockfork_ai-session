@@ -240,17 +240,17 @@
     }
 
     function buildSnippets() {
-      const endpoint = state.endpoint || 'http://127.0.0.1:3000/session/your-session-id';
-      const apiKey = state.apiKey || 'sk_sess_your_api_key';
+      const baseUrl = state.endpoint || 'http://127.0.0.1:3000/v1';
+      const apiKey = state.apiKey || 'sk_live_your_api_key';
       const model = 'managed';
-      const curlSnippet = `curl ${endpoint}/v1/chat/completions \\
+      const curlSnippet = `curl ${baseUrl}/chat/completions \\
   -H "Authorization: Bearer ${apiKey}" \\
   -H "Content-Type: application/json" \\
   -d '{\n    "model": "${model}",\n    "messages": [{"role": "user", "content": "Hello"}]\n  }'`;
 
-      const sdkSnippet = `import OpenAI from "openai";\n\nconst client = new OpenAI({\n  apiKey: "${apiKey}",\n  baseURL: "${endpoint}/v1"\n});\n\nconst completion = await client.chat.completions.create({\n  model: "${model}",\n  messages: [{ role: "user", content: "Hello" }]\n});\n\nconsole.log(completion.choices[0].message.content);`;
+      const sdkSnippet = `import OpenAI from "openai";\n\nconst client = new OpenAI({\n  apiKey: "${apiKey}",\n  baseURL: "${baseUrl}"\n});\n\nconst completion = await client.chat.completions.create({\n  model: "${model}",\n  messages: [{ role: "user", content: "Hello" }]\n});\n\nconsole.log(completion.choices[0].message.content);`;
 
-      const langchainSnippet = `import { ChatOpenAI } from "@langchain/openai";\n\nconst model = new ChatOpenAI({\n  apiKey: "${apiKey}",\n  model: "${model}",\n  configuration: {\n    baseURL: "${endpoint}/v1"\n  }\n});\n\nconst response = await model.invoke("Hello");\nconsole.log(response.content);`;
+      const langchainSnippet = `import { ChatOpenAI } from "@langchain/openai";\n\nconst model = new ChatOpenAI({\n  apiKey: "${apiKey}",\n  model: "${model}",\n  configuration: {\n    baseURL: "${baseUrl}"\n  }\n});\n\nconst response = await model.invoke("Hello");\nconsole.log(response.content);`;
 
       document.getElementById('curl-snippet').textContent = curlSnippet;
       document.getElementById('sdk-snippet').textContent = sdkSnippet;
@@ -264,12 +264,12 @@
 
     function setSession(session) {
       state.sessionId = session.session_id;
-      state.endpoint = session.endpoint;
-      state.apiKey = session.api_key;
+      state.endpoint = session.base_url || session.baseUrl || `${session.endpoint}/v1`;
+      state.apiKey = session.public_api_key || session.publicApiKey || session.api_key;
       state.expiresAt = session.expires_at;
 
-      baseUrlEl.textContent = session.endpoint;
-      apiKeyEl.textContent = session.api_key;
+      baseUrlEl.textContent = session.base_url || session.baseUrl || `${session.endpoint}/v1`;
+      apiKeyEl.textContent = session.public_api_key || session.publicApiKey || session.api_key;
       sessionStateEl.textContent = 'Live';
       updateCountdown();
       buildSnippets();
@@ -411,7 +411,7 @@
       responseOutputEl.classList.add('is-loading');
 
       try {
-        const response = await fetch(`${state.endpoint}/v1/chat/completions`, {
+        const response = await fetch(`${state.endpoint}/chat/completions`, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${state.apiKey}`,

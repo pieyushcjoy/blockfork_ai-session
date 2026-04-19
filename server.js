@@ -17,6 +17,15 @@ const OPENROUTER_CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
 const BLOCKFORK_ADMIN_SECRET = process.env.BLOCKFORK_ADMIN_SECRET || '';
 const SESSION_TTL_MS = 4 * 60 * 60 * 1000;
+const SESSION_TTL_OPTIONS = new Map([
+  ['30m', 30 * 60 * 1000],
+  ['1h', 60 * 60 * 1000],
+  ['2h', 2 * 60 * 60 * 1000],
+  ['4h', 4 * 60 * 60 * 1000],
+  ['8h', 8 * 60 * 60 * 1000],
+]);
+const DEFAULT_SESSION_TTL_SELECTED = '4h';
+const DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED = '1h';
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const NON_STREAM_TIMEOUT_MS = 8 * 1000;
 const STREAM_ESTABLISH_TIMEOUT_MS = 8 * 1000;
@@ -85,10 +94,16 @@ const MODEL_MAP = Object.freeze({
 
 const sessions = new Map();
 const sessionsByApiKey = new Map();
+const liveKeysByApiKey = new Map();
+const liveKeysById = new Map();
+const liveKeyCreateLocks = new Map();
+const LIVE_KEY_PREFIX = 'sk_live_';
+const SESSION_KEY_PREFIX = 'sk_sess_';
 const publicDir = __dirname;
 const UPSTREAM_ERROR_BODY_LIMIT_BYTES = 2 * 1024;
 const ADMIN_SECRET_HEADER = 'x-admin-secret';
 const PUBLIC_MODEL_ALIAS = DEFAULT_MODEL_IDENTIFIER;
+const RUNTIME_DISCOVERY_LIVE_KEY_USER_ID = 'blockfork-runtime-discovery';
 
 let sqlPromise = null;
 let billingDb = null;
@@ -194,12 +209,350 @@ function parseBearerToken(headerValue) {
   return token;
 }
 
+function isSessionKeyToken(token) {
+  return typeof token === 'string' && token.startsWith(SESSION_KEY_PREFIX);
+}
+
+function isLiveKeyToken(token) {
+  return typeof token === 'string' && token.startsWith(LIVE_KEY_PREFIX);
+}
+
 function getPublicBaseUrl(req) {
   return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
 }
 
 function getSessionBaseUrl(req) {
   return `${getPublicBaseUrl(req)}/v1`;
+}
+
+function normalizeSessionTtlSelection(ttlSelected = DEFAULT_SESSION_TTL_SELECTED) {
+  const raw = String(ttlSelected || '').trim().toLowerCase();
+  if (SESSION_TTL_OPTIONS.has(raw)) {
+    return raw;
+  }
+
+  return DEFAULT_SESSION_TTL_SELECTED;
+}
+
+function toIsoTimestamp(value, fallbackMs = Date.now()) {
+  if (value === null || value === undefined || value === '') {
+    return new Date(fallbackMs).toISOString();
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return new Date(numeric).toISOString();
+  }
+
+  const parsed = new Date(value);
+  if (Number.isFinite(parsed.getTime())) {
+    return parsed.toISOString();
+  }
+
+  return new Date(fallbackMs).toISOString();
+}
+
+function getSessionTtlMs(ttlSelected = DEFAULT_SESSION_TTL_SELECTED) {
+  return SESSION_TTL_OPTIONS.get(normalizeSessionTtlSelection(ttlSelected)) || SESSION_TTL_OPTIONS.get(DEFAULT_SESSION_TTL_SELECTED);
+}
+
+function normalizeSessionTtlInput(overrides = {}) {
+  if (Object.prototype.hasOwnProperty.call(overrides, 'ttl_selected')) {
+    return normalizeSessionTtlSelection(overrides.ttl_selected);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(overrides, 'ttl')) {
+    return normalizeSessionTtlSelection(overrides.ttl);
+  }
+
+  return DEFAULT_SESSION_TTL_SELECTED;
+}
+
+function buildLiveKeyRecord(overrides = {}) {
+  const now = Date.now();
+  const liveKeyId = String(overrides.id || crypto.randomUUID());
+  const key = String(overrides.key || `${LIVE_KEY_PREFIX}${crypto.randomBytes(24).toString('hex')}`);
+
+  if (!key.startsWith(LIVE_KEY_PREFIX)) {
+    throw new Error('Invalid live key prefix');
+  }
+
+  return {
+    id: liveKeyId,
+    key,
+    user_id: overrides.user_id || null,
+    created_at: new Date(Number.isFinite(Number(overrides.created_at)) ? Number(overrides.created_at) : now).toISOString(),
+    last_session_id: overrides.last_session_id || null,
+    budget_limit: Number.isFinite(Number(overrides.budget_limit)) ? Number(overrides.budget_limit) : null,
+  };
+}
+
+function hydrateLiveKeyFromStored(liveKeyRow) {
+  if (!liveKeyRow) {
+    return null;
+  }
+
+  const liveKey = {
+    id: String(liveKeyRow.id || ''),
+    key: String(liveKeyRow.key || ''),
+    user_id: liveKeyRow.user_id || null,
+    created_at: toIsoTimestamp(liveKeyRow.created_at),
+    last_session_id: liveKeyRow.last_session_id || null,
+    budget_limit: liveKeyRow.budget_limit === null || liveKeyRow.budget_limit === undefined
+      ? null
+      : Number(liveKeyRow.budget_limit),
+  };
+
+  liveKeysById.set(liveKey.id, liveKey);
+  liveKeysByApiKey.set(liveKey.key, liveKey);
+  return liveKey;
+}
+
+async function persistLiveKeyRecord(liveKey, db = null) {
+  const runInsert = (database) => {
+    const insert = database.prepare(`
+      INSERT OR REPLACE INTO live_keys (
+        id, key, user_id, created_at, last_session_id, budget_limit
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      liveKey.id,
+      liveKey.key,
+      liveKey.user_id || null,
+      new Date(liveKey.created_at).getTime(),
+      liveKey.last_session_id || null,
+      liveKey.budget_limit === null || liveKey.budget_limit === undefined || liveKey.budget_limit === ''
+        ? null
+        : Number(liveKey.budget_limit),
+    ]);
+    insert.free();
+    return true;
+  };
+
+  if (db) {
+    return runInsert(db);
+  }
+
+  return withBillingWrite(async (database) => runInsert(database));
+}
+
+async function createLiveKeyRecord(overrides = {}) {
+  const liveKey = buildLiveKeyRecord(overrides);
+  await persistLiveKeyRecord(liveKey);
+  return hydrateLiveKeyFromStored(liveKey);
+}
+
+async function linkLiveKeyToSession(db, sessionId, liveKeyId, sessionUserId = null) {
+  const update = db.prepare(`
+    UPDATE sessions
+    SET linked_live_key_id = ?, user_id = COALESCE(user_id, ?)
+    WHERE session_id = ?
+  `);
+  update.run([liveKeyId, sessionUserId, sessionId]);
+  update.free();
+  return true;
+}
+
+async function mintLiveKeyForUser(overrides = {}) {
+  const liveKey = buildLiveKeyRecord({
+    user_id: overrides.user_id || null,
+    last_session_id: overrides.last_session_id || null,
+    budget_limit: overrides.budget_limit,
+  });
+  await persistLiveKeyRecord(liveKey);
+  return hydrateLiveKeyFromStored(liveKey);
+}
+
+async function attachLiveKeyToSession(sessionInput, overrides = {}) {
+  const db = await ensureBillingDb();
+  const sessionId = typeof sessionInput === 'string' ? sessionInput : String(sessionInput?.session_id || '');
+  if (!sessionId) {
+    return null;
+  }
+
+  return withBillingWrite(async (database) => {
+    const freshSessionRow = await getStoredSessionById(database, sessionId);
+    if (!freshSessionRow) {
+      return null;
+    }
+
+    if (freshSessionRow.linked_live_key_id) {
+      const existingLiveKey = await getStoredLiveKeyById(database, String(freshSessionRow.linked_live_key_id));
+      if (existingLiveKey) {
+        return hydrateLiveKeyFromStored(existingLiveKey);
+      }
+    }
+
+    const liveKey = buildLiveKeyRecord({
+      user_id: overrides.user_id || freshSessionRow.user_id || null,
+      budget_limit: overrides.budget_limit,
+      last_session_id: freshSessionRow.session_id,
+    });
+    await persistLiveKeyRecord(liveKey, database);
+    await linkLiveKeyToSession(database, freshSessionRow.session_id, liveKey.id, freshSessionRow.user_id || liveKey.user_id || null);
+
+    const cachedSession = sessions.get(freshSessionRow.session_id);
+    if (cachedSession) {
+      cachedSession.linked_live_key_id = liveKey.id;
+      if (!cachedSession.user_id) {
+        cachedSession.user_id = freshSessionRow.user_id || liveKey.user_id || null;
+      }
+    }
+
+    return hydrateLiveKeyFromStored(liveKey);
+  });
+}
+
+async function backfillLiveKeysForActiveSessions() {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare(`
+    SELECT *
+    FROM sessions
+    WHERE status = 'active'
+  `);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject());
+  }
+  stmt.free();
+
+  const created = [];
+  for (const row of rows) {
+    if (row.linked_live_key_id) {
+      continue;
+    }
+
+    const liveKey = await attachLiveKeyToSession(row);
+    if (liveKey) {
+      created.push({
+        session_id: String(row.session_id || ''),
+        live_key_id: liveKey.id,
+        live_key: liveKey.key,
+        user_id: liveKey.user_id || null,
+      });
+    }
+  }
+
+  return {
+    created_count: created.length,
+    created,
+  };
+}
+
+async function getOrCreateLiveKeyForSession(sessionInput, overrides = {}) {
+  const sessionId = typeof sessionInput === 'string' ? sessionInput : String(sessionInput?.session_id || '');
+  if (!sessionId) {
+    return null;
+  }
+
+  const db = await ensureBillingDb();
+  const sessionRow = typeof sessionInput === 'string'
+    ? await getStoredSessionById(db, sessionId)
+    : sessionInput;
+
+  if (!sessionRow) {
+    return null;
+  }
+
+  if (sessionRow.linked_live_key_id) {
+    const liveKeyRow = await getStoredLiveKeyById(db, String(sessionRow.linked_live_key_id));
+    if (liveKeyRow) {
+      return hydrateLiveKeyFromStored(liveKeyRow);
+    }
+  }
+
+  return attachLiveKeyToSession(sessionRow, overrides);
+}
+
+async function getStoredLiveKeyByApiKey(db, apiKey) {
+  const stmt = db.prepare('SELECT * FROM live_keys WHERE key = ? LIMIT 1');
+  stmt.bind([apiKey]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+async function getStoredLiveKeyById(db, id) {
+  const stmt = db.prepare('SELECT * FROM live_keys WHERE id = ? LIMIT 1');
+  stmt.bind([id]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+async function getStoredLiveKeyByUserId(db, userId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM live_keys
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+  stmt.bind([userId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+async function getActiveSessionByLiveKeyId(db, liveKeyId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM sessions
+    WHERE linked_live_key_id = ? AND expires_at > ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+  stmt.bind([liveKeyId, Date.now()]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+async function loadPersistedLiveKeyByApiKey(apiKey) {
+  const db = await ensureBillingDb();
+  const liveKeyRow = await getStoredLiveKeyByApiKey(db, apiKey);
+  return hydrateLiveKeyFromStored(liveKeyRow);
+}
+
+async function loadPersistedSessionByLiveKeyId(liveKeyId) {
+  const db = await ensureBillingDb();
+  const sessionRow = await getActiveSessionByLiveKeyId(db, liveKeyId);
+  if (!sessionRow) {
+    return null;
+  }
+
+  const sessionState = await getSessionState(db, String(sessionRow.session_id || ''));
+  return hydrateSessionFromStored(sessionRow, sessionState);
+}
+
+async function preloadLiveKeys() {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare('SELECT * FROM live_keys');
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject());
+  }
+  stmt.free();
+
+  for (const row of rows) {
+    hydrateLiveKeyFromStored(row);
+  }
 }
 
 function getSessionStatus(session) {
@@ -326,7 +679,7 @@ function cacheSessionRecord(session) {
 function buildSessionRecord(overrides = {}) {
   const now = Date.now();
   const sessionId = crypto.randomUUID();
-  const apiKey = `sk_sess_${crypto.randomBytes(24).toString('hex')}`;
+  const apiKey = `${SESSION_KEY_PREFIX}${crypto.randomBytes(24).toString('hex')}`;
   const provider = overrides.provider || DEFAULT_PROVIDER;
 
   if (provider !== 'openrouter') {
@@ -356,9 +709,15 @@ function buildSessionRecord(overrides = {}) {
     upstream_api_key: OPENROUTER_API_KEY,
     default_model_alias: defaultModelAlias,
     allowed_model_aliases: allowedModelAliases,
+    user_id: overrides.user_id || null,
+    linked_live_key_id: overrides.linked_live_key_id || null,
+    ttl_selected: normalizeSessionTtlInput(overrides),
+    ttl_ms: Number.isFinite(Number(overrides.ttl_ms)) ? Number(overrides.ttl_ms) : getSessionTtlMs(normalizeSessionTtlInput(overrides)),
     status: 'active',
     token_usage: 0,
-    session_budget_usd: MAX_PER_SESSION_USD,
+    session_budget_usd: Number.isFinite(Number(overrides.session_budget_usd))
+      ? Number(overrides.session_budget_usd)
+      : MAX_PER_SESSION_USD,
     session_spend_usd: 0,
     session_reserved_usd: 0,
     request_count: 0,
@@ -367,7 +726,7 @@ function buildSessionRecord(overrides = {}) {
     rate_window_started_at: new Date(now).toISOString(),
     rate_window_count: 0,
     created_at: new Date(now).toISOString(),
-    expires_at: new Date(now + SESSION_TTL_MS).toISOString(),
+    expires_at: new Date(now + (Number.isFinite(Number(overrides.ttl_ms)) ? Number(overrides.ttl_ms) : getSessionTtlMs(normalizeSessionTtlInput(overrides)))).toISOString(),
     capability_contract: null,
     capability_contract_validated_at: null,
     capability_contract_expires_at: null,
@@ -400,6 +759,10 @@ function hydrateSessionFromStored(sessionRow, sessionState = null) {
     upstream_api_key: OPENROUTER_API_KEY,
     default_model_alias: String(sessionRow.default_model_alias || PUBLIC_MODEL_ALIAS),
     allowed_model_aliases: allowedModelAliases,
+    user_id: sessionRow.user_id || null,
+    linked_live_key_id: sessionRow.linked_live_key_id || null,
+    ttl_selected: normalizeSessionTtlSelection(sessionRow.ttl_selected || DEFAULT_SESSION_TTL_SELECTED),
+    ttl_ms: Number(sessionRow.ttl_ms || SESSION_TTL_MS),
     status: String(sessionRow.status || 'active'),
     token_usage: Number(sessionRow.token_usage || 0),
     session_budget_usd: Number(sessionState?.budget_usd ?? MAX_PER_SESSION_USD),
@@ -418,13 +781,13 @@ function hydrateSessionFromStored(sessionRow, sessionState = null) {
   });
 }
 
-async function persistSessionRecord(session) {
-  return withBillingWrite(async (db) => {
-    const insert = db.prepare(`
+async function persistSessionRecord(session, db = null) {
+  const runInsert = (database) => {
+    const insert = database.prepare(`
       INSERT OR REPLACE INTO sessions (
-        session_id, api_key, created_at, expires_at, status, provider,
-        default_model_alias, allowed_model_aliases_json, token_usage
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        session_id, api_key, created_at, expires_at, status, provider, user_id, linked_live_key_id,
+        ttl_selected, ttl_ms, default_model_alias, allowed_model_aliases_json, token_usage
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     insert.run([
       session.session_id,
@@ -433,13 +796,23 @@ async function persistSessionRecord(session) {
       new Date(session.expires_at).getTime(),
       session.status,
       session.provider,
+      session.user_id || null,
+      session.linked_live_key_id || null,
+      normalizeSessionTtlSelection(session.ttl_selected || DEFAULT_SESSION_TTL_SELECTED),
+      Number.isFinite(Number(session.ttl_ms)) ? Number(session.ttl_ms) : getSessionTtlMs(session.ttl_selected || DEFAULT_SESSION_TTL_SELECTED),
       session.default_model_alias,
       JSON.stringify(session.allowed_model_aliases || [PUBLIC_MODEL_ALIAS]),
       Number(session.token_usage || 0),
     ]);
     insert.free();
     return true;
-  });
+  };
+
+  if (db) {
+    return runInsert(db);
+  }
+
+  return withBillingWrite(async (database) => runInsert(database));
 }
 
 async function createSessionRecord(overrides = {}) {
@@ -449,10 +822,10 @@ async function createSessionRecord(overrides = {}) {
   return cacheSessionRecord(session);
 }
 
-async function registerSessionState(session) {
-  return withBillingWrite(async (db) => {
+async function registerSessionState(session, db = null) {
+  const runInsert = (database) => {
     const now = getTimestamp();
-    const insert = db.prepare(`
+    const insert = database.prepare(`
       INSERT OR REPLACE INTO session_state (
         session_id, budget_usd, spent_usd, reserved_usd, request_count, rate_window_started_at,
         rate_window_count, max_requests_per_minute, rate_limit_window_ms, created_at, updated_at
@@ -473,7 +846,13 @@ async function registerSessionState(session) {
     ]);
     insert.free();
     return true;
-  });
+  };
+
+  if (db) {
+    return runInsert(db);
+  }
+
+  return withBillingWrite(async (database) => runInsert(database));
 }
 
 async function getSessionState(db, sessionId) {
@@ -490,6 +869,17 @@ async function getSessionState(db, sessionId) {
 async function getStoredSessionByApiKey(db, apiKey) {
   const stmt = db.prepare('SELECT * FROM sessions WHERE api_key = ? LIMIT 1');
   stmt.bind([apiKey]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+async function getStoredSessionById(db, sessionId) {
+  const stmt = db.prepare('SELECT * FROM sessions WHERE session_id = ? LIMIT 1');
+  stmt.bind([sessionId]);
   let row = null;
   if (stmt.step()) {
     row = stmt.getAsObject();
@@ -522,6 +912,83 @@ async function loadPersistedSessionByApiKey(apiKey) {
   return hydrateSessionFromStored(sessionRow, sessionState);
 }
 
+async function getLatestStoredSessionForLiveKey(db, liveKeyId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM sessions
+    WHERE linked_live_key_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+  stmt.bind([liveKeyId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+async function withLiveKeyCreateLock(liveKeyId, callback) {
+  const previous = liveKeyCreateLocks.get(liveKeyId) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const queue = previous.then(() => current);
+  liveKeyCreateLocks.set(liveKeyId, queue);
+
+  await previous;
+  try {
+    return await callback();
+  } finally {
+    release();
+    if (liveKeyCreateLocks.get(liveKeyId) === queue) {
+      liveKeyCreateLocks.delete(liveKeyId);
+    }
+  }
+}
+
+function getSessionTtlSelectedFromRecord(sessionRow) {
+  if (!sessionRow) {
+    return DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED;
+  }
+
+  return normalizeSessionTtlSelection(sessionRow.ttl_selected || DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED);
+}
+
+function getSessionTtlMsFromSelected(ttlSelected) {
+  return getSessionTtlMs(normalizeSessionTtlSelection(ttlSelected || DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED));
+}
+
+async function createLiveKeySessionRecord(db, liveKeyRow, ttlSelected = DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED) {
+  const liveKey = hydrateLiveKeyFromStored(liveKeyRow);
+  const effectiveTtlSelected = normalizeSessionTtlSelection(ttlSelected || DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED);
+  const session = buildSessionRecord({
+    user_id: liveKey.user_id || null,
+    linked_live_key_id: liveKey.id,
+    ttl_selected: effectiveTtlSelected,
+    ttl_ms: getSessionTtlMsFromSelected(effectiveTtlSelected),
+  });
+
+  return withBillingWrite(async (database) => {
+    await persistSessionRecord(session, database);
+    await registerSessionState(session, database);
+
+    const updateLiveKey = database.prepare(`
+      UPDATE live_keys
+      SET last_session_id = ?
+      WHERE id = ?
+    `);
+    updateLiveKey.run([session.session_id, liveKey.id]);
+    updateLiveKey.free();
+
+    liveKey.last_session_id = session.session_id;
+    hydrateLiveKeyFromStored(liveKey);
+    return cacheSessionRecord(session);
+  });
+}
+
 async function preloadActiveSessions() {
   const db = await ensureBillingDb();
   const stmt = db.prepare(`
@@ -540,6 +1007,66 @@ async function preloadActiveSessions() {
     const sessionState = await getSessionState(db, String(row.session_id || ''));
     hydrateSessionFromStored(row, sessionState);
   }
+}
+
+async function resolveLiveKeySession(token, req = null) {
+  const db = await ensureBillingDb();
+  const liveKeyRow = await getStoredLiveKeyByApiKey(db, token);
+  if (!liveKeyRow) {
+    logJson('live_key_resolution', {
+      outcome: 'invalid_key',
+      token_prefix: LIVE_KEY_PREFIX,
+    });
+    return { error: { statusCode: 401, message: 'Invalid live key', type: 'authentication_error', code: 'invalid_live_key' } };
+  }
+
+  const liveKey = hydrateLiveKeyFromStored(liveKeyRow);
+  const sessionRow = await getActiveSessionByLiveKeyId(db, liveKey.id);
+
+  if (!sessionRow) {
+    return withLiveKeyCreateLock(liveKey.id, async () => {
+      const recheckedActiveSession = await getActiveSessionByLiveKeyId(db, liveKey.id);
+      if (recheckedActiveSession) {
+        const recheckedState = await getSessionState(db, String(recheckedActiveSession.session_id || ''));
+        const session = hydrateSessionFromStored(recheckedActiveSession, recheckedState);
+        logJson('live_key_resolution', {
+          outcome: 'resolved_after_lock',
+          live_key_id: liveKey.id,
+          live_key_last_session_id: liveKey.last_session_id || null,
+          session_id: session.session_id,
+          token_prefix: LIVE_KEY_PREFIX,
+          request_path: req?.path || '',
+        });
+        return { session };
+      }
+
+      const latestSessionRow = await getLatestStoredSessionForLiveKey(db, liveKey.id);
+      const ttlSelected = getSessionTtlSelectedFromRecord(latestSessionRow);
+      const session = await createLiveKeySessionRecord(db, liveKeyRow, ttlSelected);
+      logJson('live_key_resolution', {
+        outcome: 'created_session',
+        live_key_id: liveKey.id,
+        live_key_last_session_id: liveKey.last_session_id || null,
+        session_id: session.session_id,
+        ttl_selected: session.ttl_selected,
+        token_prefix: LIVE_KEY_PREFIX,
+        request_path: req?.path || '',
+      });
+      return { session };
+    });
+  }
+
+  const sessionState = await getSessionState(db, String(sessionRow.session_id || ''));
+  const session = hydrateSessionFromStored(sessionRow, sessionState);
+  logJson('live_key_resolution', {
+    outcome: 'resolved',
+    live_key_id: liveKey.id,
+    live_key_last_session_id: liveKey.last_session_id || null,
+    session_id: session.session_id,
+    token_prefix: LIVE_KEY_PREFIX,
+    request_path: req?.path || '',
+  });
+  return { session };
 }
 
 function incrementUsage(session, totalTokens) {
@@ -674,9 +1201,22 @@ async function ensureBillingDb() {
       expires_at INTEGER,
       status TEXT DEFAULT 'active',
       provider TEXT NOT NULL DEFAULT 'openrouter',
+      user_id TEXT,
+      linked_live_key_id TEXT,
+      ttl_selected TEXT NOT NULL DEFAULT '1h',
+      ttl_ms INTEGER NOT NULL DEFAULT 3600000,
       default_model_alias TEXT NOT NULL DEFAULT 'managed',
       allowed_model_aliases_json TEXT NOT NULL DEFAULT '["managed"]',
       token_usage INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS live_keys (
+      id TEXT PRIMARY KEY,
+      key TEXT UNIQUE NOT NULL,
+      user_id TEXT,
+      created_at INTEGER NOT NULL,
+      last_session_id TEXT,
+      budget_limit REAL
     );
 
     CREATE TABLE IF NOT EXISTS session_state (
@@ -762,6 +1302,26 @@ async function ensureBillingDb() {
     }
   }
 
+  const liveKeysColumnsStmt = billingDb.prepare('PRAGMA table_info(live_keys)');
+  const liveKeysColumns = new Set();
+  while (liveKeysColumnsStmt.step()) {
+    liveKeysColumns.add(String(liveKeysColumnsStmt.getAsObject().name || ''));
+  }
+  liveKeysColumnsStmt.free();
+
+  const liveKeysAlterations = [
+    ['user_id', 'TEXT'],
+    ['created_at', 'INTEGER NOT NULL DEFAULT 0'],
+    ['last_session_id', 'TEXT'],
+    ['budget_limit', 'REAL'],
+  ];
+
+  for (const [columnName, columnType] of liveKeysAlterations) {
+    if (!liveKeysColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE live_keys ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
   const sessionsColumnsStmt = billingDb.prepare('PRAGMA table_info(sessions)');
   const sessionsColumns = new Set();
   while (sessionsColumnsStmt.step()) {
@@ -771,6 +1331,10 @@ async function ensureBillingDb() {
 
   const sessionsAlterations = [
     ['provider', "TEXT NOT NULL DEFAULT 'openrouter'"],
+    ['user_id', 'TEXT'],
+    ['linked_live_key_id', 'TEXT'],
+    ['ttl_selected', "TEXT NOT NULL DEFAULT '1h'"],
+    ['ttl_ms', 'INTEGER NOT NULL DEFAULT 3600000'],
     ['default_model_alias', "TEXT NOT NULL DEFAULT 'managed'"],
     ['allowed_model_aliases_json', "TEXT NOT NULL DEFAULT '[\"managed\"]'"],
     ['token_usage', 'INTEGER NOT NULL DEFAULT 0'],
@@ -1229,6 +1793,43 @@ async function getAdminRequests(filters = {}) {
   return rows;
 }
 
+async function getAdminLiveKeys() {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare(`
+    SELECT id, key, user_id, created_at, last_session_id, budget_limit
+    FROM live_keys
+    ORDER BY created_at DESC
+  `);
+  const rows = [];
+  while (stmt.step()) {
+    const row = stmt.getAsObject();
+    rows.push({
+      id: String(row.id || ''),
+      key: String(row.key || ''),
+      user_id: row.user_id || null,
+      created_at: toIsoTimestamp(row.created_at),
+      last_session_id: row.last_session_id || null,
+      budget_limit: row.budget_limit === null || row.budget_limit === undefined || row.budget_limit === ''
+        ? null
+        : Number(row.budget_limit),
+    });
+  }
+  stmt.free();
+  return rows;
+}
+
+async function getOrCreateRuntimeDiscoveryLiveKey() {
+  const db = await ensureBillingDb();
+  const existing = await getStoredLiveKeyByUserId(db, RUNTIME_DISCOVERY_LIVE_KEY_USER_ID);
+  if (existing) {
+    return hydrateLiveKeyFromStored(existing);
+  }
+
+  return mintLiveKeyForUser({
+    user_id: RUNTIME_DISCOVERY_LIVE_KEY_USER_ID,
+  });
+}
+
 function requireAdminSecret(req, res, next) {
   if (!BLOCKFORK_ADMIN_SECRET) {
     return sendError(res, 401, 'Admin access is not configured', 'authentication_error', 'admin_not_configured');
@@ -1405,6 +2006,14 @@ async function getSessionFromBearer(req) {
     return { error: { statusCode: 401, message: 'Missing or invalid bearer token', type: 'authentication_error', code: 'invalid_session_key' } };
   }
 
+  if (isLiveKeyToken(token)) {
+    return resolveLiveKeySession(token, req);
+  }
+
+  if (!isSessionKeyToken(token)) {
+    return { error: { statusCode: 401, message: 'Missing or invalid bearer token', type: 'authentication_error', code: 'invalid_session_key' } };
+  }
+
   let session = sessionsByApiKey.get(token);
   if (!session) {
     session = await loadPersistedSessionByApiKey(token);
@@ -1469,13 +2078,17 @@ function buildRuntimePayload(session) {
   };
 }
 
-function buildSessionCreationPayload(req, session, preflight) {
+function buildSessionCreationPayload(req, session, preflight, liveKey = null) {
   const budget = buildSessionBudgetInfo(session);
+  const publicApiKey = String(liveKey?.key || session.public_api_key || session.publicApiKey || session.api_key || '');
+  const runtimeBaseUrl = getSessionBaseUrl(req);
 
   return {
     session_id: session.session_id,
     endpoint: getPublicBaseUrl(req),
+    base_url: runtimeBaseUrl,
     api_key: session.api_key,
+    public_api_key: publicApiKey,
     default_model: PUBLIC_MODEL_ALIAS,
     created_at: session.created_at,
     expires_at: session.expires_at,
@@ -1484,7 +2097,11 @@ function buildSessionCreationPayload(req, session, preflight) {
     session: {
       id: session.session_id,
       apiKey: session.api_key,
+      publicApiKey,
+      public_api_key: publicApiKey,
       endpoint: getPublicBaseUrl(req),
+      baseUrl: runtimeBaseUrl,
+      base_url: runtimeBaseUrl,
       defaultModel: PUBLIC_MODEL_ALIAS,
       createdAt: session.created_at,
       expiresAt: session.expires_at,
@@ -1492,6 +2109,21 @@ function buildSessionCreationPayload(req, session, preflight) {
       budget,
     },
     preflight,
+  };
+}
+
+function buildOpenClawConfigPayload(req, liveKey) {
+  return {
+    type: 'blockfork_connection_kit',
+    openai_compatible: {
+      base_url: getSessionBaseUrl(req),
+      api_key: liveKey.key,
+    },
+    instructions: [
+      'Set base_url in OpenClaw',
+      'Paste API key',
+      'Use model: managed',
+    ],
   };
 }
 
@@ -3184,6 +3816,26 @@ app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/v1', async (req, res) => {
+  try {
+    const liveKey = await getOrCreateRuntimeDiscoveryLiveKey();
+
+    return res.json({
+      type: 'blockfork_runtime',
+      connection: {
+        base_url: getSessionBaseUrl(req),
+        api_key: liveKey.key,
+        auth: 'bearer',
+        default_model: PUBLIC_MODEL_ALIAS,
+      },
+      usage: 'Set base_url to this URL, use the returned API key, and keep model set to managed',
+    });
+  } catch (error) {
+    console.error('Failed to build runtime descriptor', error);
+    return sendError(res, 500, 'Failed to build runtime descriptor', 'runtime_error', 'runtime_descriptor_failed');
+  }
+});
+
 app.get('/', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
@@ -3195,6 +3847,51 @@ app.get('/admin', (req, res) => {
 app.get('/admin/api/summary', requireAdminSecret, async (req, res) => {
   const summary = await getAdminSummary();
   res.json(summary);
+});
+
+app.post('/admin/api/live-keys', requireAdminSecret, async (req, res) => {
+  try {
+    const liveKey = await mintLiveKeyForUser({
+      user_id: typeof req.body?.user_id === 'string' && req.body.user_id.trim() ? req.body.user_id.trim() : null,
+      budget_limit: req.body?.budget_limit,
+      last_session_id: typeof req.body?.last_session_id === 'string' && req.body.last_session_id.trim() ? req.body.last_session_id.trim() : null,
+    });
+
+    return res.status(201).json({
+      id: liveKey.id,
+      key: liveKey.key,
+      user_id: liveKey.user_id || null,
+      created_at: liveKey.created_at,
+      last_session_id: liveKey.last_session_id || null,
+      budget_limit: liveKey.budget_limit,
+    });
+  } catch (error) {
+    console.error('Failed to mint live key', error);
+    return sendError(res, 500, 'Failed to mint live key', 'runtime_error', 'live_key_mint_failed');
+  }
+});
+
+app.post('/admin/api/live-keys/backfill', requireAdminSecret, async (req, res) => {
+  try {
+    const result = await backfillLiveKeysForActiveSessions();
+    return res.json(result);
+  } catch (error) {
+    console.error('Failed to backfill live keys', error);
+    return sendError(res, 500, 'Failed to backfill live keys', 'runtime_error', 'live_key_backfill_failed');
+  }
+});
+
+app.get('/admin/api/live-keys', requireAdminSecret, async (req, res) => {
+  try {
+    const liveKeys = await getAdminLiveKeys();
+    return res.json({
+      data: liveKeys,
+      count: liveKeys.length,
+    });
+  } catch (error) {
+    console.error('Failed to load live keys', error);
+    return sendError(res, 500, 'Failed to load live keys', 'runtime_error', 'live_keys_load_failed');
+  }
 });
 
 app.get('/admin/api/requests', requireAdminSecret, async (req, res) => {
@@ -3213,12 +3910,46 @@ app.get('/admin/api/requests', requireAdminSecret, async (req, res) => {
   });
 });
 
+app.get('/session/:id/openclaw-config.json', legacySessionAuth, async (req, res) => {
+  try {
+    const liveKey = await getOrCreateLiveKeyForSession(req.session, {
+      user_id: req.session.user_id || null,
+    });
+
+    if (!liveKey) {
+      return sendError(res, 404, 'Live key not found', 'invalid_request_error', 'live_key_not_found');
+    }
+
+    return res.json(buildOpenClawConfigPayload(req, liveKey));
+  } catch (error) {
+    console.error('Failed to build OpenClaw config', error);
+    return sendError(res, 500, 'Failed to build OpenClaw config', 'runtime_error', 'openclaw_config_failed');
+  }
+});
+
+app.get('/live/:key/openclaw-config.json', async (req, res) => {
+  try {
+    const liveKey = await loadPersistedLiveKeyByApiKey(String(req.params.key || ''));
+    if (!liveKey) {
+      return sendError(res, 404, 'Live key not found', 'invalid_request_error', 'live_key_not_found');
+    }
+
+    return res.json(buildOpenClawConfigPayload(req, liveKey));
+  } catch (error) {
+    console.error('Failed to build live key OpenClaw config', error);
+    return sendError(res, 500, 'Failed to build OpenClaw config', 'runtime_error', 'openclaw_config_failed');
+  }
+});
+
 async function handleSessionCreation(req, res) {
   try {
     const session = await createSessionRecord(req.body || {});
+    const liveKey = await getOrCreateLiveKeyForSession(session, {
+      user_id: session.user_id || null,
+    });
     const preflight = await evaluateCapabilityContract(req, session, { useCache: false });
 
-    return res.status(201).json(buildSessionCreationPayload(req, session, preflight));
+    return res.status(201).json(buildSessionCreationPayload(req, session, preflight, liveKey));
   } catch (error) {
     if (error.message.includes('Unknown model') || error.message.includes('Unsupported provider')) {
       return sendError(res, 400, error.message, 'invalid_request_error', 'invalid_session_config');
@@ -3298,6 +4029,7 @@ setInterval(cleanupExpiredSessions, CLEANUP_INTERVAL_MS).unref();
 
 async function startServer(port = PORT) {
   await ensureBillingDb();
+  await preloadLiveKeys();
   await preloadActiveSessions();
   return app.listen(port, HOST, () => {
     console.log(`BlockFork AI Session Runtime listening on http://${HOST}:${port}`);
@@ -3315,6 +4047,17 @@ module.exports = {
   app,
   sessions,
   sessionsByApiKey,
+  liveKeysByApiKey,
+  liveKeysById,
+  createLiveKeyRecord,
+  createLiveKeySessionRecord,
+  mintLiveKeyForUser,
+  attachLiveKeyToSession,
+  backfillLiveKeysForActiveSessions,
+  getOrCreateLiveKeyForSession,
+  loadPersistedLiveKeyByApiKey,
+  resolveLiveKeySession,
+  preloadLiveKeys,
   MODEL_MAP,
   startServer,
 };
