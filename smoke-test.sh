@@ -11,6 +11,21 @@ FORCE_REJECT="${FORCE_REJECT:-0}"
 EXPECT_FALLBACK="${EXPECT_FALLBACK:-0}"
 FAKE_MODEL="${FAKE_MODEL:-gpt-4}"
 PROMPT="${PROMPT:-Reply with one short sentence confirming the runtime is working.}"
+EXPECT_V1_DESCRIPTOR="${EXPECT_V1_DESCRIPTOR:-1}"
+
+resolve_live_key_session_id() {
+  local live_key="$1"
+  python3 -c 'import json, sys
+live_key = sys.argv[1]
+payload = json.load(sys.stdin)
+for row in payload.get("data", []):
+    if row.get("key") == live_key:
+        print(row.get("last_session_id", ""))
+        break
+else:
+    print("")
+' "$live_key"
+}
 
 if [[ -z "$ADMIN_SECRET" ]]; then
   echo "ADMIN_SECRET is required" >&2
@@ -63,10 +78,13 @@ assert_contains() {
 
 session_json="$(curl -sS -X POST "$BASE_URL$SESSION_CREATE_PATH" -H 'Content-Type: application/json' -d '{}')"
 session_id="$(printf '%s' "$session_json" | extract_json_field session_id)"
-api_key="$(printf '%s' "$session_json" | extract_json_field api_key)"
+session_api_key="$(printf '%s' "$session_json" | extract_json_field api_key)"
+public_api_key="$(printf '%s' "$session_json" | extract_json_field public_api_key)"
+api_key="${public_api_key:-$session_api_key}"
 default_model="$(printf '%s' "$session_json" | extract_json_field default_model)"
 session_budget_usd="$(printf '%s' "$session_json" | extract_json_field budget.usd)"
 session_expires_in="$(printf '%s' "$session_json" | extract_json_field expires_in)"
+session_base_url="$(printf '%s' "$session_json" | extract_json_field base_url)"
 
 assert_equals "$default_model" "managed" "Session default model should stay neutral"
 if [[ -z "$session_budget_usd" ]]; then
@@ -76,6 +94,26 @@ fi
 if [[ -z "$session_expires_in" ]]; then
   echo "FAIL: Session expiry missing from creation response" >&2
   exit 1
+fi
+if [[ -z "$api_key" ]]; then
+  echo "FAIL: Session auth key missing from creation response" >&2
+  exit 1
+fi
+
+if [[ "$EXPECT_V1_DESCRIPTOR" == "1" ]]; then
+  v1_json="$(curl -sS "$BASE_URL/v1")"
+  descriptor_base_url="$(printf '%s' "$v1_json" | extract_json_field connection.base_url)"
+  descriptor_api_key="$(printf '%s' "$v1_json" | extract_json_field connection.api_key)"
+  descriptor_model="$(printf '%s' "$v1_json" | extract_json_field connection.default_model)"
+
+  assert_equals "$descriptor_base_url" "$BASE_URL/v1" "GET /v1 should expose the runtime base URL"
+  assert_equals "$descriptor_model" "managed" "GET /v1 should expose the managed model alias"
+  if [[ -z "$descriptor_api_key" ]]; then
+    echo "FAIL: GET /v1 should expose a discovery live key" >&2
+    exit 1
+  fi
+
+  api_key="$descriptor_api_key"
 fi
 
 chat_payload_file="$(mktemp)"
@@ -176,6 +214,13 @@ else
 fi
 
 summary_json="$(curl -sS "$BASE_URL/admin/api/summary" -H "x-admin-secret: $ADMIN_SECRET")"
+if [[ "$EXPECT_V1_DESCRIPTOR" == "1" ]]; then
+  live_keys_json="$(curl -sS "$BASE_URL/admin/api/live-keys" -H "x-admin-secret: $ADMIN_SECRET")"
+  descriptor_session_id="$(printf '%s' "$live_keys_json" | resolve_live_key_session_id "$api_key")"
+  if [[ -n "$descriptor_session_id" ]]; then
+    session_id="$descriptor_session_id"
+  fi
+fi
 request_rows_json="$(curl -sS "$BASE_URL/admin/api/requests?session_id=$session_id&limit=20" -H "x-admin-secret: $ADMIN_SECRET")"
 
 summary_used="$(printf '%s' "$summary_json" | extract_json_field used_usd)"
