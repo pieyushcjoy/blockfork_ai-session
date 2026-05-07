@@ -11,6 +11,15 @@
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js",
-    "smoke:test": "bash smoke-test.sh"
+    "smoke:test": "bash smoke-test.sh",
+    "runtime:install": "bash scripts/runtime-ctl.sh install",
+    "runtime:start": "bash scripts/runtime-ctl.sh start",
+    "runtime:stop": "bash scripts/runtime-ctl.sh stop",
+    "runtime:restart": "bash scripts/runtime-ctl.sh restart",
+    "runtime:status": "bash scripts/runtime-ctl.sh status",
+    "runtime:logs": "bash scripts/runtime-ctl.sh logs",
+    "runtime:verify": "bash scripts/verify-runtime.sh",
+    "runtime:verify:ui": "bash scripts/verify-runtime.sh --with-ui",
+    "runtime:verify:integrity": "bash scripts/verify-api-integrity.sh"
   }
 }

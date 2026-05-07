@@ -15,6 +15,9 @@ const PORT = Number(process.env.PORT || 3100);
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
+const BLOCKFORK_LOCAL_BASE_URL = (process.env.BLOCKFORK_LOCAL_BASE_URL || '').trim().replace(/\/+$/, '');
+const BLOCKFORK_LOCAL_API_KEY = (process.env.BLOCKFORK_LOCAL_API_KEY || '').trim();
+const BLOCKFORK_LOCAL_MODEL = (process.env.BLOCKFORK_LOCAL_MODEL || '').trim();
 const BLOCKFORK_ADMIN_SECRET = process.env.BLOCKFORK_ADMIN_SECRET || '';
 const SESSION_TTL_MS = 4 * 60 * 60 * 1000;
 const SESSION_TTL_OPTIONS = new Map([
@@ -33,12 +36,75 @@ const STREAM_IDLE_TIMEOUT_MS = 15 * 1000;
 const CONTRACT_CACHE_TTL_MS = 60 * 1000;
 const DEFAULT_PROVIDER = process.env.BLOCKFORK_DEFAULT_PROVIDER || 'openrouter';
 const DEFAULT_MODEL_IDENTIFIER = process.env.BLOCKFORK_DEFAULT_MODEL || 'managed';
+// `managed` intentionally stays on the free Gemma route during the Mac mini phase.
 const DEFAULT_UPSTREAM_MODEL = 'google/gemma-4-31b-it:free';
-const FALLBACK_MODEL_IDENTIFIER = process.env.BLOCKFORK_FALLBACK_MODEL || 'openai/gpt-4o-mini';
+const FALLBACK_MODEL_IDENTIFIER = (process.env.BLOCKFORK_FALLBACK_MODEL || '').trim();
+const ENABLE_FALLBACK = /^(1|true|yes)$/i.test(process.env.BLOCKFORK_ENABLE_FALLBACK || '');
+const FALLBACK_REQUIRE_FREE = !/^(0|false|no)$/i.test(process.env.BLOCKFORK_FALLBACK_REQUIRE_FREE || '1');
+const PRIMARY_NON_STREAM_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_PRIMARY_NON_STREAM_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_PRIMARY_NON_STREAM_TIMEOUT_MS)
+    : 5000,
+);
+const PRIMARY_STREAM_ESTABLISH_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_PRIMARY_STREAM_ESTABLISH_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_PRIMARY_STREAM_ESTABLISH_TIMEOUT_MS)
+    : 5000,
+);
+const LOCAL_STREAM_ESTABLISH_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_STREAM_ESTABLISH_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_LOCAL_STREAM_ESTABLISH_TIMEOUT_MS)
+    : 20000,
+);
+const LOCAL_STREAM_IDLE_BEFORE_HEADERS_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_STREAM_IDLE_BEFORE_HEADERS_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_LOCAL_STREAM_IDLE_BEFORE_HEADERS_TIMEOUT_MS)
+    : 45000,
+);
+const LOCAL_STREAM_IDLE_AFTER_HEADERS_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_STREAM_IDLE_AFTER_HEADERS_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_LOCAL_STREAM_IDLE_AFTER_HEADERS_TIMEOUT_MS)
+    : 30000,
+);
+const LOCAL_NON_STREAM_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_NON_STREAM_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_LOCAL_NON_STREAM_TIMEOUT_MS)
+    : 30000,
+);
+const ENABLE_LOCAL_NON_STREAM_RETRY = !/^(0|false|no)$/i.test(process.env.BLOCKFORK_LOCAL_ENABLE_NON_STREAM_RETRY || '1');
+const ENABLE_LOCAL_PROFILE = !/^(0|false|no)$/i.test(process.env.BLOCKFORK_LOCAL_PROFILE_ENABLE || '1');
+const LOCAL_PROFILE_MAX_MESSAGES = Math.max(
+  4,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_PROFILE_MAX_MESSAGES))
+    ? Number(process.env.BLOCKFORK_LOCAL_PROFILE_MAX_MESSAGES)
+    : 48,
+);
+const ENABLE_LOCAL_WARMUP = /^(1|true|yes)$/i.test(process.env.BLOCKFORK_LOCAL_WARMUP_ENABLE || '');
+const LOCAL_WARMUP_INTERVAL_MS = Math.max(
+  10000,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_WARMUP_INTERVAL_MS))
+    ? Number(process.env.BLOCKFORK_LOCAL_WARMUP_INTERVAL_MS)
+    : 90000,
+);
+const LOCAL_WARMUP_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_LOCAL_WARMUP_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_LOCAL_WARMUP_TIMEOUT_MS)
+    : 12000,
+);
 const ALLOW_MODEL_OVERRIDE = /^(1|true|yes)$/i.test(process.env.BLOCKFORK_ALLOW_MODEL_OVERRIDE || '');
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
 const FORCE_PRIMARY_429 = !IS_PRODUCTION && /^(1|true|yes)$/i.test(process.env.BLOCKFORK_FORCE_PRIMARY_429 || '');
+const FORCE_PRIMARY_TIMEOUT = !IS_PRODUCTION && /^(1|true|yes)$/i.test(process.env.BLOCKFORK_FORCE_PRIMARY_TIMEOUT || '');
+const ENABLE_TEST_UPSTREAM_KEY_OVERRIDE = !IS_PRODUCTION
+  && /^(1|true|yes)$/i.test(process.env.BLOCKFORK_ENABLE_TEST_UPSTREAM_KEY_OVERRIDE || '');
 const MAX_CREDITS_USD = Number(process.env.MAX_CREDITS_USD || 10);
 const MAX_PER_SESSION_USD = Math.min(
   Number.isFinite(Number(process.env.MAX_PER_SESSION_USD)) ? Number(process.env.MAX_PER_SESSION_USD) : 1,
@@ -65,25 +131,31 @@ const DEFAULT_ALLOWED_MODELS = process.env.BLOCKFORK_ALLOWED_MODELS
   : [DEFAULT_MODEL_IDENTIFIER];
 
 const MODEL_MAP = Object.freeze({
+  // Public clients should keep using `managed`; alias routing is maintained server-side.
   managed: {
-    upstreamId: DEFAULT_UPSTREAM_MODEL,
+    providerId: BLOCKFORK_LOCAL_BASE_URL ? 'local_openai' : 'openrouter',
+    upstreamId: BLOCKFORK_LOCAL_MODEL || DEFAULT_UPSTREAM_MODEL,
+    fallbackAlias: FALLBACK_MODEL_IDENTIFIER || null,
     contextWindow: 262144,
     maxTokens: 8192,
     capabilities: ['chat'],
   },
   'bf/free-120b': {
+    providerId: 'openrouter',
     upstreamId: DEFAULT_UPSTREAM_MODEL,
     contextWindow: 262144,
     maxTokens: 8192,
     capabilities: ['chat'],
   },
   'bf/gemma-31b-free': {
+    providerId: 'openrouter',
     upstreamId: DEFAULT_UPSTREAM_MODEL,
     contextWindow: 262144,
     maxTokens: 8192,
     capabilities: ['chat'],
   },
   'openai/gpt-4o-mini': {
+    providerId: 'openrouter',
     upstreamId: 'openai/gpt-4o-mini',
     contextWindow: 128000,
     maxTokens: 16384,
@@ -179,6 +251,19 @@ function logUpstreamFailure(context, details = {}) {
   }, console.error);
 }
 
+function logRoutingDecision(event, payload = {}) {
+  logJson(event, payload);
+}
+
+function fallbackEventBase(requestId, primaryDescriptor, fallbackDescriptor, reason = '') {
+  return {
+    request_id: requestId,
+    primary_model: primaryDescriptor?.upstreamId || '',
+    fallback_model: fallbackDescriptor?.upstreamId || '',
+    reason,
+  };
+}
+
 function logStreamDiagnostics(context, details = {}) {
   logJson('stream_diagnostics', {
     ...context,
@@ -207,6 +292,33 @@ function parseBearerToken(headerValue) {
   }
 
   return token;
+}
+
+function resolveTestUpstreamKeyOverride(req) {
+  if (!ENABLE_TEST_UPSTREAM_KEY_OVERRIDE) {
+    return '';
+  }
+
+  const candidate = req.get('x-blockfork-test-upstream-key');
+  if (typeof candidate !== 'string') {
+    return '';
+  }
+
+  const trimmed = candidate.trim();
+  return trimmed || '';
+}
+
+function resolveTestPrimaryFailureMode(req) {
+  if (IS_PRODUCTION) {
+    return '';
+  }
+
+  const value = String(req.get('x-blockfork-test-primary-failure') || '').trim().toLowerCase();
+  if (value === '429' || value === 'timeout') {
+    return value;
+  }
+
+  return '';
 }
 
 function isSessionKeyToken(token) {
@@ -368,6 +480,8 @@ async function mintLiveKeyForUser(overrides = {}) {
 }
 
 async function attachLiveKeyToSession(sessionInput, overrides = {}) {
+  // Live keys are the stable auth surface for clients; they are mapped to short-lived
+  // session keys so we can rotate sessions without breaking caller configuration.
   const db = await ensureBillingDb();
   const sessionId = typeof sessionInput === 'string' ? sessionInput : String(sessionInput?.session_id || '');
   if (!sessionId) {
@@ -597,6 +711,57 @@ function getModelDescriptor(identifier) {
   return null;
 }
 
+function buildProviderRegistry() {
+  return {
+    openrouter: {
+      chatUrl: OPENROUTER_CHAT_URL,
+      modelsUrl: OPENROUTER_MODELS_URL,
+      apiKey: OPENROUTER_API_KEY,
+      requiresApiKey: true,
+      probeMethod: 'models',
+    },
+    local_openai: {
+      chatUrl: BLOCKFORK_LOCAL_BASE_URL ? `${BLOCKFORK_LOCAL_BASE_URL}/chat/completions` : '',
+      modelsUrl: BLOCKFORK_LOCAL_BASE_URL ? `${BLOCKFORK_LOCAL_BASE_URL}/models` : '',
+      apiKey: BLOCKFORK_LOCAL_API_KEY,
+      requiresApiKey: false,
+      probeMethod: 'models_optional',
+    },
+  };
+}
+
+function getDescriptorProviderId(descriptor) {
+  return descriptor?.providerId || DEFAULT_PROVIDER;
+}
+
+function isLocalProviderDescriptor(descriptor) {
+  return getDescriptorProviderId(descriptor) === 'local_openai';
+}
+
+function getRequestTimeoutMs(descriptor, isStreaming, attempt) {
+  if (isLocalProviderDescriptor(descriptor)) {
+    return isStreaming ? LOCAL_STREAM_ESTABLISH_TIMEOUT_MS : LOCAL_NON_STREAM_TIMEOUT_MS;
+  }
+
+  return attempt === 'primary'
+    ? (isStreaming ? PRIMARY_STREAM_ESTABLISH_TIMEOUT_MS : PRIMARY_NON_STREAM_TIMEOUT_MS)
+    : (isStreaming ? STREAM_ESTABLISH_TIMEOUT_MS : NON_STREAM_TIMEOUT_MS);
+}
+
+function getStreamIdleTimeouts(descriptor) {
+  if (isLocalProviderDescriptor(descriptor)) {
+    return {
+      beforeHeadersMs: LOCAL_STREAM_IDLE_BEFORE_HEADERS_TIMEOUT_MS,
+      afterHeadersMs: LOCAL_STREAM_IDLE_AFTER_HEADERS_TIMEOUT_MS,
+    };
+  }
+
+  return {
+    beforeHeadersMs: STREAM_IDLE_TIMEOUT_MS,
+    afterHeadersMs: STREAM_IDLE_TIMEOUT_MS,
+  };
+}
+
 function getDescriptorRatePer1K(descriptor) {
   return Number(descriptor?.ratePer1k ?? BILLING_RATE_PER_1K) || 0;
 }
@@ -607,7 +772,39 @@ function estimateCostForDescriptor(descriptor, inputTokens, outputTokens) {
 }
 
 function getFallbackModelDescriptor() {
-  return getModelDescriptor(FALLBACK_MODEL_IDENTIFIER);
+  if (!ENABLE_FALLBACK) {
+    return null;
+  }
+
+  if (!FALLBACK_MODEL_IDENTIFIER) {
+    return null;
+  }
+
+  const descriptor = getModelDescriptor(FALLBACK_MODEL_IDENTIFIER);
+  if (!descriptor) {
+    return null;
+  }
+
+  if (FALLBACK_REQUIRE_FREE && !String(descriptor.upstreamId || '').includes(':free')) {
+    return null;
+  }
+
+  return descriptor;
+}
+
+function getFallbackDescriptorForAlias(descriptor) {
+  if (!ENABLE_FALLBACK || !descriptor) {
+    return null;
+  }
+
+  if (descriptor.fallbackAlias) {
+    const aliasDescriptor = getModelDescriptor(descriptor.fallbackAlias);
+    if (aliasDescriptor) {
+      return aliasDescriptor;
+    }
+  }
+
+  return getFallbackModelDescriptor();
 }
 
 function isRetryableUpstreamStatus(status) {
@@ -682,7 +879,7 @@ function buildSessionRecord(overrides = {}) {
   const apiKey = `${SESSION_KEY_PREFIX}${crypto.randomBytes(24).toString('hex')}`;
   const provider = overrides.provider || DEFAULT_PROVIDER;
 
-  if (provider !== 'openrouter') {
+  if (!['openrouter', 'local_openai'].includes(provider)) {
     throw new Error(`Unsupported provider: ${provider}`);
   }
 
@@ -1844,8 +2041,9 @@ function requireAdminSecret(req, res, next) {
 }
 
 async function probeProviderAvailability(session) {
-  const providerConfig = getProviderConfig(session);
-  if (!providerConfig || !providerConfig.apiKey) {
+  const descriptor = getModelDescriptor(session.default_model_alias) || getModelDescriptor(PUBLIC_MODEL_ALIAS);
+  const providerConfig = getProviderConfig(session, descriptor);
+  if (!providerConfig || (providerConfig.requiresApiKey && !providerConfig.apiKey)) {
     return {
       status: 'fail',
       reason: 'runtime_not_ready',
@@ -1859,10 +2057,16 @@ async function probeProviderAvailability(session) {
   const timeout = setTimeout(() => controller.abort(), 3000);
 
   try {
-    const response = await fetch(OPENROUTER_MODELS_URL, {
+    if (!providerConfig.modelsUrl) {
+      return {
+        status: 'pass',
+      };
+    }
+
+    const response = await fetch(providerConfig.modelsUrl, {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${providerConfig.apiKey}`,
+        ...(providerConfig.apiKey ? { Authorization: `Bearer ${providerConfig.apiKey}` } : {}),
       },
       signal: controller.signal,
     });
@@ -2040,6 +2244,8 @@ async function getSessionFromBearer(req) {
 }
 
 async function canonicalSessionAuth(req, res, next) {
+  // Canonical auth accepts either a session key or a live key and always resolves to
+  // an active session record. This is the trust boundary for all /v1 proxy traffic.
   const { session, error } = await getSessionFromBearer(req);
   if (error) {
     return sendError(res, error.statusCode, error.message, error.type, error.code);
@@ -2113,6 +2319,8 @@ function buildSessionCreationPayload(req, session, preflight, liveKey = null) {
 }
 
 function buildOpenClawConfigPayload(req, liveKey) {
+  // OpenClaw consumes this connection kit; keep model pinned to managed to preserve
+  // server-side routing control while we iterate free-tier reliability behavior.
   return {
     type: 'blockfork_connection_kit',
     openai_compatible: {
@@ -2369,6 +2577,77 @@ function normalizeResponsesResponseFromChat(payload, modelAlias) {
   };
 }
 
+function getArtifactContractInput(reqBody = {}) {
+  const body = reqBody && typeof reqBody === 'object' ? reqBody : {};
+  return body?.metadata?.blockfork_artifact_contract || body?.blockfork_artifact_contract || null;
+}
+
+function checkArtifactEvidence(contract) {
+  if (!contract || contract.requested !== true) {
+    return { required: false, ok: true };
+  }
+
+  const evidence = contract.evidence && typeof contract.evidence === 'object' ? contract.evidence : null;
+  if (!evidence) {
+    return { required: true, ok: false, reason: 'missing_artifact_evidence' };
+  }
+
+  const filePath = typeof evidence.path === 'string' ? evidence.path.trim() : '';
+  if (!filePath) {
+    return { required: true, ok: false, reason: 'missing_artifact_path' };
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return { required: true, ok: false, reason: 'artifact_path_not_found' };
+  }
+
+  const stats = fs.statSync(filePath);
+  if (!stats.isFile() || Number(stats.size || 0) <= 0) {
+    return { required: true, ok: false, reason: 'artifact_not_nonempty_file' };
+  }
+
+  const deliveryRequested = evidence.delivery_requested === true || evidence.deliveryRequested === true;
+  if (deliveryRequested && !(evidence.delivery_succeeded === true || evidence.deliverySucceeded === true)) {
+    return { required: true, ok: false, reason: 'artifact_delivery_not_confirmed' };
+  }
+
+  return { required: true, ok: true };
+}
+
+function detectArtifactClaim(text = '') {
+  const normalized = String(text || '').toLowerCase();
+  return /\b(created|generated|saved|attached|uploaded|sent)\b/.test(normalized)
+    && /\b(file|pdf|artifact|document|report)\b/.test(normalized);
+}
+
+function validateArtifactHonestyOrError(reqBody, completionText) {
+  const contract = getArtifactContractInput(reqBody);
+  const evidenceCheck = checkArtifactEvidence(contract);
+  if (evidenceCheck.required && !evidenceCheck.ok) {
+    return {
+      statusCode: 422,
+      message: `Artifact verification failed: ${evidenceCheck.reason}`,
+      type: 'invalid_request_error',
+      code: 'artifact_verification_failed',
+    };
+  }
+
+  if (!contract || contract.requested !== true) {
+    return null;
+  }
+
+  if (detectArtifactClaim(completionText) && !evidenceCheck.ok) {
+    return {
+      statusCode: 422,
+      message: 'Artifact claim blocked: no verifiable artifact evidence',
+      type: 'invalid_request_error',
+      code: 'artifact_claim_without_evidence',
+    };
+  }
+
+  return null;
+}
+
 function buildResponseStreamObject(session, modelAlias, responseId, createdAt) {
   return {
     id: responseId,
@@ -2414,6 +2693,82 @@ function normalizeChatChunkPayload(payload, modelAlias, fallbackCreated) {
   };
 }
 
+function normalizeTextForDedupe(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function compactLocalMessages(messages) {
+  if (!Array.isArray(messages)) {
+    return messages;
+  }
+
+  const next = [];
+  let lastKey = '';
+
+  for (const raw of messages) {
+    if (!raw || typeof raw !== 'object') {
+      continue;
+    }
+    const role = typeof raw.role === 'string' ? raw.role : '';
+    const content = raw.content;
+    const dedupeKey = `${role}::${typeof content === 'string' ? normalizeTextForDedupe(content) : JSON.stringify(content)}`;
+
+    if (dedupeKey && dedupeKey === lastKey) {
+      continue;
+    }
+
+    lastKey = dedupeKey;
+    next.push({
+      ...raw,
+      ...(typeof content === 'string' ? { content: normalizeTextForDedupe(content) } : {}),
+    });
+  }
+
+  if (next.length > LOCAL_PROFILE_MAX_MESSAGES) {
+    return next.slice(next.length - LOCAL_PROFILE_MAX_MESSAGES);
+  }
+
+  return next;
+}
+
+function applyLocalOrchestrationProfile(reqBody, descriptor, requestId = '') {
+  if (!ENABLE_LOCAL_PROFILE || !isLocalProviderDescriptor(descriptor) || !reqBody || typeof reqBody !== 'object') {
+    return reqBody;
+  }
+
+  const beforeBytes = Buffer.byteLength(JSON.stringify(reqBody), 'utf8');
+  const beforeTools = countTools(reqBody);
+  const nextBody = {
+    ...reqBody,
+    messages: compactLocalMessages(reqBody.messages),
+  };
+
+  if (typeof nextBody.system === 'string') {
+    nextBody.system = normalizeTextForDedupe(nextBody.system);
+  }
+
+  if (Array.isArray(nextBody.tools)) {
+    // Semantics-preserving compaction: normalize object shape without dropping tools.
+    nextBody.tools = nextBody.tools.map((tool) => (tool && typeof tool === 'object'
+      ? JSON.parse(JSON.stringify(tool))
+      : tool));
+  }
+
+  const afterBytes = Buffer.byteLength(JSON.stringify(nextBody), 'utf8');
+  const afterTools = countTools(nextBody);
+  if (afterBytes !== beforeBytes) {
+    logRoutingDecision('local_profile_applied', {
+      request_id: requestId,
+      payload_size_before_bytes: beforeBytes,
+      payload_size_after_bytes: afterBytes,
+      tool_count_before: beforeTools,
+      tool_count_after: afterTools,
+    });
+  }
+
+  return nextBody;
+}
+
 function buildUpstreamBody(reqBody, descriptor) {
   const upstreamBody = {
     ...reqBody,
@@ -2432,20 +2787,35 @@ function buildUpstreamBody(reqBody, descriptor) {
   return upstreamBody;
 }
 
-function getProviderConfig(session) {
-  if (session.provider !== 'openrouter') {
+function getProviderConfig(session, descriptor, upstreamApiKeyOverride = '') {
+  const registry = buildProviderRegistry();
+  const providerId = getDescriptorProviderId(descriptor) || session.provider;
+  const provider = registry[providerId];
+  if (!provider || !provider.chatUrl) {
+    return null;
+  }
+
+  const apiKey = providerId === 'openrouter'
+    ? (upstreamApiKeyOverride || session.upstream_api_key || provider.apiKey)
+    : (upstreamApiKeyOverride || provider.apiKey || '');
+
+  if (provider.requiresApiKey && !apiKey) {
     return null;
   }
 
   return {
-    chatUrl: OPENROUTER_CHAT_URL,
-    apiKey: session.upstream_api_key,
+    providerId,
+    chatUrl: provider.chatUrl,
+    modelsUrl: provider.modelsUrl,
+    apiKey,
+    requiresApiKey: provider.requiresApiKey,
+    probeMethod: provider.probeMethod,
   };
 }
 
 async function fetchUpstreamChat(session, descriptor, upstreamBody, isStreaming, requestId, extra = {}) {
-  const providerConfig = getProviderConfig(session);
-  if (!providerConfig || !providerConfig.apiKey) {
+  const providerConfig = getProviderConfig(session, descriptor, extra.upstream_api_key_override || '');
+  if (!providerConfig || (providerConfig.requiresApiKey && !providerConfig.apiKey)) {
     return { error: { statusCode: 500, message: 'Provider configuration is incomplete', type: 'runtime_error', code: 'provider_not_configured' } };
   }
 
@@ -2453,11 +2823,14 @@ async function fetchUpstreamChat(session, descriptor, upstreamBody, isStreaming,
   logUpstreamRequest(upstreamContext);
 
   const controller = new AbortController();
-  const timeoutMs = isStreaming ? STREAM_ESTABLISH_TIMEOUT_MS : NON_STREAM_TIMEOUT_MS;
+  const timeoutMs = getRequestTimeoutMs(descriptor, isStreaming, extra.attempt || 'primary');
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    if (FORCE_PRIMARY_429 && extra.attempt === 'primary') {
+    const simulatePrimary429 = extra.attempt === 'primary' && (FORCE_PRIMARY_429 || extra.test_primary_failure_mode === '429');
+    const simulatePrimaryTimeout = extra.attempt === 'primary' && (FORCE_PRIMARY_TIMEOUT || extra.test_primary_failure_mode === 'timeout');
+
+    if (simulatePrimary429) {
       const syntheticBody = JSON.stringify({
         error: {
           message: 'Simulated primary rate limit for fallback smoke testing',
@@ -2484,15 +2857,39 @@ async function fetchUpstreamChat(session, descriptor, upstreamBody, isStreaming,
         response_body: truncateText(syntheticBody, UPSTREAM_ERROR_BODY_LIMIT_BYTES),
         duration_ms: Date.now() - upstreamContext.started_at_ms,
       });
+      logRoutingDecision('primary_outcome', {
+        request_id: requestId,
+        status: 429,
+        classification: 'rate_limited',
+      });
 
       return { upstream, upstreamContext };
+    }
+
+    if (simulatePrimaryTimeout) {
+      clearTimeout(timeout);
+      logUpstreamFailure(upstreamContext, {
+        status: 0,
+        status_text: 'Simulated Primary Timeout',
+        response_body: '',
+        duration_ms: Date.now() - upstreamContext.started_at_ms,
+      });
+      logRoutingDecision('primary_outcome', {
+        request_id: requestId,
+        status: 0,
+        classification: 'primary_timeout',
+      });
+      return {
+        error: { statusCode: 502, message: 'Upstream request timed out', type: 'provider_error', code: 'upstream_timeout' },
+        upstreamContext,
+      };
     }
 
     const upstream = await fetch(providerConfig.chatUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${providerConfig.apiKey}`,
+        ...(providerConfig.apiKey ? { Authorization: `Bearer ${providerConfig.apiKey}` } : {}),
       },
       body: JSON.stringify(upstreamBody),
       signal: controller.signal,
@@ -2514,6 +2911,26 @@ async function fetchUpstreamChat(session, descriptor, upstreamBody, isStreaming,
         response_body: truncateText(responseBody, UPSTREAM_ERROR_BODY_LIMIT_BYTES),
         duration_ms: Date.now() - upstreamContext.started_at_ms,
       });
+      if (extra.attempt === 'primary' && upstream.status === 429) {
+        logRoutingDecision('primary_outcome', {
+          request_id: requestId,
+          status: 429,
+          classification: 'rate_limited',
+        });
+      }
+      if (extra.attempt === 'primary' && upstream.status === 401) {
+        logRoutingDecision('primary_outcome', {
+          request_id: requestId,
+          status: 401,
+          classification: 'unauthorized',
+        });
+      }
+    } else if (extra.attempt === 'primary') {
+      logRoutingDecision('primary_outcome', {
+        request_id: requestId,
+        status: 200,
+        classification: 'success',
+      });
     }
 
     return { upstream, upstreamContext };
@@ -2526,6 +2943,13 @@ async function fetchUpstreamChat(session, descriptor, upstreamBody, isStreaming,
       duration_ms: Date.now() - upstreamContext.started_at_ms,
     });
     if (error.name === 'AbortError') {
+      if (extra.attempt === 'primary') {
+        logRoutingDecision('primary_outcome', {
+          request_id: requestId,
+          status: 0,
+          classification: 'primary_timeout',
+        });
+      }
       return {
         error: { statusCode: 502, message: 'Upstream request timed out', type: 'provider_error', code: 'upstream_timeout' },
         upstreamContext,
@@ -2544,28 +2968,28 @@ async function executeChatFlow(session, body, options = {}) {
     return { error: { statusCode: 400, message: 'messages must be a non-empty array', type: 'invalid_request_error', code: 'invalid_messages' } };
   }
 
-  const providerConfig = getProviderConfig(session);
-  if (!providerConfig || !providerConfig.apiKey) {
-    return { error: { statusCode: 500, message: 'Provider configuration is incomplete', type: 'runtime_error', code: 'provider_not_configured' } };
-  }
-
   const { descriptor: primaryDescriptor, error } = normalizeModelForSession(session, body.model);
   if (error) {
     return { error: { statusCode: 400, message: error, type: 'invalid_request_error', code: 'unsupported_model' } };
   }
 
-  const fallbackDescriptor = getFallbackModelDescriptor();
-  if (!fallbackDescriptor) {
-    return { error: { statusCode: 500, message: 'Fallback model is unavailable', type: 'runtime_error', code: 'fallback_model_unavailable' } };
+  const providerConfig = getProviderConfig(session, primaryDescriptor, options.upstreamApiKeyOverride || '');
+  if (!providerConfig || (providerConfig.requiresApiKey && !providerConfig.apiKey)) {
+    return { error: { statusCode: 500, message: 'Provider configuration is incomplete', type: 'runtime_error', code: 'provider_not_configured' } };
   }
 
-  const primaryUpstreamBody = buildUpstreamBody(body, primaryDescriptor);
-  const fallbackUpstreamBody = buildUpstreamBody(body, fallbackDescriptor);
   const requestId = createRequestId();
+  const effectiveBody = applyLocalOrchestrationProfile(body, primaryDescriptor, requestId);
+  const fallbackDescriptor = getFallbackDescriptorForAlias(primaryDescriptor);
+
+  const primaryUpstreamBody = buildUpstreamBody(effectiveBody, primaryDescriptor);
+  const fallbackUpstreamBody = fallbackDescriptor ? buildUpstreamBody(effectiveBody, fallbackDescriptor) : null;
   const timestamp = getTimestamp();
-  const estimated = estimateRequestTokens(body);
+  const estimated = estimateRequestTokens(effectiveBody);
   const primaryEstimatedCost = estimateCostForDescriptor(primaryDescriptor, estimated.inputTokens, estimated.outputTokens);
-  const fallbackEstimatedCost = estimateCostForDescriptor(fallbackDescriptor, estimated.inputTokens, estimated.outputTokens);
+  const fallbackEstimatedCost = fallbackDescriptor
+    ? estimateCostForDescriptor(fallbackDescriptor, estimated.inputTokens, estimated.outputTokens)
+    : 0;
   const reservedCostUsd = Math.max(primaryEstimatedCost, fallbackEstimatedCost);
   const route = options.route || 'chat/completions';
   const reservation = await reserveBillingBudget({
@@ -2613,11 +3037,13 @@ async function executeChatFlow(session, body, options = {}) {
   }
 
   const responseAlias = PUBLIC_MODEL_ALIAS;
-  const isStreaming = Boolean(body.stream);
+  const isStreaming = Boolean(effectiveBody.stream);
   const primaryAttempt = await fetchUpstreamChat(session, primaryDescriptor, primaryUpstreamBody, isStreaming, requestId, {
     attempt: 'primary',
     primary_model: primaryDescriptor.upstreamId,
     fallback_model_used: false,
+    upstream_api_key_override: options.upstreamApiKeyOverride || '',
+    test_primary_failure_mode: options.testPrimaryFailureMode || '',
   });
 
   const primaryFailureReason = primaryAttempt.error
@@ -2628,11 +3054,26 @@ async function executeChatFlow(session, body, options = {}) {
 
   if (primaryAttempt.error || (primaryAttempt.upstream && !primaryAttempt.upstream.ok)) {
     const canFallback = Boolean(fallbackDescriptor) && (primaryAttempt.error || isRetryableUpstreamStatus(primaryAttempt.upstream.status));
+    if (!canFallback && !fallbackDescriptor) {
+      logRoutingDecision('fallback_skipped_unconfigured', {
+        request_id: requestId,
+        primary_model: primaryDescriptor.upstreamId,
+        reason: ENABLE_FALLBACK ? 'fallback_not_configured_or_not_free' : 'fallback_disabled',
+      });
+    }
     if (canFallback) {
+      logRoutingDecision('fallback_attempt_started', fallbackEventBase(
+        requestId,
+        primaryDescriptor,
+        fallbackDescriptor,
+        primaryFailureReason || 'retryable_primary_failure',
+      ));
       const fallbackAttempt = await fetchUpstreamChat(session, fallbackDescriptor, fallbackUpstreamBody, isStreaming, requestId, {
         attempt: 'fallback',
         primary_model: primaryDescriptor.upstreamId,
         fallback_model_used: true,
+        upstream_api_key_override: options.upstreamApiKeyOverride || '',
+        test_primary_failure_mode: '',
       });
 
       const fallbackFailureReason = fallbackAttempt.error
@@ -2642,6 +3083,12 @@ async function executeChatFlow(session, body, options = {}) {
           : '');
 
       if (!fallbackAttempt.error && fallbackAttempt.upstream && fallbackAttempt.upstream.ok) {
+        logRoutingDecision('fallback_success', fallbackEventBase(
+          requestId,
+          primaryDescriptor,
+          fallbackDescriptor,
+          primaryFailureReason || 'retryable_primary_failure',
+        ));
         return {
           descriptor: fallbackDescriptor,
           responseAlias,
@@ -2663,10 +3110,18 @@ async function executeChatFlow(session, body, options = {}) {
             endpoint: providerConfig.chatUrl,
             finalized: false,
           },
+          served_by: 'fallback',
+          effective_body: effectiveBody,
         };
       }
 
       const finalFailureReason = [primaryFailureReason, fallbackFailureReason].filter(Boolean).join(';') || 'upstream_error';
+      logRoutingDecision('fallback_failed', fallbackEventBase(
+        requestId,
+        primaryDescriptor,
+        fallbackDescriptor,
+        finalFailureReason,
+      ));
       await finalizeBillingRequest({
         request_id: requestId,
         timestamp: getTimestamp(),
@@ -2764,6 +3219,8 @@ async function executeChatFlow(session, body, options = {}) {
       endpoint: providerConfig.chatUrl,
       finalized: false,
     },
+    served_by: 'primary',
+    effective_body: effectiveBody,
   };
 }
 
@@ -2847,10 +3304,144 @@ async function proxyNonStreamingChat(res, session, descriptor, upstream, billing
     });
   }
   incrementUsage(session, usage.totalTokens);
-  return res.status(200).json(normalizeChatCompletionResponse(payload, responseAlias));
+  return normalizeChatCompletionResponse(payload, responseAlias);
 }
 
-function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamContext, billing = null, responseAlias = PUBLIC_MODEL_ALIAS) {
+function writeChatSseFromNonStreamPayload(res, payload, responseAlias = PUBLIC_MODEL_ALIAS) {
+  const created = Number.isFinite(payload?.created) ? payload.created : Math.floor(Date.now() / 1000);
+  const id = payload?.id || `chatcmpl_${crypto.randomUUID()}`;
+  const content = stringifyTextContent(payload?.choices?.[0]?.message?.content ?? '');
+
+  const head = {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model: responseAlias,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  };
+  const body = {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model: responseAlias,
+    choices: [{ index: 0, delta: { content }, finish_reason: null }],
+  };
+  const tail = {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model: responseAlias,
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: payload?.usage || null,
+  };
+
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.write(`data: ${JSON.stringify(head)}\n\n`);
+  res.write(`data: ${JSON.stringify(body)}\n\n`);
+  res.write(`data: ${JSON.stringify(tail)}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing, responseAlias, retryOptions = {}) {
+  if (!ENABLE_LOCAL_NON_STREAM_RETRY || !isLocalProviderDescriptor(descriptor)) {
+    return false;
+  }
+
+  const originalBody = retryOptions.originalBody && typeof retryOptions.originalBody === 'object'
+    ? retryOptions.originalBody
+    : req.body;
+  if (!originalBody || typeof originalBody !== 'object') {
+    return false;
+  }
+
+  logRoutingDecision('local_nonstream_retry_started', {
+    request_id: billing?.request_id || '',
+    model: descriptor.upstreamId,
+    reason: 'stream_first_token_timeout',
+  });
+
+  const retryBody = {
+    ...originalBody,
+    stream: false,
+  };
+  delete retryBody.stream_options;
+
+  const requestId = billing?.request_id || createRequestId();
+  const retryAttempt = await fetchUpstreamChat(session, descriptor, buildUpstreamBody(retryBody, descriptor), false, requestId, {
+    attempt: 'local_nonstream_retry',
+    primary_model: descriptor.upstreamId,
+    fallback_model_used: false,
+    upstream_api_key_override: retryOptions.upstreamApiKeyOverride || '',
+  });
+
+  if (retryAttempt.error || !retryAttempt.upstream || !retryAttempt.upstream.ok) {
+    logRoutingDecision('local_nonstream_retry_failed', {
+      request_id: requestId,
+      model: descriptor.upstreamId,
+      reason: retryAttempt?.error?.code || failureReasonFromUpstreamStatus(retryAttempt?.upstream?.status),
+    });
+    return false;
+  }
+
+  let payload;
+  try {
+    payload = await retryAttempt.upstream.json();
+  } catch (error) {
+    logRoutingDecision('local_nonstream_retry_failed', {
+      request_id: requestId,
+      model: descriptor.upstreamId,
+      reason: 'upstream_invalid_response',
+    });
+    return false;
+  }
+
+  const normalized = normalizeChatCompletionResponse(payload, responseAlias);
+  const assistantText = stringifyTextContent(normalized?.choices?.[0]?.message?.content ?? '');
+  const artifactError = validateArtifactHonestyOrError(req.body, assistantText);
+  if (artifactError) {
+    sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
+    return true;
+  }
+
+  const usage = extractUsageTokens(payload?.usage);
+  if (billing?.reserved) {
+    await finalizeBillingRequest({
+      request_id: billing.request_id,
+      timestamp: getTimestamp(),
+      route: billing.route,
+      session_id: session.session_id,
+      primary_model: billing.primary_model || '',
+      model_used: billing.model_used,
+      input_tokens: usage.inputTokens || billing.input_tokens || 0,
+      output_tokens: usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0)),
+      estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor,
+        usage.inputTokens || billing.input_tokens || 0,
+        usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0))
+      ),
+      status: 'success',
+      fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+      failure_reason: billing.failure_reason || '',
+      endpoint: billing.endpoint || '',
+      error_code: '',
+      status_code: 200,
+      response_body: '',
+      reserved_cost_usd: billing.reserved_cost_usd,
+    });
+  }
+  incrementUsage(session, usage.totalTokens);
+  logRoutingDecision('local_nonstream_retry_success', {
+    request_id: requestId,
+    model: descriptor.upstreamId,
+  });
+  writeChatSseFromNonStreamPayload(res, normalized, responseAlias);
+  return true;
+}
+
+function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamContext, billing = null, responseAlias = PUBLIC_MODEL_ALIAS, retryOptions = {}) {
   if (!upstream.ok) {
     if (billing?.reserved) {
       void finalizeBillingRequest({
@@ -2911,7 +3502,10 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
     firstTokenAt: null,
     completed: false,
     billingFinalized: false,
+    retriedLocalNonStream: false,
+    retryInProgress: false,
   };
+  const idleTimeouts = getStreamIdleTimeouts(descriptor);
 
   const finalizeRequest = async (status, details = {}) => {
     if (state.billingFinalized || !billing) {
@@ -2949,10 +3543,6 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
     clearTimeout(state.idleTimer);
     state.idleTimer = setTimeout(() => {
       if (!state.wroteHeaders) {
-        void finalizeRequest('failed', {
-          statusCode: 502,
-          errorCode: 'upstream_timeout',
-        });
         logStreamDiagnostics(upstreamContext, {
           stage: 'idle_timeout_before_headers',
           completed: false,
@@ -2960,6 +3550,32 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
             pending_total_tokens: state.pendingTotalTokens,
             buffered_bytes: Buffer.byteLength(state.buffer, 'utf8'),
           },
+        });
+        if (!state.retriedLocalNonStream && isLocalProviderDescriptor(descriptor)) {
+          state.retriedLocalNonStream = true;
+          state.retryInProgress = true;
+          logRoutingDecision('stream_first_token_timeout_local', {
+            request_id: billing?.request_id || '',
+            model: descriptor.upstreamId,
+          });
+          if (upstream.body && !upstream.body.destroyed) {
+            upstream.body.destroy();
+          }
+          void (async () => {
+            const recovered = await attemptLocalNonStreamRetry(req, res, session, descriptor, billing, responseAlias, retryOptions);
+            if (!recovered) {
+              void finalizeRequest('failed', {
+                statusCode: 502,
+                errorCode: 'upstream_timeout',
+              });
+              sendError(res, 502, 'Upstream stream timed out before the first chunk', 'provider_error', 'upstream_timeout');
+            }
+          })();
+          return;
+        }
+        void finalizeRequest('failed', {
+          statusCode: 502,
+          errorCode: 'upstream_timeout',
         });
         sendError(res, 502, 'Upstream stream timed out before the first chunk', 'provider_error', 'upstream_timeout');
         if (upstream.body && !upstream.body.destroyed) {
@@ -2986,7 +3602,7 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         },
       });
       res.end();
-    }, STREAM_IDLE_TIMEOUT_MS);
+    }, state.wroteHeaders ? idleTimeouts.afterHeadersMs : idleTimeouts.beforeHeadersMs);
   };
 
   const writeHeadersIfNeeded = () => {
@@ -3077,6 +3693,9 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
   });
 
   upstream.body.on('end', () => {
+    if (state.retryInProgress && !state.wroteHeaders) {
+      return;
+    }
     clearTimeout(state.idleTimer);
 
     if (state.buffer) {
@@ -3151,8 +3770,17 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
   });
 
   upstream.body.on('error', (error) => {
+    if (state.retryInProgress && !state.wroteHeaders) {
+      return;
+    }
     clearTimeout(state.idleTimer);
       if (!state.wroteHeaders) {
+        if (isLocalProviderDescriptor(descriptor)) {
+          logRoutingDecision('stream_first_token_timeout_local', {
+            request_id: billing?.request_id || '',
+            model: descriptor.upstreamId,
+          });
+        }
         void finalizeRequest('failed', {
           inputTokens: state.pendingInputTokens,
           outputTokens: state.pendingTotalTokens,
@@ -3193,7 +3821,7 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
   return undefined;
 }
 
-function proxyStreamingResponses(req, res, session, descriptor, upstream, upstreamContext, billing = null, responseAlias = PUBLIC_MODEL_ALIAS) {
+function proxyStreamingResponses(req, res, session, descriptor, upstream, upstreamContext, billing = null, responseAlias = PUBLIC_MODEL_ALIAS, retryOptions = {}) {
   if (!upstream.ok) {
     if (billing?.reserved) {
       void finalizeBillingRequest({
@@ -3264,6 +3892,7 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
     completed: false,
     billingFinalized: false,
   };
+  const idleTimeouts = getStreamIdleTimeouts(descriptor);
 
   const finalizeRequest = async (status, details = {}) => {
     if (state.billingFinalized || !billing) {
@@ -3408,7 +4037,7 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         },
       });
       res.end();
-    }, STREAM_IDLE_TIMEOUT_MS);
+    }, state.wroteHeaders ? idleTimeouts.afterHeadersMs : idleTimeouts.beforeHeadersMs);
   };
 
   const flushParsedChunk = (parsed) => {
@@ -3657,8 +4286,10 @@ async function handleChatCompletion(req, res) {
     return sendError(res, 400, 'messages must be a non-empty array', 'invalid_request_error', 'invalid_messages');
   }
 
-  const { descriptor, responseAlias, upstream, upstreamContext, billing, error } = await executeChatFlow(req.session, req.body, {
+  const { descriptor, responseAlias, upstream, upstreamContext, billing, error, served_by, effective_body } = await executeChatFlow(req.session, req.body, {
     route: 'chat/completions',
+    upstreamApiKeyOverride: resolveTestUpstreamKeyOverride(req),
+    testPrimaryFailureMode: resolveTestPrimaryFailureMode(req),
   });
   if (error) {
     if (billing?.reserved && !billing.finalized) {
@@ -3686,10 +4317,36 @@ async function handleChatCompletion(req, res) {
   }
 
   if (req.body.stream) {
-    return proxyStreamingChat(req, res, req.session, descriptor, upstream, upstreamContext, billing, responseAlias);
+    logRoutingDecision('response_served', {
+      route: 'chat/completions',
+      served_by: served_by || 'primary',
+      session_id: req.session.session_id,
+      model_used: billing?.model_used || descriptor?.upstreamId || '',
+    });
+    return proxyStreamingChat(req, res, req.session, descriptor, upstream, upstreamContext, billing, responseAlias, {
+      originalBody: effective_body || req.body,
+      upstreamApiKeyOverride: resolveTestUpstreamKeyOverride(req),
+    });
   }
 
-  return proxyNonStreamingChat(res, req.session, descriptor, upstream, billing, responseAlias);
+  const responsePayload = await proxyNonStreamingChat(res, req.session, descriptor, upstream, billing, responseAlias);
+  if (responsePayload === undefined) {
+    return undefined;
+  }
+
+  const assistantText = stringifyTextContent(responsePayload?.choices?.[0]?.message?.content ?? '');
+  const artifactError = validateArtifactHonestyOrError(req.body, assistantText);
+  if (artifactError) {
+    return sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
+  }
+
+  logRoutingDecision('response_served', {
+    route: 'chat/completions',
+    served_by: served_by || 'primary',
+    session_id: req.session.session_id,
+    model_used: billing?.model_used || descriptor?.upstreamId || '',
+  });
+  return res.status(200).json(responsePayload);
 }
 
 async function handleResponsesCompatibility(req, res) {
@@ -3698,8 +4355,10 @@ async function handleResponsesCompatibility(req, res) {
     return sendError(res, translated.error.statusCode, translated.error.message, translated.error.type, translated.error.code);
   }
 
-  const { descriptor, upstream, upstreamContext, billing, error } = await executeChatFlow(req.session, translated.body, {
+  const { descriptor, upstream, upstreamContext, billing, error, served_by, effective_body } = await executeChatFlow(req.session, translated.body, {
     route: 'responses',
+    upstreamApiKeyOverride: resolveTestUpstreamKeyOverride(req),
+    testPrimaryFailureMode: resolveTestPrimaryFailureMode(req),
   });
   if (error) {
     if (billing?.reserved && !billing.finalized) {
@@ -3727,7 +4386,16 @@ async function handleResponsesCompatibility(req, res) {
   }
 
   if (translated.body.stream) {
-    return proxyStreamingResponses(req, res, req.session, descriptor, upstream, upstreamContext, billing, PUBLIC_MODEL_ALIAS);
+    logRoutingDecision('response_served', {
+      route: 'responses',
+      served_by: served_by || 'primary',
+      session_id: req.session.session_id,
+      model_used: billing?.model_used || descriptor?.upstreamId || '',
+    });
+    return proxyStreamingResponses(req, res, req.session, descriptor, upstream, upstreamContext, billing, PUBLIC_MODEL_ALIAS, {
+      originalBody: effective_body || translated.body,
+      upstreamApiKeyOverride: resolveTestUpstreamKeyOverride(req),
+    });
   }
 
   if (!upstream.ok) {
@@ -3809,7 +4477,20 @@ async function handleResponsesCompatibility(req, res) {
     });
   }
   incrementUsage(req.session, payload?.usage?.total_tokens);
-  return res.status(200).json(normalizeResponsesResponseFromChat(normalizeChatCompletionResponse(payload, PUBLIC_MODEL_ALIAS), PUBLIC_MODEL_ALIAS));
+  const chatPayload = normalizeChatCompletionResponse(payload, PUBLIC_MODEL_ALIAS);
+  const assistantText = stringifyTextContent(chatPayload?.choices?.[0]?.message?.content ?? '');
+  const artifactError = validateArtifactHonestyOrError(req.body, assistantText);
+  if (artifactError) {
+    return sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
+  }
+
+  logRoutingDecision('response_served', {
+    route: 'responses',
+    served_by: served_by || 'primary',
+    session_id: req.session.session_id,
+    model_used: billing?.model_used || descriptor?.upstreamId || '',
+  });
+  return res.status(200).json(normalizeResponsesResponseFromChat(chatPayload, PUBLIC_MODEL_ALIAS));
 }
 
 app.get('/health', (req, res) => {
@@ -4027,10 +4708,74 @@ app.use((req, res) => {
 
 setInterval(cleanupExpiredSessions, CLEANUP_INTERVAL_MS).unref();
 
+let localWarmupTimer = null;
+
+function startLocalWarmupLoop() {
+  if (!ENABLE_LOCAL_WARMUP || !BLOCKFORK_LOCAL_BASE_URL || !BLOCKFORK_LOCAL_MODEL) {
+    return;
+  }
+
+  const chatUrl = `${BLOCKFORK_LOCAL_BASE_URL}/chat/completions`;
+  let successCount = 0;
+  let failureCount = 0;
+
+  const runProbe = async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), LOCAL_WARMUP_TIMEOUT_MS);
+    try {
+      const response = await fetch(chatUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(BLOCKFORK_LOCAL_API_KEY ? { Authorization: `Bearer ${BLOCKFORK_LOCAL_API_KEY}` } : {}),
+        },
+        body: JSON.stringify({
+          model: BLOCKFORK_LOCAL_MODEL,
+          messages: [{ role: 'user', content: 'warmup' }],
+          max_tokens: 4,
+          stream: false,
+        }),
+        signal: controller.signal,
+      });
+      if (response.ok) {
+        successCount += 1;
+      } else {
+        failureCount += 1;
+        logRoutingDecision('local_warmup_probe_failed', {
+          status: response.status,
+          failures: failureCount,
+          successes: successCount,
+        });
+      }
+    } catch (error) {
+      failureCount += 1;
+      logRoutingDecision('local_warmup_probe_failed', {
+        reason: error?.name || error?.message || 'warmup_error',
+        failures: failureCount,
+        successes: successCount,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  localWarmupTimer = setInterval(() => {
+    void runProbe();
+  }, LOCAL_WARMUP_INTERVAL_MS);
+  localWarmupTimer.unref();
+
+  logRoutingDecision('local_warmup_started', {
+    interval_ms: LOCAL_WARMUP_INTERVAL_MS,
+    timeout_ms: LOCAL_WARMUP_TIMEOUT_MS,
+    model: BLOCKFORK_LOCAL_MODEL,
+  });
+}
+
 async function startServer(port = PORT) {
   await ensureBillingDb();
   await preloadLiveKeys();
   await preloadActiveSessions();
+  startLocalWarmupLoop();
   return app.listen(port, HOST, () => {
     console.log(`BlockFork AI Session Runtime listening on http://${HOST}:${port}`);
   });
