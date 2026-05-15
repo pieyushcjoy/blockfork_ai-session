@@ -20,6 +20,16 @@
     "runtime:logs": "bash scripts/runtime-ctl.sh logs",
     "runtime:verify": "bash scripts/verify-runtime.sh",
     "runtime:verify:ui": "bash scripts/verify-runtime.sh --with-ui",
-    "runtime:verify:integrity": "bash scripts/verify-api-integrity.sh"
+    "runtime:verify:integrity": "bash scripts/verify-api-integrity.sh",
+    "execution:verify:core": "bash scripts/verify-execution-core.sh",
+    "execution:verify:transitions": "bash scripts/verify-execution-transitions.sh",
+    "execution:verify:recovery": "bash scripts/verify-execution-recovery.sh",
+    "execution:verify:workspace-artifact": "bash scripts/verify-workspace-artifact-boundary.sh",
+    "execution:verify:capabilities-budget": "bash scripts/verify-execution-capabilities-budget.sh",
+    "execution:verify:context-continuity": "bash scripts/verify-execution-context-continuity.sh",
+    "execution:verify:continuity-recommendations": "bash scripts/verify-execution-continuity-recommendations.sh",
+    "readiness:state-boundary": "bash scripts/verify-state-boundary.sh",
+    "readiness:report": "bash scripts/readiness-report.sh",
+    "readiness:gate": "bash scripts/verify-readiness-gate.sh"
   }
 }

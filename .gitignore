@@ -3,6 +3,7 @@ node_modules/
 .env
 .env.*
 !.env.production.example
+!.env.validation.example
 
 billing.sqlite
 *.sqlite

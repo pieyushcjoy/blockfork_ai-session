@@ -2,7 +2,15 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-require('dotenv').config();
+const DEFAULT_ENV_FILE = '.env';
+const REQUESTED_ENV_FILE = (process.env.ENV_FILE || DEFAULT_ENV_FILE).trim() || DEFAULT_ENV_FILE;
+const RESOLVED_ENV_FILE = path.resolve(process.cwd(), REQUESTED_ENV_FILE);
+
+if (process.env.ENV_FILE && !fs.existsSync(RESOLVED_ENV_FILE)) {
+  throw new Error(`ENV_FILE not found: ${process.env.ENV_FILE}`);
+}
+
+require('dotenv').config({ path: RESOLVED_ENV_FILE });
 
 const express = require('express');
 const fetch = require('node-fetch');
@@ -29,6 +37,7 @@ const SESSION_TTL_OPTIONS = new Map([
 ]);
 const DEFAULT_SESSION_TTL_SELECTED = '4h';
 const DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED = '1h';
+const RUNTIME_PROFILE_PATH = path.join(__dirname, 'logs', 'runtime-profile.json');
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const NON_STREAM_TIMEOUT_MS = 8 * 1000;
 const STREAM_ESTABLISH_TIMEOUT_MS = 8 * 1000;
@@ -171,6 +180,54 @@ const liveKeysById = new Map();
 const liveKeyCreateLocks = new Map();
 const LIVE_KEY_PREFIX = 'sk_live_';
 const SESSION_KEY_PREFIX = 'sk_sess_';
+const EXECUTION_ID_PREFIX = 'exec_';
+const EXECUTION_EVENT_ID_PREFIX = 'exevt_';
+const EXECUTION_LEASE_ID_PREFIX = 'lease_';
+const WORKSPACE_ID_PREFIX = 'ws_';
+const EXECUTION_ARTIFACT_ID_PREFIX = 'art_';
+const CONTINUITY_EVENT_ID_PREFIX = 'cevt_';
+const SESSION_LINEAGE_ID_PREFIX = 'lin_';
+const CONTINUITY_RECOMMENDATION_ID_PREFIX = 'crec_';
+const EXECUTION_NON_STREAM_LEASE_TTL_MS = 30 * 1000;
+const EXECUTION_STREAM_LEASE_TTL_MS = 120 * 1000;
+const PRESSURE_WARNING_THRESHOLD = 0.70;
+const PRESSURE_CRITICAL_THRESHOLD = 0.85;
+const PRESSURE_OVER_LIMIT_THRESHOLD = 1.0;
+const EXECUTION_STATES = Object.freeze({
+  CREATED: 'created',
+  QUEUED: 'queued',
+  RUNNING: 'running',
+  WAITING: 'waiting',
+  RETRYING: 'retrying',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+  EXPIRED: 'expired',
+  RECOVERY_REQUIRED: 'recovery_required',
+});
+const EXECUTION_TERMINAL_STATES = new Set([
+  EXECUTION_STATES.COMPLETED,
+  EXECUTION_STATES.FAILED,
+  EXECUTION_STATES.CANCELLED,
+  EXECUTION_STATES.EXPIRED,
+]);
+const EXECUTION_LEGAL_TRANSITIONS = new Map([
+  [EXECUTION_STATES.CREATED, new Set([EXECUTION_STATES.QUEUED, EXECUTION_STATES.CANCELLED, EXECUTION_STATES.EXPIRED])],
+  [EXECUTION_STATES.QUEUED, new Set([EXECUTION_STATES.RUNNING, EXECUTION_STATES.CANCELLED, EXECUTION_STATES.EXPIRED, EXECUTION_STATES.RECOVERY_REQUIRED])],
+  [EXECUTION_STATES.RUNNING, new Set([EXECUTION_STATES.WAITING, EXECUTION_STATES.RETRYING, EXECUTION_STATES.COMPLETED, EXECUTION_STATES.FAILED, EXECUTION_STATES.CANCELLED, EXECUTION_STATES.RECOVERY_REQUIRED])],
+  [EXECUTION_STATES.WAITING, new Set([EXECUTION_STATES.QUEUED, EXECUTION_STATES.RUNNING, EXECUTION_STATES.CANCELLED, EXECUTION_STATES.EXPIRED, EXECUTION_STATES.RECOVERY_REQUIRED])],
+  [EXECUTION_STATES.RETRYING, new Set([EXECUTION_STATES.RUNNING, EXECUTION_STATES.FAILED, EXECUTION_STATES.RECOVERY_REQUIRED, EXECUTION_STATES.CANCELLED, EXECUTION_STATES.EXPIRED])],
+  [EXECUTION_STATES.RECOVERY_REQUIRED, new Set([EXECUTION_STATES.QUEUED, EXECUTION_STATES.RUNNING, EXECUTION_STATES.FAILED, EXECUTION_STATES.CANCELLED, EXECUTION_STATES.EXPIRED])],
+  [EXECUTION_STATES.COMPLETED, new Set()],
+  [EXECUTION_STATES.FAILED, new Set()],
+  [EXECUTION_STATES.CANCELLED, new Set()],
+  [EXECUTION_STATES.EXPIRED, new Set()],
+]);
+const ARTIFACT_VERIFICATION_STATES = Object.freeze({
+  PENDING: 'pending',
+  VERIFIED: 'verified',
+  REJECTED: 'rejected',
+});
 const publicDir = __dirname;
 const UPSTREAM_ERROR_BODY_LIMIT_BYTES = 2 * 1024;
 const ADMIN_SECRET_HEADER = 'x-admin-secret';
@@ -181,12 +238,93 @@ let sqlPromise = null;
 let billingDb = null;
 let billingWriteChain = Promise.resolve();
 
+function writeRuntimeProfileMarker(port = PORT) {
+  fs.mkdirSync(path.dirname(RUNTIME_PROFILE_PATH), { recursive: true });
+  fs.writeFileSync(RUNTIME_PROFILE_PATH, JSON.stringify({
+    env_file: RESOLVED_ENV_FILE,
+    node_env: NODE_ENV,
+    host: HOST,
+    port,
+    fallback_enabled: ENABLE_FALLBACK,
+    local_base_url_enabled: Boolean(BLOCKFORK_LOCAL_BASE_URL),
+    updated_at: new Date().toISOString(),
+  }, null, 2));
+}
+
 app.use(express.json({ limit: '1mb' }));
 app.use('/assets', express.static(path.join(publicDir, 'assets')));
 app.use('/styles.css', express.static(path.join(publicDir, 'styles.css')));
 
 function createRequestId() {
   return crypto.randomUUID();
+}
+
+function createExecutionId() {
+  return `${EXECUTION_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createExecutionEventId() {
+  return `${EXECUTION_EVENT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createExecutionLeaseId() {
+  return `${EXECUTION_LEASE_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createWorkspaceId() {
+  return `${WORKSPACE_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createExecutionArtifactId() {
+  return `${EXECUTION_ARTIFACT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createContinuityEventId() {
+  return `${CONTINUITY_EVENT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createSessionLineageId() {
+  return `${SESSION_LINEAGE_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createContinuityRecommendationId() {
+  return `${CONTINUITY_RECOMMENDATION_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+const CONTINUITY_RECOMMENDATION_TYPES = Object.freeze({
+  NONE: 'none',
+  MONITOR_PRESSURE: 'monitor_pressure',
+  RECOMMEND_ROLLOVER: 'recommend_rollover',
+  RECOMMEND_COMPACTION_CANDIDATE: 'recommend_compaction_candidate',
+  REQUIRE_MANUAL_RESET: 'require_manual_reset',
+  RECOVERY_REVIEW_REQUIRED: 'recovery_review_required',
+});
+
+const CONTINUITY_RECOMMENDATION_STATUS = Object.freeze({
+  ACTIVE: 'active',
+  SUPERSEDED: 'superseded',
+  RESOLVED: 'resolved',
+});
+
+const CONTINUITY_RECOMMENDATION_PRECEDENCE = Object.freeze({
+  none: 0,
+  monitor_pressure: 1,
+  recommend_compaction_candidate: 2,
+  recommend_rollover: 3,
+  require_manual_reset: 4,
+  recovery_review_required: 5,
+});
+
+function buildExecutionLeaseHolder(requestId = '') {
+  return `runtime:${process.pid}:${requestId || 'unknown'}`;
+}
+
+function getExecutionLeaseTtlMs(isStreaming = false) {
+  return isStreaming ? EXECUTION_STREAM_LEASE_TTL_MS : EXECUTION_NON_STREAM_LEASE_TTL_MS;
+}
+
+function addMillisecondsToIso(timestamp, ttlMs) {
+  return new Date(new Date(timestamp).getTime() + ttlMs).toISOString();
 }
 
 function getTimestamp() {
@@ -1160,6 +1298,7 @@ function getSessionTtlMsFromSelected(ttlSelected) {
 
 async function createLiveKeySessionRecord(db, liveKeyRow, ttlSelected = DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED) {
   const liveKey = hydrateLiveKeyFromStored(liveKeyRow);
+  const previousSessionId = liveKey.last_session_id || null;
   const effectiveTtlSelected = normalizeSessionTtlSelection(ttlSelected || DEFAULT_LIVE_KEY_SESSION_TTL_SELECTED);
   const session = buildSessionRecord({
     user_id: liveKey.user_id || null,
@@ -1179,6 +1318,46 @@ async function createLiveKeySessionRecord(db, liveKeyRow, ttlSelected = DEFAULT_
     `);
     updateLiveKey.run([session.session_id, liveKey.id]);
     updateLiveKey.free();
+
+    if (previousSessionId && previousSessionId !== session.session_id) {
+      const lineageTimestamp = getTimestamp();
+      const lineageInsert = database.prepare(`
+        INSERT OR REPLACE INTO session_lineage (
+          lineage_id, root_session_id, child_session_id, link_reason, trigger_execution_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      lineageInsert.run([
+        createSessionLineageId(),
+        previousSessionId,
+        session.session_id,
+        'manual_new_session',
+        null,
+        lineageTimestamp,
+      ]);
+      lineageInsert.free();
+
+      const eventInsert = database.prepare(`
+        INSERT INTO session_continuity_events (
+          event_id, session_id, execution_id, pressure_state, pressure_ratio,
+          event_type, decision, source, reason_code, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      eventInsert.run([
+        createContinuityEventId(),
+        session.session_id,
+        null,
+        'unknown',
+        0,
+        'fresh_session_detected',
+        'observe_only',
+        'finalization',
+        'manual_new_session',
+        lineageTimestamp,
+      ]);
+      eventInsert.free();
+
+      await resolveRecommendationFromLineage(previousSessionId, session.session_id, lineageTimestamp, database);
+    }
 
     liveKey.last_session_id = session.session_id;
     hydrateLiveKeyFromStored(liveKey);
@@ -1435,6 +1614,7 @@ async function ensureBillingDb() {
       timestamp TEXT NOT NULL,
       route TEXT NOT NULL,
       session_id TEXT NOT NULL,
+      execution_id TEXT,
       primary_model TEXT NOT NULL DEFAULT '',
       model_used TEXT NOT NULL,
       input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1448,6 +1628,151 @@ async function ensureBillingDb() {
       status_code INTEGER NOT NULL DEFAULT 0,
       response_body TEXT NOT NULL DEFAULT '',
       reserved_cost_usd REAL NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS executions (
+      execution_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      current_state TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_request_id TEXT NOT NULL DEFAULT '',
+      idempotency_key TEXT,
+      workspace_id TEXT,
+      lease_id TEXT,
+      lease_holder TEXT,
+      lease_acquired_at TEXT,
+      lease_expires_at TEXT,
+      lease_epoch INTEGER NOT NULL DEFAULT 0,
+      last_heartbeat_at TEXT,
+      recovery_reason TEXT,
+      recovery_notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS execution_events (
+      event_id TEXT PRIMARY KEY,
+      execution_id TEXT NOT NULL,
+      previous_state TEXT NOT NULL DEFAULT '',
+      new_state TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      actor_source TEXT NOT NULL,
+      reason_code TEXT NOT NULL,
+      request_id TEXT,
+      notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS workspaces (
+      workspace_id TEXT PRIMARY KEY,
+      canonical_root TEXT NOT NULL UNIQUE,
+      root_source TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS execution_artifacts (
+      artifact_id TEXT PRIMARY KEY,
+      execution_id TEXT NOT NULL UNIQUE,
+      workspace_id TEXT NOT NULL,
+      declared_path TEXT NOT NULL,
+      canonical_path TEXT NOT NULL,
+      verification_state TEXT NOT NULL,
+      reason_code TEXT NOT NULL DEFAULT '',
+      delivery_requested INTEGER NOT NULL DEFAULT 0,
+      delivery_confirmed INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS execution_capabilities (
+      execution_id TEXT PRIMARY KEY,
+      requested_model_input TEXT NOT NULL DEFAULT '',
+      requested_model_alias TEXT NOT NULL,
+      resolved_model_alias TEXT NOT NULL,
+      resolved_provider_id TEXT NOT NULL,
+      resolved_upstream_model_id TEXT NOT NULL,
+      fallback_model_alias TEXT NOT NULL DEFAULT '',
+      fallback_eligible INTEGER NOT NULL DEFAULT 0,
+      fallback_used INTEGER NOT NULL DEFAULT 0,
+      supports_chat INTEGER NOT NULL DEFAULT 0,
+      supports_streaming INTEGER NOT NULL DEFAULT 0,
+      supports_tools INTEGER NOT NULL DEFAULT 0,
+      artifact_claim_risk TEXT NOT NULL DEFAULT 'unknown',
+      timeout_profile TEXT NOT NULL DEFAULT 'unknown',
+      retryability_class TEXT NOT NULL DEFAULT 'unknown',
+      provider_class TEXT NOT NULL DEFAULT 'unknown',
+      context_window_tokens INTEGER NOT NULL DEFAULT 0,
+      max_output_tokens INTEGER NOT NULL DEFAULT 0,
+      validated_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      fact_source TEXT NOT NULL DEFAULT 'descriptor_registry',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS execution_budgets (
+      execution_id TEXT PRIMARY KEY,
+      requested_input_tokens_estimate INTEGER NOT NULL DEFAULT 0,
+      requested_output_tokens INTEGER NOT NULL DEFAULT 0,
+      effective_context_window_tokens INTEGER NOT NULL DEFAULT 0,
+      effective_max_output_tokens INTEGER NOT NULL DEFAULT 0,
+      reserved_output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_total_budget_demand INTEGER NOT NULL DEFAULT 0,
+      accepted_input_tokens_estimate INTEGER NOT NULL DEFAULT 0,
+      context_adaptation_applied INTEGER NOT NULL DEFAULT 0,
+      context_adaptation_reason TEXT NOT NULL DEFAULT 'none',
+      budget_rejection_reason TEXT NOT NULL DEFAULT '',
+      completed_input_tokens INTEGER NOT NULL DEFAULT 0,
+      completed_output_tokens INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_context_pressure (
+      session_id TEXT PRIMARY KEY,
+      latest_pressure_state TEXT NOT NULL DEFAULT 'unknown',
+      latest_pressure_ratio REAL NOT NULL DEFAULT 0,
+      latest_execution_id TEXT,
+      first_critical_at TEXT,
+      latest_over_limit_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_continuity_events (
+      event_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      execution_id TEXT,
+      pressure_state TEXT NOT NULL,
+      pressure_ratio REAL NOT NULL DEFAULT 0,
+      event_type TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      source TEXT NOT NULL,
+      reason_code TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_lineage (
+      lineage_id TEXT PRIMARY KEY,
+      root_session_id TEXT NOT NULL,
+      child_session_id TEXT NOT NULL,
+      link_reason TEXT NOT NULL,
+      trigger_execution_id TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_continuity_recommendations (
+      recommendation_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      execution_id TEXT,
+      recommendation_type TEXT NOT NULL,
+      pressure_state TEXT NOT NULL DEFAULT 'unknown',
+      trigger_event_id TEXT,
+      reason_code TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'active',
+      superseded_by_recommendation_id TEXT,
+      resolution_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      resolved_at TEXT
     );
   `);
 
@@ -1488,6 +1813,7 @@ async function ensureBillingDb() {
   requestLogColumnsStmt.free();
 
   const requestLogAlterations = [
+    ['execution_id', 'TEXT'],
     ['primary_model', "TEXT NOT NULL DEFAULT ''"],
     ['fallback_triggered', 'INTEGER NOT NULL DEFAULT 0'],
     ['failure_reason', "TEXT NOT NULL DEFAULT ''"],
@@ -1496,6 +1822,66 @@ async function ensureBillingDb() {
   for (const [columnName, columnType] of requestLogAlterations) {
     if (!requestLogColumns.has(columnName)) {
       billingDb.run(`ALTER TABLE request_logs ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  billingDb.run(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_session_idempotency
+    ON executions(session_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL AND idempotency_key != ''
+  `);
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_executions_session_id ON executions(session_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_executions_state ON executions(current_state)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_execution_events_execution_id_timestamp ON execution_events(execution_id, timestamp)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_request_logs_execution_id ON request_logs(execution_id)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_canonical_root ON workspaces(canonical_root)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_artifacts_execution_id ON execution_artifacts(execution_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_execution_artifacts_workspace_id ON execution_artifacts(workspace_id)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_capabilities_execution_id ON execution_capabilities(execution_id)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_budgets_execution_id ON execution_budgets(execution_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_events_session_created ON session_continuity_events(session_id, created_at)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_session_lineage_child_session ON session_lineage(child_session_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_recommendations_session_status_created ON session_continuity_recommendations(session_id, status, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_recommendations_session_type_status ON session_continuity_recommendations(session_id, recommendation_type, status)');
+
+  const executionColumnsStmt = billingDb.prepare('PRAGMA table_info(executions)');
+  const executionColumns = new Set();
+  while (executionColumnsStmt.step()) {
+    executionColumns.add(String(executionColumnsStmt.getAsObject().name || ''));
+  }
+  executionColumnsStmt.free();
+
+  const executionAlterations = [
+    ['lease_id', 'TEXT'],
+    ['lease_holder', 'TEXT'],
+    ['lease_acquired_at', 'TEXT'],
+    ['lease_expires_at', 'TEXT'],
+    ['lease_epoch', 'INTEGER NOT NULL DEFAULT 0'],
+    ['last_heartbeat_at', 'TEXT'],
+    ['recovery_reason', 'TEXT'],
+    ['recovery_notes', 'TEXT'],
+  ];
+
+  for (const [columnName, columnType] of executionAlterations) {
+    if (!executionColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE executions ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const executionCapabilityColumnsStmt = billingDb.prepare('PRAGMA table_info(execution_capabilities)');
+  const executionCapabilityColumns = new Set();
+  while (executionCapabilityColumnsStmt.step()) {
+    executionCapabilityColumns.add(String(executionCapabilityColumnsStmt.getAsObject().name || ''));
+  }
+  executionCapabilityColumnsStmt.free();
+
+  const executionCapabilityAlterations = [
+    ['requested_model_input', "TEXT NOT NULL DEFAULT ''"],
+  ];
+
+  for (const [columnName, columnType] of executionCapabilityAlterations) {
+    if (!executionCapabilityColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE execution_capabilities ADD COLUMN ${columnName} ${columnType}`);
     }
   }
 
@@ -1596,6 +1982,1578 @@ async function withBillingWrite(callback) {
   });
 
   return nextWrite;
+}
+
+function hydrateExecutionRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    execution_id: String(row.execution_id || ''),
+    session_id: String(row.session_id || ''),
+    current_state: String(row.current_state || ''),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+    last_request_id: row.last_request_id || '',
+    idempotency_key: row.idempotency_key || null,
+    workspace_id: row.workspace_id || null,
+    lease_id: row.lease_id || null,
+    lease_holder: row.lease_holder || null,
+    lease_acquired_at: row.lease_acquired_at || null,
+    lease_expires_at: row.lease_expires_at || null,
+    lease_epoch: Number(row.lease_epoch || 0),
+    last_heartbeat_at: row.last_heartbeat_at || null,
+    recovery_reason: row.recovery_reason || null,
+    recovery_notes: row.recovery_notes || null,
+  };
+}
+
+function hydrateWorkspaceRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    workspace_id: String(row.workspace_id || ''),
+    canonical_root: String(row.canonical_root || ''),
+    root_source: String(row.root_source || ''),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateExecutionArtifactRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    artifact_id: String(row.artifact_id || ''),
+    execution_id: String(row.execution_id || ''),
+    workspace_id: String(row.workspace_id || ''),
+    declared_path: String(row.declared_path || ''),
+    canonical_path: String(row.canonical_path || ''),
+    verification_state: String(row.verification_state || ''),
+    reason_code: String(row.reason_code || ''),
+    delivery_requested: Number(row.delivery_requested || 0),
+    delivery_confirmed: Number(row.delivery_confirmed || 0),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateExecutionCapabilityRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    execution_id: String(row.execution_id || ''),
+    requested_model_input: String(row.requested_model_input || ''),
+    requested_model_alias: String(row.requested_model_alias || ''),
+    resolved_model_alias: String(row.resolved_model_alias || ''),
+    resolved_provider_id: String(row.resolved_provider_id || ''),
+    resolved_upstream_model_id: String(row.resolved_upstream_model_id || ''),
+    fallback_model_alias: String(row.fallback_model_alias || ''),
+    fallback_eligible: Number(row.fallback_eligible || 0),
+    fallback_used: Number(row.fallback_used || 0),
+    supports_chat: Number(row.supports_chat || 0),
+    supports_streaming: Number(row.supports_streaming || 0),
+    supports_tools: Number(row.supports_tools || 0),
+    artifact_claim_risk: String(row.artifact_claim_risk || 'unknown'),
+    timeout_profile: String(row.timeout_profile || 'unknown'),
+    retryability_class: String(row.retryability_class || 'unknown'),
+    provider_class: String(row.provider_class || 'unknown'),
+    context_window_tokens: Number(row.context_window_tokens || 0),
+    max_output_tokens: Number(row.max_output_tokens || 0),
+    validated_at: row.validated_at || '',
+    expires_at: row.expires_at || '',
+    fact_source: String(row.fact_source || 'descriptor_registry'),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateExecutionBudgetRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    execution_id: String(row.execution_id || ''),
+    requested_input_tokens_estimate: Number(row.requested_input_tokens_estimate || 0),
+    requested_output_tokens: Number(row.requested_output_tokens || 0),
+    effective_context_window_tokens: Number(row.effective_context_window_tokens || 0),
+    effective_max_output_tokens: Number(row.effective_max_output_tokens || 0),
+    reserved_output_tokens: Number(row.reserved_output_tokens || 0),
+    estimated_total_budget_demand: Number(row.estimated_total_budget_demand || 0),
+    accepted_input_tokens_estimate: Number(row.accepted_input_tokens_estimate || 0),
+    context_adaptation_applied: Number(row.context_adaptation_applied || 0),
+    context_adaptation_reason: String(row.context_adaptation_reason || 'none'),
+    budget_rejection_reason: String(row.budget_rejection_reason || ''),
+    completed_input_tokens: Number(row.completed_input_tokens || 0),
+    completed_output_tokens: Number(row.completed_output_tokens || 0),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function assertLegalExecutionTransition(previousState, nextState) {
+  const from = String(previousState || '');
+  const to = String(nextState || '');
+  if (!from || !to) {
+    throw new Error('Execution transition requires both previous and next state');
+  }
+
+  if (from === to) {
+    throw new Error(`Illegal execution transition: ${from} -> ${to}`);
+  }
+
+  if (!EXECUTION_LEGAL_TRANSITIONS.has(from)) {
+    throw new Error(`Unknown execution state: ${from}`);
+  }
+
+  const allowed = EXECUTION_LEGAL_TRANSITIONS.get(from);
+  if (!allowed || !allowed.has(to)) {
+    throw new Error(`Illegal execution transition: ${from} -> ${to}`);
+  }
+}
+
+async function getStoredExecutionById(db, executionId) {
+  const stmt = db.prepare('SELECT * FROM executions WHERE execution_id = ? LIMIT 1');
+  stmt.bind([executionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateExecutionRow(row);
+}
+
+async function getStoredWorkspaceById(db, workspaceId) {
+  const stmt = db.prepare('SELECT * FROM workspaces WHERE workspace_id = ? LIMIT 1');
+  stmt.bind([workspaceId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateWorkspaceRow(row);
+}
+
+async function getStoredWorkspaceByRoot(db, canonicalRoot) {
+  const stmt = db.prepare('SELECT * FROM workspaces WHERE canonical_root = ? LIMIT 1');
+  stmt.bind([canonicalRoot]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateWorkspaceRow(row);
+}
+
+async function getStoredExecutionArtifactByExecutionId(db, executionId) {
+  const stmt = db.prepare('SELECT * FROM execution_artifacts WHERE execution_id = ? LIMIT 1');
+  stmt.bind([executionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateExecutionArtifactRow(row);
+}
+
+async function getStoredExecutionCapabilityByExecutionId(db, executionId) {
+  const stmt = db.prepare('SELECT * FROM execution_capabilities WHERE execution_id = ? LIMIT 1');
+  stmt.bind([executionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateExecutionCapabilityRow(row);
+}
+
+async function getStoredExecutionBudgetByExecutionId(db, executionId) {
+  const stmt = db.prepare('SELECT * FROM execution_budgets WHERE execution_id = ? LIMIT 1');
+  stmt.bind([executionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateExecutionBudgetRow(row);
+}
+
+async function getExecutionById(executionId) {
+  const db = await ensureBillingDb();
+  return getStoredExecutionById(db, executionId);
+}
+
+async function getExecutionByRequestId(requestId) {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare('SELECT execution_id FROM request_logs WHERE request_id = ? LIMIT 1');
+  stmt.bind([requestId]);
+  let executionId = '';
+  if (stmt.step()) {
+    executionId = String(stmt.getAsObject().execution_id || '');
+  }
+  stmt.free();
+  if (!executionId) {
+    return null;
+  }
+  return getStoredExecutionById(db, executionId);
+}
+
+async function getExecutionCapabilityRecord(executionId) {
+  const db = await ensureBillingDb();
+  return getStoredExecutionCapabilityByExecutionId(db, executionId);
+}
+
+async function getExecutionBudgetRecord(executionId) {
+  const db = await ensureBillingDb();
+  return getStoredExecutionBudgetByExecutionId(db, executionId);
+}
+
+function classifyProviderClass(descriptor) {
+  const providerId = getDescriptorProviderId(descriptor);
+  if (providerId === 'local_openai') {
+    return 'local';
+  }
+  if (providerId === 'openrouter') {
+    return 'remote';
+  }
+  return 'unknown';
+}
+
+function classifyArtifactClaimRisk(descriptor) {
+  const providerClass = classifyProviderClass(descriptor);
+  if (providerClass === 'remote') {
+    return 'high';
+  }
+  if (providerClass === 'local') {
+    return 'medium';
+  }
+  return 'unknown';
+}
+
+function classifyRetryabilityForDescriptor(descriptor, options = {}) {
+  if (!descriptor || !getDescriptorProviderId(descriptor)) {
+    return 'unknown';
+  }
+  if (options.staleFacts) {
+    return 'unknown';
+  }
+  if (options.fallbackEligible) {
+    return 'conditionally_retryable';
+  }
+  return 'safe_retryable';
+}
+
+function buildExecutionCapabilityRecord(executionId, session, requestedModel, descriptor, fallbackDescriptor = null, options = {}) {
+  const validatedAt = options.timestamp || getTimestamp();
+  const expiresAt = new Date(new Date(validatedAt).getTime() + CONTRACT_CACHE_TTL_MS).toISOString();
+  const providerId = getDescriptorProviderId(descriptor) || '';
+  const requestedModelInput = String(requestedModel || '');
+  const requestedDescriptor = requestedModelInput ? getModelDescriptor(requestedModelInput) : null;
+  const requestedModelAlias = String(requestedDescriptor?.alias || descriptor?.alias || session?.default_model_alias || PUBLIC_MODEL_ALIAS);
+  const cachedContract = options.cachedContract || null;
+  return {
+    execution_id: executionId,
+    requested_model_input: requestedModelInput,
+    requested_model_alias: requestedModelAlias,
+    resolved_model_alias: String(descriptor?.alias || requestedModelAlias),
+    resolved_provider_id: providerId,
+    resolved_upstream_model_id: String(descriptor?.upstreamId || ''),
+    fallback_model_alias: String(fallbackDescriptor?.alias || ''),
+    fallback_eligible: Number(Boolean(fallbackDescriptor)),
+    fallback_used: Number(Boolean(options.fallbackUsed)),
+    supports_chat: 1,
+    supports_streaming: 1,
+    supports_tools: Number(Boolean(Array.isArray(descriptor?.capabilities) && descriptor.capabilities.includes('tools'))),
+    artifact_claim_risk: classifyArtifactClaimRisk(descriptor),
+    timeout_profile: options.timeoutProfile || (providerId === 'local_openai' ? 'local' : 'remote_primary'),
+    retryability_class: classifyRetryabilityForDescriptor(descriptor, {
+      fallbackEligible: Boolean(fallbackDescriptor),
+      staleFacts: false,
+    }),
+    provider_class: classifyProviderClass(descriptor),
+    context_window_tokens: Number(descriptor?.contextWindow || 0),
+    max_output_tokens: Number(descriptor?.maxTokens || 0),
+    validated_at: validatedAt,
+    expires_at: expiresAt,
+    fact_source: cachedContract ? 'session_cached_contract' : 'descriptor_registry',
+    created_at: validatedAt,
+    updated_at: validatedAt,
+  };
+}
+
+async function persistExecutionCapabilityRecord(record) {
+  return withBillingWrite(async (db) => {
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO execution_capabilities (
+        execution_id, requested_model_input, requested_model_alias, resolved_model_alias, resolved_provider_id, resolved_upstream_model_id,
+        fallback_model_alias, fallback_eligible, fallback_used, supports_chat, supports_streaming, supports_tools,
+        artifact_claim_risk, timeout_profile, retryability_class, provider_class, context_window_tokens,
+        max_output_tokens, validated_at, expires_at, fact_source, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      record.execution_id,
+      record.requested_model_input || '',
+      record.requested_model_alias,
+      record.resolved_model_alias,
+      record.resolved_provider_id,
+      record.resolved_upstream_model_id,
+      record.fallback_model_alias || '',
+      Number(Boolean(record.fallback_eligible)),
+      Number(Boolean(record.fallback_used)),
+      Number(Boolean(record.supports_chat)),
+      Number(Boolean(record.supports_streaming)),
+      Number(Boolean(record.supports_tools)),
+      record.artifact_claim_risk || 'unknown',
+      record.timeout_profile || 'unknown',
+      record.retryability_class || 'unknown',
+      record.provider_class || 'unknown',
+      Number(record.context_window_tokens || 0),
+      Number(record.max_output_tokens || 0),
+      record.validated_at || getTimestamp(),
+      record.expires_at || getTimestamp(),
+      record.fact_source || 'descriptor_registry',
+      record.created_at || getTimestamp(),
+      record.updated_at || getTimestamp(),
+    ]);
+    insert.free();
+    return getStoredExecutionCapabilityByExecutionId(db, record.execution_id);
+  });
+}
+
+async function updateExecutionCapabilityFallbackUse(executionId, descriptor, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionCapabilityByExecutionId(db, executionId);
+    if (!current) {
+      return null;
+    }
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE execution_capabilities
+      SET resolved_model_alias = ?,
+          resolved_provider_id = ?,
+          resolved_upstream_model_id = ?,
+          fallback_model_alias = ?,
+          fallback_used = 1,
+          artifact_claim_risk = ?,
+          timeout_profile = ?,
+          retryability_class = ?,
+          provider_class = ?,
+          context_window_tokens = ?,
+          max_output_tokens = ?,
+          updated_at = ?
+      WHERE execution_id = ?
+    `);
+    update.run([
+      String(descriptor?.alias || current.resolved_model_alias),
+      String(getDescriptorProviderId(descriptor) || current.resolved_provider_id),
+      String(descriptor?.upstreamId || current.resolved_upstream_model_id),
+      String(descriptor?.alias || current.fallback_model_alias),
+      classifyArtifactClaimRisk(descriptor),
+      options.timeoutProfile || 'remote_fallback',
+      classifyRetryabilityForDescriptor(descriptor, { fallbackEligible: false }),
+      classifyProviderClass(descriptor),
+      Number(descriptor?.contextWindow || current.context_window_tokens || 0),
+      Number(descriptor?.maxTokens || current.max_output_tokens || 0),
+      timestamp,
+      executionId,
+    ]);
+    update.free();
+    return getStoredExecutionCapabilityByExecutionId(db, executionId);
+  });
+}
+
+function getExecutionCapabilityFreshness(record, nowMs = Date.now()) {
+  if (!record || !record.validated_at || !record.expires_at) {
+    return { stale: true, reason: 'missing_capability_facts' };
+  }
+
+  const expiresAtMs = new Date(record.expires_at).getTime();
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+    return { stale: true, reason: 'stale_capability_facts' };
+  }
+
+  if (!record.resolved_provider_id || !record.resolved_upstream_model_id) {
+    return { stale: true, reason: 'incomplete_capability_facts' };
+  }
+
+  return { stale: false, reason: '' };
+}
+
+async function canExecutionUseOptimisticRetry(executionId) {
+  const record = await getExecutionCapabilityRecord(executionId);
+  if (!record) {
+    return { allowed: false, reason: 'missing_capability_facts' };
+  }
+  const freshness = getExecutionCapabilityFreshness(record);
+  if (freshness.stale) {
+    return { allowed: false, reason: freshness.reason };
+  }
+  if (record.retryability_class === 'unknown') {
+    return { allowed: false, reason: 'unknown_retryability_class' };
+  }
+  return { allowed: true, reason: '' };
+}
+
+function buildExecutionBudgetRecord(executionId, requestBody, acceptedBody, descriptor, options = {}) {
+  const timestamp = options.timestamp || getTimestamp();
+  const requestedEstimate = options.requestedEstimate || estimateRequestTokens(requestBody);
+  const acceptedEstimate = options.acceptedEstimate || estimateRequestTokens(acceptedBody);
+  const requestedOutputTokens = Number.isFinite(Number(requestBody?.max_tokens))
+    ? Math.max(1, Number(requestBody.max_tokens))
+    : DEFAULT_OUTPUT_RESERVATION_TOKENS;
+  const reservedOutputTokens = Number.isFinite(Number(options.reservedOutputTokens))
+    ? Math.max(1, Number(options.reservedOutputTokens))
+    : requestedOutputTokens;
+  const effectiveContextWindowTokens = Math.max(0, Number(descriptor?.contextWindow || 0));
+  const effectiveMaxOutputTokens = Math.max(0, Number(descriptor?.maxTokens || 0));
+  const adaptationApplied = Boolean(options.contextAdaptationApplied);
+  return {
+    execution_id: executionId,
+    requested_input_tokens_estimate: Math.max(0, Number(requestedEstimate.inputTokens || 0)),
+    requested_output_tokens: requestedOutputTokens,
+    effective_context_window_tokens: effectiveContextWindowTokens,
+    effective_max_output_tokens: effectiveMaxOutputTokens,
+    reserved_output_tokens: reservedOutputTokens,
+    estimated_total_budget_demand: Math.max(0, Number(requestedEstimate.inputTokens || 0) + reservedOutputTokens),
+    accepted_input_tokens_estimate: Math.max(0, Number(acceptedEstimate.inputTokens || 0)),
+    context_adaptation_applied: Number(adaptationApplied),
+    context_adaptation_reason: adaptationApplied ? (options.contextAdaptationReason || 'history_compaction') : 'none',
+    budget_rejection_reason: options.budgetRejectionReason || '',
+    completed_input_tokens: Number(options.completedInputTokens || 0),
+    completed_output_tokens: Number(options.completedOutputTokens || 0),
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+}
+
+async function persistExecutionBudgetRecord(record) {
+  return withBillingWrite(async (db) => {
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO execution_budgets (
+        execution_id, requested_input_tokens_estimate, requested_output_tokens, effective_context_window_tokens,
+        effective_max_output_tokens, reserved_output_tokens, estimated_total_budget_demand, accepted_input_tokens_estimate,
+        context_adaptation_applied, context_adaptation_reason, budget_rejection_reason, completed_input_tokens,
+        completed_output_tokens, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      record.execution_id,
+      Number(record.requested_input_tokens_estimate || 0),
+      Number(record.requested_output_tokens || 0),
+      Number(record.effective_context_window_tokens || 0),
+      Number(record.effective_max_output_tokens || 0),
+      Number(record.reserved_output_tokens || 0),
+      Number(record.estimated_total_budget_demand || 0),
+      Number(record.accepted_input_tokens_estimate || 0),
+      Number(Boolean(record.context_adaptation_applied)),
+      record.context_adaptation_reason || 'none',
+      record.budget_rejection_reason || '',
+      Number(record.completed_input_tokens || 0),
+      Number(record.completed_output_tokens || 0),
+      record.created_at || getTimestamp(),
+      record.updated_at || getTimestamp(),
+    ]);
+    insert.free();
+    return getStoredExecutionBudgetByExecutionId(db, record.execution_id);
+  });
+}
+
+function classifyExecutionBudgetFit(record) {
+  if (!record) {
+    return { fits: true, rejectionReason: '' };
+  }
+  if (
+    Number(record.effective_max_output_tokens || 0) > 0
+    && Number(record.requested_output_tokens || 0) > Number(record.effective_max_output_tokens || 0)
+  ) {
+    return { fits: false, rejectionReason: 'reserved_output_exceeded' };
+  }
+  if (
+    Number(record.effective_context_window_tokens || 0) > 0
+    && Number(record.estimated_total_budget_demand || 0) > Number(record.effective_context_window_tokens || 0)
+  ) {
+    return { fits: false, rejectionReason: 'context_window_exceeded' };
+  }
+  return { fits: true, rejectionReason: '' };
+}
+
+function classifyContextPressure(record) {
+  if (!record) {
+    return { state: 'unknown', ratio: 0 };
+  }
+  const demand = Number(record.estimated_total_budget_demand || 0);
+  const window = Number(record.effective_context_window_tokens || 0);
+  if (!Number.isFinite(window) || window <= 0) {
+    return { state: 'unknown', ratio: 0 };
+  }
+  const ratio = demand / window;
+  if (ratio >= PRESSURE_OVER_LIMIT_THRESHOLD) {
+    return { state: 'over_limit', ratio };
+  }
+  if (ratio >= PRESSURE_CRITICAL_THRESHOLD) {
+    return { state: 'critical', ratio };
+  }
+  if (ratio >= PRESSURE_WARNING_THRESHOLD) {
+    return { state: 'warning', ratio };
+  }
+  return { state: 'healthy', ratio };
+}
+
+async function persistSessionContextPressure(sessionId, executionId, pressure, timestamp = getTimestamp()) {
+  return withBillingWrite(async (db) => {
+    const currentStmt = db.prepare('SELECT * FROM session_context_pressure WHERE session_id = ? LIMIT 1');
+    currentStmt.bind([sessionId]);
+    let current = null;
+    if (currentStmt.step()) {
+      current = currentStmt.getAsObject();
+    }
+    currentStmt.free();
+
+    const firstCriticalAt = current?.first_critical_at
+      || (pressure.state === 'critical' || pressure.state === 'over_limit' ? timestamp : null);
+    const latestOverLimitAt = pressure.state === 'over_limit'
+      ? timestamp
+      : (current?.latest_over_limit_at || null);
+
+    const upsert = db.prepare(`
+      INSERT OR REPLACE INTO session_context_pressure (
+        session_id, latest_pressure_state, latest_pressure_ratio, latest_execution_id,
+        first_critical_at, latest_over_limit_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    upsert.run([
+      sessionId,
+      pressure.state,
+      Number(pressure.ratio || 0),
+      executionId || null,
+      firstCriticalAt,
+      latestOverLimitAt,
+      timestamp,
+    ]);
+    upsert.free();
+    return true;
+  });
+}
+
+async function appendSessionContinuityEvent(entry) {
+  const eventId = entry.event_id || createContinuityEventId();
+  return withBillingWrite(async (db) => {
+    const insert = db.prepare(`
+      INSERT INTO session_continuity_events (
+        event_id, session_id, execution_id, pressure_state, pressure_ratio,
+        event_type, decision, source, reason_code, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      eventId,
+      entry.session_id,
+      entry.execution_id || null,
+      entry.pressure_state || 'unknown',
+      Number(entry.pressure_ratio || 0),
+      entry.event_type,
+      entry.decision,
+      entry.source,
+      entry.reason_code || '',
+      entry.created_at || getTimestamp(),
+    ]);
+    insert.free();
+    return eventId;
+  });
+}
+
+function shouldEmitRecommendationForPressureState(pressureState) {
+  return pressureState === 'warning' || pressureState === 'critical' || pressureState === 'over_limit';
+}
+
+function deriveContinuityRecommendation(input = {}) {
+  const pressureState = String(input.pressureState || 'unknown');
+  const eventType = String(input.eventType || '');
+  const repeatedCritical = Boolean(input.repeatedCritical);
+  const repeatedOverflow = Boolean(input.repeatedOverflow);
+  const reasonCode = String(input.reasonCode || '');
+
+  if (repeatedOverflow) {
+    return { type: CONTINUITY_RECOMMENDATION_TYPES.RECOVERY_REVIEW_REQUIRED, reasonCode: reasonCode || 'repeated_overflow_without_recovery' };
+  }
+  if (eventType === 'pressure_over_limit') {
+    return { type: CONTINUITY_RECOMMENDATION_TYPES.REQUIRE_MANUAL_RESET, reasonCode: reasonCode || 'context_window_exceeded' };
+  }
+  if (eventType === 'downstream_overflow_detected') {
+    return { type: CONTINUITY_RECOMMENDATION_TYPES.RECOMMEND_ROLLOVER, reasonCode: reasonCode || 'downstream_context_overflow' };
+  }
+  if (pressureState === 'critical' && repeatedCritical) {
+    return { type: CONTINUITY_RECOMMENDATION_TYPES.RECOMMEND_COMPACTION_CANDIDATE, reasonCode: reasonCode || 'critical_pressure_repeated' };
+  }
+  if (pressureState === 'warning' || pressureState === 'critical') {
+    return { type: CONTINUITY_RECOMMENDATION_TYPES.MONITOR_PRESSURE, reasonCode: reasonCode || 'pressure_threshold_crossed' };
+  }
+  return { type: CONTINUITY_RECOMMENDATION_TYPES.NONE, reasonCode: reasonCode || 'no_action_required' };
+}
+
+async function getActiveRecommendationForSession(sessionId) {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare(`
+    SELECT *
+    FROM session_continuity_recommendations
+    WHERE session_id = ? AND status = 'active'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+  stmt.bind([sessionId]);
+  const row = stmt.step() ? stmt.getAsObject() : null;
+  stmt.free();
+  return row;
+}
+
+async function getContinuityEventCounts(sessionId, eventType, sinceIso) {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM session_continuity_events
+    WHERE session_id = ? AND event_type = ? AND created_at >= ?
+  `);
+  stmt.bind([sessionId, eventType, sinceIso]);
+  const row = stmt.step() ? stmt.getAsObject() : { count: 0 };
+  stmt.free();
+  return Number(row.count || 0);
+}
+
+async function supersedeActiveRecommendation(sessionId, supersededByRecommendationId, timestamp = getTimestamp()) {
+  return withBillingWrite(async (db) => {
+    const select = db.prepare(`
+      SELECT recommendation_id
+      FROM session_continuity_recommendations
+      WHERE session_id = ? AND status = 'active'
+      ORDER BY created_at DESC
+    `);
+    select.bind([sessionId]);
+    const ids = [];
+    while (select.step()) {
+      ids.push(String(select.getAsObject().recommendation_id || ''));
+    }
+    select.free();
+    for (const recommendationId of ids) {
+      if (!recommendationId || recommendationId === supersededByRecommendationId) {
+        continue;
+      }
+      const update = db.prepare(`
+        UPDATE session_continuity_recommendations
+        SET status = 'superseded',
+            superseded_by_recommendation_id = ?,
+            updated_at = ?
+        WHERE recommendation_id = ? AND status = 'active'
+      `);
+      update.run([supersededByRecommendationId, timestamp, recommendationId]);
+      update.free();
+    }
+    return true;
+  });
+}
+
+async function createOrUpdateSessionRecommendation(input = {}) {
+  const recommendationType = String(input.recommendationType || CONTINUITY_RECOMMENDATION_TYPES.NONE);
+  if (recommendationType === CONTINUITY_RECOMMENDATION_TYPES.NONE) {
+    return null;
+  }
+  const sessionId = String(input.sessionId || '');
+  if (!sessionId) {
+    return null;
+  }
+  const timestamp = input.timestamp || getTimestamp();
+  const pressureState = String(input.pressureState || 'unknown');
+  const executionId = input.executionId || null;
+  const triggerEventId = input.triggerEventId || null;
+  const reasonCode = String(input.reasonCode || '');
+
+  const active = await getActiveRecommendationForSession(sessionId);
+  if (active && String(active.recommendation_type) === recommendationType) {
+    return withBillingWrite(async (db) => {
+      const update = db.prepare(`
+        UPDATE session_continuity_recommendations
+        SET updated_at = ?, execution_id = COALESCE(?, execution_id), pressure_state = ?, trigger_event_id = COALESCE(?, trigger_event_id), reason_code = ?
+        WHERE recommendation_id = ?
+      `);
+      update.run([timestamp, executionId, pressureState, triggerEventId, reasonCode, String(active.recommendation_id)]);
+      update.free();
+      return getActiveRecommendationForSession(sessionId);
+    });
+  }
+
+  const activePrecedence = active ? (CONTINUITY_RECOMMENDATION_PRECEDENCE[String(active.recommendation_type)] ?? -1) : -1;
+  const requestedPrecedence = CONTINUITY_RECOMMENDATION_PRECEDENCE[recommendationType] ?? -1;
+  if (active && activePrecedence > requestedPrecedence) {
+    return active;
+  }
+
+  const recommendationId = createContinuityRecommendationId();
+  await withBillingWrite(async (db) => {
+    const insert = db.prepare(`
+      INSERT INTO session_continuity_recommendations (
+        recommendation_id, session_id, execution_id, recommendation_type, pressure_state,
+        trigger_event_id, reason_code, status, superseded_by_recommendation_id,
+        resolution_reason, created_at, updated_at, resolved_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      recommendationId,
+      sessionId,
+      executionId,
+      recommendationType,
+      pressureState,
+      triggerEventId,
+      reasonCode,
+      CONTINUITY_RECOMMENDATION_STATUS.ACTIVE,
+      null,
+      null,
+      timestamp,
+      timestamp,
+      null,
+    ]);
+    insert.free();
+    return true;
+  });
+
+  await supersedeActiveRecommendation(sessionId, recommendationId, timestamp);
+  return getActiveRecommendationForSession(sessionId);
+}
+
+function resolveRecommendationFromLineageInDb(db, rootSessionId, childSessionId, timestamp = getTimestamp()) {
+  if (!rootSessionId || !childSessionId || rootSessionId === childSessionId) {
+    return 0;
+  }
+  const resolvable = new Set([
+    CONTINUITY_RECOMMENDATION_TYPES.RECOMMEND_ROLLOVER,
+    CONTINUITY_RECOMMENDATION_TYPES.REQUIRE_MANUAL_RESET,
+    CONTINUITY_RECOMMENDATION_TYPES.RECOVERY_REVIEW_REQUIRED,
+  ]);
+
+  const select = db.prepare(`
+    SELECT recommendation_id, recommendation_type
+    FROM session_continuity_recommendations
+    WHERE session_id = ? AND status = 'active'
+    ORDER BY created_at DESC
+  `);
+  select.bind([rootSessionId]);
+  const toResolve = [];
+  while (select.step()) {
+    const row = select.getAsObject();
+    const type = String(row.recommendation_type || '');
+    if (resolvable.has(type)) {
+      toResolve.push(String(row.recommendation_id || ''));
+    }
+  }
+  select.free();
+  for (const recommendationId of toResolve) {
+    const update = db.prepare(`
+      UPDATE session_continuity_recommendations
+      SET status = 'resolved',
+          resolution_reason = 'resolved_by_fresh_session_lineage',
+          updated_at = ?,
+          resolved_at = ?
+      WHERE recommendation_id = ? AND status = 'active'
+    `);
+    update.run([timestamp, timestamp, recommendationId]);
+    update.free();
+  }
+  return toResolve.length;
+}
+
+async function resolveRecommendationFromLineage(rootSessionId, childSessionId, timestamp = getTimestamp(), db = null) {
+  if (db) {
+    return resolveRecommendationFromLineageInDb(db, rootSessionId, childSessionId, timestamp);
+  }
+  return withBillingWrite(async (database) => (
+    resolveRecommendationFromLineageInDb(database, rootSessionId, childSessionId, timestamp)
+  ));
+}
+
+async function linkSessionLineage(rootSessionId, childSessionId, linkReason, triggerExecutionId = null, timestamp = getTimestamp()) {
+  if (!rootSessionId || !childSessionId || rootSessionId === childSessionId) {
+    return false;
+  }
+  return withBillingWrite(async (db) => {
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO session_lineage (
+        lineage_id, root_session_id, child_session_id, link_reason, trigger_execution_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      createSessionLineageId(),
+      rootSessionId,
+      childSessionId,
+      linkReason,
+      triggerExecutionId || null,
+      timestamp,
+    ]);
+    insert.free();
+    return true;
+  });
+}
+
+async function updateExecutionBudgetOutcome(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionBudgetByExecutionId(db, executionId);
+    if (!current) {
+      return null;
+    }
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE execution_budgets
+      SET budget_rejection_reason = CASE
+            WHEN ? != '' THEN ?
+            ELSE budget_rejection_reason
+          END,
+          completed_input_tokens = CASE
+            WHEN ? IS NULL THEN completed_input_tokens
+            ELSE ?
+          END,
+          completed_output_tokens = CASE
+            WHEN ? IS NULL THEN completed_output_tokens
+            ELSE ?
+          END,
+          updated_at = ?
+      WHERE execution_id = ?
+    `);
+    const rejectionReason = String(options.budgetRejectionReason || '');
+    const completedInputTokens = Number.isFinite(Number(options.completedInputTokens))
+      ? Number(options.completedInputTokens)
+      : null;
+    const completedOutputTokens = Number.isFinite(Number(options.completedOutputTokens))
+      ? Number(options.completedOutputTokens)
+      : null;
+    update.run([
+      rejectionReason,
+      rejectionReason,
+      completedInputTokens,
+      completedInputTokens,
+      completedOutputTokens,
+      completedOutputTokens,
+      timestamp,
+      executionId,
+    ]);
+    update.free();
+    return getStoredExecutionBudgetByExecutionId(db, executionId);
+  });
+}
+
+async function recordRejectedRequestLog(entry) {
+  return withBillingWrite(async (db) => {
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO request_logs (
+        request_id, timestamp, route, session_id, execution_id, primary_model, model_used, input_tokens, output_tokens,
+        estimated_cost_usd, status, fallback_triggered, failure_reason, endpoint, error_code, status_code, response_body, reserved_cost_usd
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      entry.request_id,
+      entry.timestamp || getTimestamp(),
+      entry.route,
+      entry.session_id,
+      entry.execution_id || null,
+      entry.primary_model || '',
+      entry.model_used || '',
+      Number(entry.input_tokens || 0),
+      Number(entry.output_tokens || 0),
+      Number(entry.estimated_cost_usd || 0),
+      entry.status || 'rejected',
+      Number(Boolean(entry.fallback_triggered)),
+      entry.failure_reason || '',
+      entry.endpoint || '',
+      entry.error_code || '',
+      Number(entry.status_code || 0),
+      entry.response_body || '',
+      Number(entry.reserved_cost_usd || 0),
+    ]);
+    insert.free();
+    return true;
+  });
+}
+
+function appendExecutionEventTx(db, event) {
+  const insert = db.prepare(`
+    INSERT INTO execution_events (
+      event_id, execution_id, previous_state, new_state, timestamp, actor_source, reason_code, request_id, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    event.event_id || createExecutionEventId(),
+    event.execution_id,
+    event.previous_state || '',
+    event.new_state,
+    event.timestamp || getTimestamp(),
+    event.actor_source || 'runtime',
+    event.reason_code || 'unspecified',
+    event.request_id || null,
+    event.notes || null,
+  ]);
+  insert.free();
+}
+
+async function appendExecutionEvent(event) {
+  return withBillingWrite(async (db) => {
+    appendExecutionEventTx(db, event);
+    return event;
+  });
+}
+
+function appendExecutionLeaseEventTx(db, execution, reasonCode, options = {}) {
+  appendExecutionEventTx(db, {
+    execution_id: execution.execution_id,
+    previous_state: execution.current_state,
+    new_state: execution.current_state,
+    timestamp: options.timestamp || getTimestamp(),
+    actor_source: options.actorSource || 'runtime',
+    reason_code: reasonCode,
+    request_id: options.requestId || execution.last_request_id || null,
+    notes: options.notes || null,
+  });
+}
+
+async function createExecutionRecord(options = {}) {
+  return withBillingWrite(async (db) => {
+    const sessionId = String(options.sessionId || '');
+    if (!sessionId) {
+      throw new Error('Execution creation requires sessionId');
+    }
+
+    const idempotencyKey = options.idempotencyKey ? String(options.idempotencyKey) : '';
+    if (idempotencyKey) {
+      const existingStmt = db.prepare(`
+        SELECT * FROM executions
+        WHERE session_id = ? AND idempotency_key = ?
+        LIMIT 1
+      `);
+      existingStmt.bind([sessionId, idempotencyKey]);
+      let existingRow = null;
+      if (existingStmt.step()) {
+        existingRow = existingStmt.getAsObject();
+      }
+      existingStmt.free();
+
+      if (existingRow) {
+        const existing = hydrateExecutionRow(existingRow);
+        const updateExisting = db.prepare(`
+          UPDATE executions
+          SET updated_at = ?, last_request_id = ?
+          WHERE execution_id = ?
+        `);
+        updateExisting.run([
+          options.timestamp || getTimestamp(),
+          options.requestId || existing.last_request_id || '',
+          existing.execution_id,
+        ]);
+        updateExisting.free();
+        return {
+          execution: {
+            ...existing,
+            updated_at: options.timestamp || getTimestamp(),
+            last_request_id: options.requestId || existing.last_request_id || '',
+          },
+          reused: true,
+        };
+      }
+    }
+
+    const executionId = createExecutionId();
+    const timestamp = options.timestamp || getTimestamp();
+    const insert = db.prepare(`
+      INSERT INTO executions (
+        execution_id, session_id, current_state, created_at, updated_at, last_request_id, idempotency_key, workspace_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      executionId,
+      sessionId,
+      EXECUTION_STATES.CREATED,
+      timestamp,
+      timestamp,
+      options.requestId || '',
+      idempotencyKey || null,
+      options.workspaceId || null,
+    ]);
+    insert.free();
+
+    appendExecutionEventTx(db, {
+      execution_id: executionId,
+      previous_state: '',
+      new_state: EXECUTION_STATES.CREATED,
+      timestamp,
+      actor_source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'request_admitted',
+      request_id: options.requestId || null,
+      notes: options.notes || null,
+    });
+
+    return {
+      execution: {
+        execution_id: executionId,
+        session_id: sessionId,
+        current_state: EXECUTION_STATES.CREATED,
+        created_at: timestamp,
+        updated_at: timestamp,
+        last_request_id: options.requestId || '',
+        idempotency_key: idempotencyKey || null,
+        workspace_id: options.workspaceId || null,
+        lease_id: null,
+        lease_holder: null,
+        lease_acquired_at: null,
+        lease_expires_at: null,
+        lease_epoch: 0,
+        last_heartbeat_at: null,
+        recovery_reason: null,
+        recovery_notes: null,
+      },
+      reused: false,
+    };
+  });
+}
+
+async function transitionExecution(executionId, nextState, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    assertLegalExecutionTransition(current.current_state, nextState);
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE executions
+      SET current_state = ?, updated_at = ?, last_request_id = ?
+      WHERE execution_id = ?
+    `);
+    update.run([
+      nextState,
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionEventTx(db, {
+      execution_id: executionId,
+      previous_state: current.current_state,
+      new_state: nextState,
+      timestamp,
+      actor_source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'state_transition',
+      request_id: options.requestId || null,
+      notes: options.notes || null,
+    });
+
+    return {
+      ...current,
+      current_state: nextState,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+    };
+  });
+}
+
+async function finalizeExecutionIfNeeded(executionId, desiredState, options = {}) {
+  const current = await getExecutionById(executionId);
+  if (!current) {
+    return null;
+  }
+
+  if (current.current_state === desiredState) {
+    return current;
+  }
+
+  if (EXECUTION_TERMINAL_STATES.has(current.current_state)) {
+    return current;
+  }
+
+  return transitionExecution(executionId, desiredState, options);
+}
+
+async function acquireExecutionLease(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    if (![EXECUTION_STATES.QUEUED, EXECUTION_STATES.RETRYING].includes(current.current_state)) {
+      throw new Error(`Execution lease acquisition requires queued or retrying state: ${current.current_state}`);
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const ttlMs = Math.max(1000, Number(options.ttlMs || getExecutionLeaseTtlMs(Boolean(options.isStreaming))));
+    const leaseId = options.leaseId || createExecutionLeaseId();
+    const leaseHolder = options.leaseHolder || buildExecutionLeaseHolder(options.requestId || current.last_request_id || '');
+    const leaseEpoch = Number(current.lease_epoch || 0) + 1;
+    const leaseExpiresAt = addMillisecondsToIso(timestamp, ttlMs);
+
+    const update = db.prepare(`
+      UPDATE executions
+      SET lease_id = ?,
+          lease_holder = ?,
+          lease_acquired_at = ?,
+          lease_expires_at = ?,
+          lease_epoch = ?,
+          last_heartbeat_at = ?,
+          updated_at = ?,
+          last_request_id = ?,
+          recovery_reason = NULL,
+          recovery_notes = NULL
+      WHERE execution_id = ?
+    `);
+    update.run([
+      leaseId,
+      leaseHolder,
+      timestamp,
+      leaseExpiresAt,
+      leaseEpoch,
+      timestamp,
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionLeaseEventTx(db, current, 'execution_lease_acquired', {
+      timestamp,
+      actorSource: options.actorSource || 'runtime',
+      requestId: options.requestId || current.last_request_id || null,
+      notes: `lease_epoch=${leaseEpoch}`,
+    });
+
+    return {
+      ...current,
+      lease_id: leaseId,
+      lease_holder: leaseHolder,
+      lease_acquired_at: timestamp,
+      lease_expires_at: leaseExpiresAt,
+      lease_epoch: leaseEpoch,
+      last_heartbeat_at: timestamp,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+      recovery_reason: null,
+      recovery_notes: null,
+    };
+  });
+}
+
+async function refreshExecutionLease(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    if (!current.lease_id || !current.lease_holder) {
+      throw new Error(`Execution has no active lease: ${executionId}`);
+    }
+
+    if (options.leaseId && current.lease_id !== options.leaseId) {
+      throw new Error(`Execution lease mismatch for refresh: ${executionId}`);
+    }
+    if (options.leaseHolder && current.lease_holder !== options.leaseHolder) {
+      throw new Error(`Execution lease holder mismatch for refresh: ${executionId}`);
+    }
+    if (Number.isFinite(Number(options.leaseEpoch)) && Number(current.lease_epoch || 0) !== Number(options.leaseEpoch)) {
+      throw new Error(`Execution lease epoch mismatch for refresh: ${executionId}`);
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const ttlMs = Math.max(1000, Number(options.ttlMs || getExecutionLeaseTtlMs(Boolean(options.isStreaming))));
+    const leaseExpiresAt = addMillisecondsToIso(timestamp, ttlMs);
+
+    const update = db.prepare(`
+      UPDATE executions
+      SET lease_expires_at = ?,
+          last_heartbeat_at = ?,
+          updated_at = ?,
+          last_request_id = ?
+      WHERE execution_id = ?
+    `);
+    update.run([
+      leaseExpiresAt,
+      timestamp,
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionLeaseEventTx(db, current, 'execution_lease_refreshed', {
+      timestamp,
+      actorSource: options.actorSource || 'runtime',
+      requestId: options.requestId || current.last_request_id || null,
+      notes: `lease_epoch=${current.lease_epoch}`,
+    });
+
+    return {
+      ...current,
+      lease_expires_at: leaseExpiresAt,
+      last_heartbeat_at: timestamp,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+    };
+  });
+}
+
+async function releaseExecutionLease(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    if (!current.lease_id && !current.lease_holder) {
+      return current;
+    }
+
+    if (options.leaseId && current.lease_id !== options.leaseId) {
+      return current;
+    }
+    if (options.leaseHolder && current.lease_holder !== options.leaseHolder) {
+      return current;
+    }
+    if (Number.isFinite(Number(options.leaseEpoch)) && Number(current.lease_epoch || 0) !== Number(options.leaseEpoch)) {
+      return current;
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE executions
+      SET lease_id = NULL,
+          lease_holder = NULL,
+          lease_acquired_at = NULL,
+          lease_expires_at = NULL,
+          last_heartbeat_at = NULL,
+          updated_at = ?,
+          last_request_id = ?
+      WHERE execution_id = ?
+    `);
+    update.run([
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionLeaseEventTx(db, current, 'execution_lease_released', {
+      timestamp,
+      actorSource: options.actorSource || 'runtime',
+      requestId: options.requestId || current.last_request_id || null,
+      notes: options.notes || `lease_epoch=${current.lease_epoch}`,
+    });
+
+    return {
+      ...current,
+      lease_id: null,
+      lease_holder: null,
+      lease_acquired_at: null,
+      lease_expires_at: null,
+      last_heartbeat_at: null,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+    };
+  });
+}
+
+async function assertExecutionLeaseHolder(executionId, options = {}) {
+  const current = await getExecutionById(executionId);
+  if (!current) {
+    throw new Error(`Execution not found: ${executionId}`);
+  }
+
+  const leaseId = options.leaseId || '';
+  const leaseHolder = options.leaseHolder || '';
+  const leaseEpoch = Number(options.leaseEpoch || 0);
+
+  const matches = Boolean(
+    current.lease_id
+    && current.lease_holder
+    && leaseId
+    && leaseHolder
+    && Number.isFinite(leaseEpoch)
+    && current.lease_id === leaseId
+    && current.lease_holder === leaseHolder
+    && Number(current.lease_epoch || 0) === leaseEpoch
+  );
+
+  return {
+    current,
+    matches,
+  };
+}
+
+async function markExecutionRecoveryRequired(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    if (current.current_state === EXECUTION_STATES.RECOVERY_REQUIRED) {
+      return current;
+    }
+
+    if (EXECUTION_TERMINAL_STATES.has(current.current_state)) {
+      return current;
+    }
+
+    if (options.leaseId && current.lease_id !== options.leaseId) {
+      appendExecutionLeaseEventTx(db, current, 'execution_finalize_rejected_stale_lease', {
+        timestamp: options.timestamp || getTimestamp(),
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.reasonCode || 'stale_lease',
+      });
+      return current;
+    }
+    if (options.leaseHolder && current.lease_holder !== options.leaseHolder) {
+      appendExecutionLeaseEventTx(db, current, 'execution_finalize_rejected_stale_lease', {
+        timestamp: options.timestamp || getTimestamp(),
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.reasonCode || 'stale_lease',
+      });
+      return current;
+    }
+    if (Number.isFinite(Number(options.leaseEpoch)) && Number(current.lease_epoch || 0) !== Number(options.leaseEpoch)) {
+      appendExecutionLeaseEventTx(db, current, 'execution_finalize_rejected_stale_lease', {
+        timestamp: options.timestamp || getTimestamp(),
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.reasonCode || 'stale_lease',
+      });
+      return current;
+    }
+
+    assertLegalExecutionTransition(current.current_state, EXECUTION_STATES.RECOVERY_REQUIRED);
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE executions
+      SET current_state = ?,
+          updated_at = ?,
+          last_request_id = ?,
+          recovery_reason = ?,
+          recovery_notes = ?,
+          lease_id = NULL,
+          lease_holder = NULL,
+          lease_acquired_at = NULL,
+          lease_expires_at = NULL,
+          last_heartbeat_at = NULL
+      WHERE execution_id = ?
+    `);
+    update.run([
+      EXECUTION_STATES.RECOVERY_REQUIRED,
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      options.recoveryReason || options.reasonCode || 'recovery_required',
+      options.recoveryNotes || options.notes || null,
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionEventTx(db, {
+      execution_id: executionId,
+      previous_state: current.current_state,
+      new_state: EXECUTION_STATES.RECOVERY_REQUIRED,
+      timestamp,
+      actor_source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'execution_recovery_required',
+      request_id: options.requestId || null,
+      notes: options.recoveryNotes || options.notes || null,
+    });
+
+    appendExecutionLeaseEventTx(db, current, 'execution_lease_released', {
+      timestamp,
+      actorSource: options.actorSource || 'runtime',
+      requestId: options.requestId || current.last_request_id || null,
+      notes: 'released_on_recovery_required',
+    });
+
+    return {
+      ...current,
+      current_state: EXECUTION_STATES.RECOVERY_REQUIRED,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+      recovery_reason: options.recoveryReason || options.reasonCode || 'recovery_required',
+      recovery_notes: options.recoveryNotes || options.notes || null,
+      lease_id: null,
+      lease_holder: null,
+      lease_acquired_at: null,
+      lease_expires_at: null,
+      last_heartbeat_at: null,
+    };
+  });
+}
+
+function classifyExecutionInterruption(options = {}) {
+  const status = String(options.status || '');
+  const errorCode = String(options.errorCode || '');
+  const meaningfulOutputStarted = Boolean(options.meaningfulOutputStarted);
+
+  if (status === 'success') {
+    return {
+      targetState: EXECUTION_STATES.COMPLETED,
+      billingStatus: 'success',
+      reasonCode: 'stream_completed',
+    };
+  }
+
+  if (status === 'interrupted') {
+    if (meaningfulOutputStarted) {
+      return {
+        targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+        billingStatus: 'interrupted',
+        reasonCode: errorCode || 'client_disconnect',
+        recoveryReason: 'ambiguous_live_interruption',
+      };
+    }
+    return {
+      targetState: EXECUTION_STATES.FAILED,
+      billingStatus: 'failed',
+      reasonCode: errorCode || 'client_disconnect',
+    };
+  }
+
+  if (['upstream_timeout', 'stream_proxy_failed'].includes(errorCode)) {
+    if (meaningfulOutputStarted) {
+      return {
+        targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+        billingStatus: 'interrupted',
+        reasonCode: errorCode,
+        recoveryReason: 'ambiguous_stream_interruption',
+      };
+    }
+  }
+
+  return {
+    targetState: EXECUTION_STATES.FAILED,
+    billingStatus: status === 'interrupted' ? 'interrupted' : 'failed',
+    reasonCode: errorCode || 'stream_failed',
+  };
+}
+
+async function transitionExecutionWithLease(executionId, nextState, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    if (options.leaseId && current.lease_id !== options.leaseId) {
+      appendExecutionLeaseEventTx(db, current, 'execution_finalize_rejected_stale_lease', {
+        timestamp: options.timestamp || getTimestamp(),
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.reasonCode || 'stale_lease',
+      });
+      return { ...current, rejected: true };
+    }
+    if (options.leaseHolder && current.lease_holder !== options.leaseHolder) {
+      appendExecutionLeaseEventTx(db, current, 'execution_finalize_rejected_stale_lease', {
+        timestamp: options.timestamp || getTimestamp(),
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.reasonCode || 'stale_lease',
+      });
+      return { ...current, rejected: true };
+    }
+    if (Number.isFinite(Number(options.leaseEpoch)) && Number(options.leaseEpoch) > 0
+      && Number(current.lease_epoch || 0) !== Number(options.leaseEpoch)) {
+      appendExecutionLeaseEventTx(db, current, 'execution_finalize_rejected_stale_lease', {
+        timestamp: options.timestamp || getTimestamp(),
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.reasonCode || 'stale_lease',
+      });
+      return { ...current, rejected: true };
+    }
+
+    if (current.current_state === nextState) {
+      return current;
+    }
+    if (EXECUTION_TERMINAL_STATES.has(current.current_state)) {
+      return current;
+    }
+
+    assertLegalExecutionTransition(current.current_state, nextState);
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE executions
+      SET current_state = ?,
+          updated_at = ?,
+          last_request_id = ?,
+          recovery_reason = ?,
+          recovery_notes = ?,
+          lease_id = ?,
+          lease_holder = ?,
+          lease_acquired_at = ?,
+          lease_expires_at = ?,
+          last_heartbeat_at = ?
+      WHERE execution_id = ?
+    `);
+    const clearLease = Boolean(options.clearLease);
+    update.run([
+      nextState,
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      options.recoveryReason === undefined ? (nextState === EXECUTION_STATES.RECOVERY_REQUIRED ? (current.recovery_reason || options.reasonCode || 'recovery_required') : null) : options.recoveryReason,
+      options.recoveryNotes === undefined ? (nextState === EXECUTION_STATES.RECOVERY_REQUIRED ? (options.notes || current.recovery_notes || null) : null) : options.recoveryNotes,
+      clearLease ? null : current.lease_id,
+      clearLease ? null : current.lease_holder,
+      clearLease ? null : current.lease_acquired_at,
+      clearLease ? null : current.lease_expires_at,
+      clearLease ? null : current.last_heartbeat_at,
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionEventTx(db, {
+      execution_id: executionId,
+      previous_state: current.current_state,
+      new_state: nextState,
+      timestamp,
+      actor_source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'state_transition',
+      request_id: options.requestId || null,
+      notes: options.notes || null,
+    });
+
+    if (clearLease && current.lease_id) {
+      appendExecutionLeaseEventTx(db, current, 'execution_lease_released', {
+        timestamp,
+        actorSource: options.actorSource || 'runtime',
+        requestId: options.requestId || current.last_request_id || null,
+        notes: options.notes || `released_on_${nextState}`,
+      });
+    }
+
+    return {
+      ...current,
+      current_state: nextState,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+      recovery_reason: nextState === EXECUTION_STATES.RECOVERY_REQUIRED
+        ? (options.recoveryReason === undefined ? (current.recovery_reason || options.reasonCode || 'recovery_required') : options.recoveryReason)
+        : null,
+      recovery_notes: nextState === EXECUTION_STATES.RECOVERY_REQUIRED
+        ? (options.recoveryNotes === undefined ? (options.notes || current.recovery_notes || null) : options.recoveryNotes)
+        : null,
+      lease_id: clearLease ? null : current.lease_id,
+      lease_holder: clearLease ? null : current.lease_holder,
+      lease_acquired_at: clearLease ? null : current.lease_acquired_at,
+      lease_expires_at: clearLease ? null : current.lease_expires_at,
+      last_heartbeat_at: clearLease ? null : current.last_heartbeat_at,
+      rejected: false,
+    };
+  });
 }
 
 function estimateTextTokens(value) {
@@ -1732,15 +3690,16 @@ async function reserveBillingBudget(entry) {
     if (rejectedReason) {
       const insert = db.prepare(`
       INSERT OR REPLACE INTO request_logs (
-          request_id, timestamp, route, session_id, primary_model, model_used, input_tokens, output_tokens,
+          request_id, timestamp, route, session_id, execution_id, primary_model, model_used, input_tokens, output_tokens,
           estimated_cost_usd, status, fallback_triggered, failure_reason, endpoint, error_code, status_code, response_body, reserved_cost_usd
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       insert.run([
         entry.request_id,
         entry.timestamp,
         entry.route,
         entry.session_id,
+        entry.execution_id || null,
         entry.primary_model || '',
         entry.model_used,
         entry.input_tokens,
@@ -1756,6 +3715,20 @@ async function reserveBillingBudget(entry) {
         0,
       ]);
       insert.free();
+      if (entry.execution_id) {
+        const updateBudget = db.prepare(`
+          UPDATE execution_budgets
+          SET budget_rejection_reason = ?,
+              updated_at = ?
+          WHERE execution_id = ?
+        `);
+        updateBudget.run([
+          rejectedReason,
+          entry.timestamp,
+          entry.execution_id,
+        ]);
+        updateBudget.free();
+      }
       return {
         accepted: false,
         reason: rejectedReason,
@@ -1767,15 +3740,16 @@ async function reserveBillingBudget(entry) {
 
     const insert = db.prepare(`
       INSERT OR REPLACE INTO request_logs (
-        request_id, timestamp, route, session_id, primary_model, model_used, input_tokens, output_tokens,
+        request_id, timestamp, route, session_id, execution_id, primary_model, model_used, input_tokens, output_tokens,
         estimated_cost_usd, status, fallback_triggered, failure_reason, endpoint, error_code, status_code, response_body, reserved_cost_usd
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     insert.run([
       entry.request_id,
       entry.timestamp,
       entry.route,
       entry.session_id,
+      entry.execution_id || null,
       entry.primary_model || '',
       entry.model_used,
       entry.input_tokens,
@@ -1871,6 +3845,7 @@ async function finalizeBillingRequest(entry) {
       const updateLog = db.prepare(`
         UPDATE request_logs
         SET timestamp = ?,
+            execution_id = ?,
             primary_model = ?,
             model_used = ?,
             input_tokens = ?,
@@ -1888,6 +3863,7 @@ async function finalizeBillingRequest(entry) {
       `);
       updateLog.run([
         entry.timestamp,
+        entry.execution_id || null,
         entry.primary_model || '',
         entry.model_used,
         entry.input_tokens,
@@ -1904,6 +3880,23 @@ async function finalizeBillingRequest(entry) {
         entry.request_id,
       ]);
       updateLog.free();
+
+      if (entry.execution_id) {
+        const updateBudget = db.prepare(`
+          UPDATE execution_budgets
+          SET completed_input_tokens = ?,
+              completed_output_tokens = ?,
+              updated_at = ?
+          WHERE execution_id = ?
+        `);
+        updateBudget.run([
+          Number(entry.input_tokens || 0),
+          Number(entry.output_tokens || 0),
+          entry.timestamp,
+          entry.execution_id,
+        ]);
+        updateBudget.free();
+      }
 
       return {
         totalSpend: nextTotal,
@@ -1975,7 +3968,7 @@ async function getAdminRequests(filters = {}) {
   const offset = Number.isFinite(parsedOffset) ? Math.max(0, parsedOffset) : 0;
   const stmt = db.prepare(`
     SELECT request_id, timestamp, route, session_id, primary_model, model_used, input_tokens, output_tokens,
-           estimated_cost_usd, status, fallback_triggered, failure_reason, endpoint, error_code, status_code, response_body
+           execution_id, estimated_cost_usd, status, fallback_triggered, failure_reason, endpoint, error_code, status_code, response_body
     FROM request_logs
     ${where}
     ORDER BY timestamp DESC
@@ -2553,6 +4546,135 @@ function translateResponsesToolToChatTool(tool) {
   return translated;
 }
 
+function isPathWithinRoot(candidatePath, canonicalRoot) {
+  return candidatePath === canonicalRoot || candidatePath.startsWith(`${canonicalRoot}${path.sep}`);
+}
+
+function getAllowedWorkspaceRoots() {
+  const raw = String(process.env.BLOCKFORK_WORKSPACE_ALLOWED_ROOTS || '');
+  const seen = new Set();
+  const roots = [];
+  for (const entry of raw.split(',').map((part) => part.trim()).filter(Boolean)) {
+    const declaredRoot = path.resolve(entry);
+    if (!path.isAbsolute(declaredRoot)) {
+      throw new Error(`Configured workspace root must be absolute: ${entry}`);
+    }
+    if (!fs.existsSync(declaredRoot)) {
+      throw new Error(`Configured workspace root does not exist: ${declaredRoot}`);
+    }
+    const stats = fs.statSync(declaredRoot);
+    if (!stats.isDirectory()) {
+      throw new Error(`Configured workspace root must be a directory: ${declaredRoot}`);
+    }
+    const canonicalRoot = fs.realpathSync.native(declaredRoot);
+    if (canonicalRoot !== declaredRoot) {
+      throw new Error(`Configured workspace root must not rely on path aliases or symlinks: ${declaredRoot}`);
+    }
+    if (seen.has(canonicalRoot)) {
+      continue;
+    }
+    seen.add(canonicalRoot);
+    roots.push({
+      declared_root: declaredRoot,
+      canonical_root: canonicalRoot,
+      root_source: `env:BLOCKFORK_WORKSPACE_ALLOWED_ROOTS:${declaredRoot}`,
+    });
+  }
+  return roots;
+}
+
+function resolveCanonicalArtifactPath(filePath) {
+  const declaredPath = typeof filePath === 'string' ? filePath.trim() : '';
+  if (!declaredPath) {
+    return { ok: false, reason: 'missing_artifact_path' };
+  }
+  if (!path.isAbsolute(declaredPath)) {
+    return { ok: false, reason: 'artifact_path_must_be_absolute' };
+  }
+
+  const normalizedDeclaredPath = path.resolve(declaredPath);
+  const existing = fs.existsSync(normalizedDeclaredPath);
+  const parentPath = path.dirname(normalizedDeclaredPath);
+  if (!fs.existsSync(parentPath)) {
+    return { ok: false, reason: 'artifact_parent_path_not_found' };
+  }
+
+  let canonicalParent;
+  try {
+    canonicalParent = fs.realpathSync.native(parentPath);
+  } catch (error) {
+    return { ok: false, reason: 'artifact_parent_path_not_found' };
+  }
+
+  if (canonicalParent !== parentPath) {
+    return { ok: false, reason: 'artifact_path_symlink_escape' };
+  }
+
+  let canonicalPath = path.join(canonicalParent, path.basename(normalizedDeclaredPath));
+  if (existing) {
+    const entryStats = fs.lstatSync(normalizedDeclaredPath);
+    if (entryStats.isSymbolicLink()) {
+      return { ok: false, reason: 'artifact_path_symlink_escape' };
+    }
+    try {
+      canonicalPath = fs.realpathSync.native(normalizedDeclaredPath);
+    } catch (error) {
+      return { ok: false, reason: 'artifact_path_not_found' };
+    }
+    if (canonicalPath !== normalizedDeclaredPath) {
+      return { ok: false, reason: 'artifact_path_symlink_escape' };
+    }
+  }
+
+  return {
+    ok: true,
+    declared_path: normalizedDeclaredPath,
+    canonical_path: canonicalPath,
+    exists: existing,
+  };
+}
+
+function resolveWorkspaceBindingForArtifact(contract) {
+  if (!contract || contract.requested !== true) {
+    return { required: false, ok: true };
+  }
+
+  const roots = getAllowedWorkspaceRoots();
+  if (!roots.length) {
+    return { required: true, ok: false, reason: 'artifact_workspace_roots_unconfigured' };
+  }
+
+  const evidence = contract.evidence && typeof contract.evidence === 'object' ? contract.evidence : null;
+  if (!evidence) {
+    return { required: true, ok: false, reason: 'missing_artifact_evidence' };
+  }
+
+  const pathResolution = resolveCanonicalArtifactPath(evidence.path);
+  if (!pathResolution.ok) {
+    return { required: true, ok: false, reason: pathResolution.reason };
+  }
+
+  const matches = roots.filter((root) => isPathWithinRoot(pathResolution.canonical_path, root.canonical_root));
+  if (!matches.length) {
+    return { required: true, ok: false, reason: 'artifact_path_outside_workspace' };
+  }
+  if (matches.length > 1) {
+    return { required: true, ok: false, reason: 'artifact_path_ambiguous_workspace' };
+  }
+
+  return {
+    required: true,
+    ok: true,
+    declared_path: pathResolution.declared_path,
+    canonical_path: pathResolution.canonical_path,
+    exists: pathResolution.exists,
+    workspace_root: matches[0].canonical_root,
+    root_source: matches[0].root_source,
+    delivery_requested: evidence.delivery_requested === true || evidence.deliveryRequested === true,
+    delivery_confirmed: evidence.delivery_succeeded === true || evidence.deliverySucceeded === true,
+  };
+}
+
 function normalizeResponsesResponseFromChat(payload, modelAlias) {
   const assistantContent = stringifyTextContent(payload?.choices?.[0]?.message?.content ?? '');
 
@@ -2582,36 +4704,325 @@ function getArtifactContractInput(reqBody = {}) {
   return body?.metadata?.blockfork_artifact_contract || body?.blockfork_artifact_contract || null;
 }
 
-function checkArtifactEvidence(contract) {
+async function findOrCreateWorkspaceBinding(canonicalRoot, rootSource, options = {}) {
+  return withBillingWrite(async (db) => {
+    const existing = await getStoredWorkspaceByRoot(db, canonicalRoot);
+    if (existing) {
+      return existing;
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const workspaceId = createWorkspaceId();
+    const insert = db.prepare(`
+      INSERT INTO workspaces (
+        workspace_id, canonical_root, root_source, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      workspaceId,
+      canonicalRoot,
+      rootSource || 'runtime',
+      timestamp,
+      timestamp,
+    ]);
+    insert.free();
+
+    return {
+      workspace_id: workspaceId,
+      canonical_root: canonicalRoot,
+      root_source: rootSource || 'runtime',
+      created_at: timestamp,
+      updated_at: timestamp,
+    };
+  });
+}
+
+async function getWorkspaceById(workspaceId) {
+  const db = await ensureBillingDb();
+  return getStoredWorkspaceById(db, workspaceId);
+}
+
+async function attachExecutionWorkspace(executionId, workspaceId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionById(db, executionId);
+    if (!current) {
+      throw new Error(`Execution not found: ${executionId}`);
+    }
+
+    if (current.workspace_id) {
+      if (current.workspace_id !== workspaceId) {
+        throw new Error('artifact_workspace_rebind_not_allowed');
+      }
+      return current;
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE executions
+      SET workspace_id = ?, updated_at = ?, last_request_id = ?
+      WHERE execution_id = ?
+    `);
+    update.run([
+      workspaceId,
+      timestamp,
+      options.requestId || current.last_request_id || '',
+      executionId,
+    ]);
+    update.free();
+
+    appendExecutionEventTx(db, {
+      execution_id: executionId,
+      previous_state: current.current_state,
+      new_state: current.current_state,
+      timestamp,
+      actor_source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'execution_workspace_bound',
+      request_id: options.requestId || current.last_request_id || null,
+      notes: workspaceId,
+    });
+
+    return {
+      ...current,
+      workspace_id: workspaceId,
+      updated_at: timestamp,
+      last_request_id: options.requestId || current.last_request_id || '',
+    };
+  });
+}
+
+async function getExecutionArtifactByExecutionId(executionId) {
+  const db = await ensureBillingDb();
+  return getStoredExecutionArtifactByExecutionId(db, executionId);
+}
+
+async function createExecutionArtifactRecord(options = {}) {
+  return withBillingWrite(async (db) => {
+    const executionId = String(options.executionId || '');
+    const workspaceId = String(options.workspaceId || '');
+    if (!executionId || !workspaceId) {
+      throw new Error('Artifact record requires executionId and workspaceId');
+    }
+
+    const current = await getStoredExecutionArtifactByExecutionId(db, executionId);
+    const timestamp = options.timestamp || getTimestamp();
+    const deliveryRequested = Number(Boolean(options.deliveryRequested));
+    const deliveryConfirmed = Number(Boolean(options.deliveryConfirmed));
+
+    if (current) {
+      if (current.workspace_id !== workspaceId) {
+        throw new Error('artifact_workspace_rebind_not_allowed');
+      }
+      const update = db.prepare(`
+        UPDATE execution_artifacts
+        SET declared_path = ?,
+            canonical_path = ?,
+            verification_state = ?,
+            reason_code = ?,
+            delivery_requested = ?,
+            delivery_confirmed = ?,
+            updated_at = ?
+        WHERE execution_id = ?
+      `);
+      update.run([
+        options.declaredPath,
+        options.canonicalPath,
+        options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
+        options.reasonCode || '',
+        deliveryRequested,
+        deliveryConfirmed,
+        timestamp,
+        executionId,
+      ]);
+      update.free();
+      return {
+        ...current,
+        declared_path: options.declaredPath,
+        canonical_path: options.canonicalPath,
+        verification_state: options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
+        reason_code: options.reasonCode || '',
+        delivery_requested: deliveryRequested,
+        delivery_confirmed: deliveryConfirmed,
+        updated_at: timestamp,
+      };
+    }
+
+    const artifactId = createExecutionArtifactId();
+    const insert = db.prepare(`
+      INSERT INTO execution_artifacts (
+        artifact_id, execution_id, workspace_id, declared_path, canonical_path, verification_state,
+        reason_code, delivery_requested, delivery_confirmed, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      artifactId,
+      executionId,
+      workspaceId,
+      options.declaredPath,
+      options.canonicalPath,
+      options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
+      options.reasonCode || '',
+      deliveryRequested,
+      deliveryConfirmed,
+      timestamp,
+      timestamp,
+    ]);
+    insert.free();
+    return {
+      artifact_id: artifactId,
+      execution_id: executionId,
+      workspace_id: workspaceId,
+      declared_path: options.declaredPath,
+      canonical_path: options.canonicalPath,
+      verification_state: options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
+      reason_code: options.reasonCode || '',
+      delivery_requested: deliveryRequested,
+      delivery_confirmed: deliveryConfirmed,
+      created_at: timestamp,
+      updated_at: timestamp,
+    };
+  });
+}
+
+async function updateExecutionArtifactVerification(executionId, verificationState, options = {}) {
+  return withBillingWrite(async (db) => {
+    const current = await getStoredExecutionArtifactByExecutionId(db, executionId);
+    if (!current) {
+      throw new Error(`Artifact record not found for execution: ${executionId}`);
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const update = db.prepare(`
+      UPDATE execution_artifacts
+      SET verification_state = ?,
+          reason_code = ?,
+          delivery_requested = ?,
+          delivery_confirmed = ?,
+          canonical_path = ?,
+          declared_path = ?,
+          updated_at = ?
+      WHERE execution_id = ?
+    `);
+    update.run([
+      verificationState,
+      options.reasonCode || '',
+      Number(Boolean(options.deliveryRequested ?? current.delivery_requested)),
+      Number(Boolean(options.deliveryConfirmed ?? current.delivery_confirmed)),
+      options.canonicalPath || current.canonical_path,
+      options.declaredPath || current.declared_path,
+      timestamp,
+      executionId,
+    ]);
+    update.free();
+
+    return {
+      ...current,
+      verification_state: verificationState,
+      reason_code: options.reasonCode || '',
+      delivery_requested: Number(Boolean(options.deliveryRequested ?? current.delivery_requested)),
+      delivery_confirmed: Number(Boolean(options.deliveryConfirmed ?? current.delivery_confirmed)),
+      canonical_path: options.canonicalPath || current.canonical_path,
+      declared_path: options.declaredPath || current.declared_path,
+      updated_at: timestamp,
+    };
+  });
+}
+
+async function assertArtifactPathWithinWorkspace(canonicalPath, workspaceId) {
+  const workspace = await getWorkspaceById(workspaceId);
+  if (!workspace || !workspace.canonical_root) {
+    return { ok: false, reason: 'artifact_workspace_missing' };
+  }
+  if (!isPathWithinRoot(canonicalPath, workspace.canonical_root)) {
+    return { ok: false, reason: 'artifact_path_outside_workspace', workspace };
+  }
+  return { ok: true, workspace };
+}
+
+async function prepareArtifactBindingForExecution(executionId, reqBody, options = {}) {
+  const contract = getArtifactContractInput(reqBody);
   if (!contract || contract.requested !== true) {
     return { required: false, ok: true };
   }
 
-  const evidence = contract.evidence && typeof contract.evidence === 'object' ? contract.evidence : null;
-  if (!evidence) {
-    return { required: true, ok: false, reason: 'missing_artifact_evidence' };
+  const binding = resolveWorkspaceBindingForArtifact(contract);
+  if (!binding.ok) {
+    return { ...binding, contract };
   }
 
-  const filePath = typeof evidence.path === 'string' ? evidence.path.trim() : '';
-  if (!filePath) {
-    return { required: true, ok: false, reason: 'missing_artifact_path' };
+  const workspace = await findOrCreateWorkspaceBinding(binding.workspace_root, binding.root_source, options);
+  const execution = await attachExecutionWorkspace(executionId, workspace.workspace_id, {
+    requestId: options.requestId || '',
+    actorSource: options.actorSource || 'runtime',
+    reasonCode: 'execution_workspace_bound',
+  });
+  const artifact = await createExecutionArtifactRecord({
+    executionId,
+    workspaceId: workspace.workspace_id,
+    declaredPath: binding.declared_path,
+    canonicalPath: binding.canonical_path,
+    verificationState: ARTIFACT_VERIFICATION_STATES.PENDING,
+    deliveryRequested: binding.delivery_requested,
+    deliveryConfirmed: binding.delivery_confirmed,
+    reasonCode: '',
+    timestamp: options.timestamp,
+  });
+
+  return {
+    required: true,
+    ok: true,
+    contract,
+    workspace,
+    artifact,
+    execution,
+    binding,
+  };
+}
+
+async function checkArtifactEvidence(contract, options = {}) {
+  if (!contract || contract.requested !== true) {
+    return { required: false, ok: true };
   }
 
-  if (!fs.existsSync(filePath)) {
+  const binding = resolveWorkspaceBindingForArtifact(contract);
+  if (!binding.ok) {
+    return { required: true, ok: false, reason: binding.reason };
+  }
+
+  if (options.executionId) {
+    const execution = await getExecutionById(options.executionId);
+    if (!execution) {
+      return { required: true, ok: false, reason: 'artifact_execution_missing' };
+    }
+    if (!execution.workspace_id) {
+      return { required: true, ok: false, reason: 'artifact_workspace_missing' };
+    }
+    const workspaceCheck = await assertArtifactPathWithinWorkspace(binding.canonical_path, execution.workspace_id);
+    if (!workspaceCheck.ok) {
+      return { required: true, ok: false, reason: workspaceCheck.reason };
+    }
+  }
+
+  if (!fs.existsSync(binding.declared_path)) {
     return { required: true, ok: false, reason: 'artifact_path_not_found' };
   }
 
-  const stats = fs.statSync(filePath);
+  const stats = fs.statSync(binding.declared_path);
   if (!stats.isFile() || Number(stats.size || 0) <= 0) {
     return { required: true, ok: false, reason: 'artifact_not_nonempty_file' };
   }
 
-  const deliveryRequested = evidence.delivery_requested === true || evidence.deliveryRequested === true;
-  if (deliveryRequested && !(evidence.delivery_succeeded === true || evidence.deliverySucceeded === true)) {
+  if (binding.delivery_requested && !binding.delivery_confirmed) {
     return { required: true, ok: false, reason: 'artifact_delivery_not_confirmed' };
   }
 
-  return { required: true, ok: true };
+  return {
+    required: true,
+    ok: true,
+    declared_path: binding.declared_path,
+    canonical_path: binding.canonical_path,
+    delivery_requested: binding.delivery_requested,
+    delivery_confirmed: binding.delivery_confirmed,
+  };
 }
 
 function detectArtifactClaim(text = '') {
@@ -2620,15 +5031,22 @@ function detectArtifactClaim(text = '') {
     && /\b(file|pdf|artifact|document|report)\b/.test(normalized);
 }
 
-function validateArtifactHonestyOrError(reqBody, completionText) {
+async function validateArtifactHonestyOrError(reqBody, completionText, options = {}) {
   const contract = getArtifactContractInput(reqBody);
-  const evidenceCheck = checkArtifactEvidence(contract);
+  const evidenceCheck = await checkArtifactEvidence(contract, options);
   if (evidenceCheck.required && !evidenceCheck.ok) {
+    if (options.executionId) {
+      await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.REJECTED, {
+        reasonCode: evidenceCheck.reason,
+      });
+    }
     return {
       statusCode: 422,
       message: `Artifact verification failed: ${evidenceCheck.reason}`,
       type: 'invalid_request_error',
       code: 'artifact_verification_failed',
+      reason: evidenceCheck.reason,
+      requiresRecovery: Boolean(options.meaningfulOutputStarted),
     };
   }
 
@@ -2637,12 +5055,29 @@ function validateArtifactHonestyOrError(reqBody, completionText) {
   }
 
   if (detectArtifactClaim(completionText) && !evidenceCheck.ok) {
+    if (options.executionId) {
+      await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.REJECTED, {
+        reasonCode: 'artifact_claim_without_evidence',
+      });
+    }
     return {
       statusCode: 422,
       message: 'Artifact claim blocked: no verifiable artifact evidence',
       type: 'invalid_request_error',
       code: 'artifact_claim_without_evidence',
+      reason: 'artifact_claim_without_evidence',
+      requiresRecovery: Boolean(options.meaningfulOutputStarted),
     };
+  }
+
+  if (options.executionId) {
+    await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.VERIFIED, {
+      reasonCode: '',
+      deliveryRequested: evidenceCheck.delivery_requested,
+      deliveryConfirmed: evidenceCheck.delivery_confirmed,
+      canonicalPath: evidenceCheck.canonical_path,
+      declaredPath: evidenceCheck.declared_path,
+    });
   }
 
   return null;
@@ -2979,13 +5414,248 @@ async function executeChatFlow(session, body, options = {}) {
   }
 
   const requestId = createRequestId();
+  const executionResult = await createExecutionRecord({
+    sessionId: session.session_id,
+    requestId,
+    idempotencyKey: options.idempotencyKey || '',
+    actorSource: 'runtime',
+    reasonCode: 'request_admitted',
+  });
+  const execution = executionResult.execution;
+  await transitionExecution(execution.execution_id, EXECUTION_STATES.QUEUED, {
+    requestId,
+    actorSource: 'runtime',
+    reasonCode: 'request_queued',
+  });
+  const executionLease = await acquireExecutionLease(execution.execution_id, {
+    requestId,
+    actorSource: 'runtime',
+    isStreaming: Boolean(body.stream),
+  });
+  await transitionExecutionWithLease(execution.execution_id, EXECUTION_STATES.RUNNING, {
+    requestId,
+    actorSource: 'runtime',
+    reasonCode: 'request_running',
+    leaseId: executionLease.lease_id,
+    leaseHolder: executionLease.lease_holder,
+    leaseEpoch: executionLease.lease_epoch,
+  });
+  const artifactBinding = await prepareArtifactBindingForExecution(execution.execution_id, body, {
+    requestId,
+    actorSource: 'runtime',
+    timestamp: getTimestamp(),
+  });
+  if (artifactBinding.required && !artifactBinding.ok) {
+    await transitionExecutionWithLease(execution.execution_id, EXECUTION_STATES.FAILED, {
+      requestId,
+      actorSource: 'runtime',
+      reasonCode: artifactBinding.reason || 'artifact_workspace_invalid',
+      leaseId: executionLease.lease_id,
+      leaseHolder: executionLease.lease_holder,
+      leaseEpoch: executionLease.lease_epoch,
+      clearLease: true,
+    });
+    return {
+      error: {
+        statusCode: 422,
+        message: `Artifact verification failed: ${artifactBinding.reason}`,
+        type: 'invalid_request_error',
+        code: 'artifact_verification_failed',
+      },
+      billing: {
+        request_id: requestId,
+        execution_id: execution.execution_id,
+        execution_lease_id: executionLease.lease_id,
+        execution_lease_holder: executionLease.lease_holder,
+        execution_lease_epoch: executionLease.lease_epoch,
+        timestamp: getTimestamp(),
+        route: options.route || 'chat/completions',
+        reserved: false,
+        reserved_cost_usd: 0,
+        primary_model: primaryDescriptor.upstreamId,
+        model_used: primaryDescriptor.upstreamId,
+        fallback_triggered: false,
+        failure_reason: artifactBinding.reason || 'artifact_workspace_invalid',
+        cost_descriptor: primaryDescriptor,
+        finalized: true,
+      },
+      execution,
+    };
+  }
   const effectiveBody = applyLocalOrchestrationProfile(body, primaryDescriptor, requestId);
   const fallbackDescriptor = getFallbackDescriptorForAlias(primaryDescriptor);
+  const timestamp = getTimestamp();
+  const requestedEstimate = estimateRequestTokens(body);
+  const acceptedEstimate = estimateRequestTokens(effectiveBody);
+  const capabilityRecord = buildExecutionCapabilityRecord(
+    execution.execution_id,
+    session,
+    body.model,
+    primaryDescriptor,
+    fallbackDescriptor,
+    {
+      timestamp,
+      cachedContract: getCachedCapabilityContract(session),
+    }
+  );
+  await persistExecutionCapabilityRecord(capabilityRecord);
+  const contextAdaptationApplied = JSON.stringify(body) !== JSON.stringify(effectiveBody);
+  const budgetRecord = buildExecutionBudgetRecord(
+    execution.execution_id,
+    body,
+    effectiveBody,
+    primaryDescriptor,
+    {
+      timestamp,
+      requestedEstimate,
+      acceptedEstimate,
+      reservedOutputTokens: acceptedEstimate.outputTokens,
+      contextAdaptationApplied,
+      contextAdaptationReason: contextAdaptationApplied ? 'history_compaction' : 'none',
+    }
+  );
+  await persistExecutionBudgetRecord(budgetRecord);
+  const pressure = classifyContextPressure(budgetRecord);
+  await persistSessionContextPressure(session.session_id, execution.execution_id, pressure, timestamp);
+  if (shouldEmitRecommendationForPressureState(pressure.state)) {
+    const pressureEventId = await appendSessionContinuityEvent({
+      session_id: session.session_id,
+      execution_id: execution.execution_id,
+      pressure_state: pressure.state,
+      pressure_ratio: pressure.ratio,
+      event_type: pressure.state === 'warning' ? 'pressure_warning' : 'pressure_critical',
+      decision: 'allow',
+      source: 'pre_dispatch',
+      reason_code: 'pressure_threshold_crossed',
+      created_at: timestamp,
+    });
+    const repeatedCritical = pressure.state === 'critical'
+      ? (await getContinuityEventCounts(session.session_id, 'pressure_critical', new Date(Date.now() - (60 * 60 * 1000)).toISOString())) >= 2
+      : false;
+    const pressureRecommendation = deriveContinuityRecommendation({
+      pressureState: pressure.state,
+      eventType: pressure.state === 'warning' ? 'pressure_warning' : 'pressure_critical',
+      repeatedCritical,
+      reasonCode: 'pressure_threshold_crossed',
+    });
+    await createOrUpdateSessionRecommendation({
+      sessionId: session.session_id,
+      executionId: execution.execution_id,
+      recommendationType: pressureRecommendation.type,
+      pressureState: pressure.state,
+      triggerEventId: pressureEventId,
+      reasonCode: pressureRecommendation.reasonCode,
+      timestamp,
+    });
+  }
+  const budgetFit = classifyExecutionBudgetFit(budgetRecord);
+  if (!budgetFit.fits) {
+    const overLimitEventId = await appendSessionContinuityEvent({
+      session_id: session.session_id,
+      execution_id: execution.execution_id,
+      pressure_state: 'over_limit',
+      pressure_ratio: pressure.ratio,
+      event_type: 'pressure_over_limit',
+      decision: 'reject_over_limit',
+      source: 'pre_dispatch',
+      reason_code: budgetFit.rejectionReason,
+      created_at: getTimestamp(),
+    });
+    await appendSessionContinuityEvent({
+      session_id: session.session_id,
+      execution_id: execution.execution_id,
+      pressure_state: 'over_limit',
+      pressure_ratio: pressure.ratio,
+      event_type: 'rollover_recommended',
+      decision: 'recommend_rollover',
+      source: 'pre_dispatch',
+      reason_code: budgetFit.rejectionReason,
+      created_at: getTimestamp(),
+    });
+    const repeatedOverflow = (await getContinuityEventCounts(session.session_id, 'pressure_over_limit', new Date(Date.now() - (60 * 60 * 1000)).toISOString())) >= 2;
+    const recommendation = deriveContinuityRecommendation({
+      pressureState: 'over_limit',
+      eventType: 'pressure_over_limit',
+      repeatedOverflow,
+      reasonCode: budgetFit.rejectionReason,
+    });
+    await createOrUpdateSessionRecommendation({
+      sessionId: session.session_id,
+      executionId: execution.execution_id,
+      recommendationType: recommendation.type,
+      pressureState: 'over_limit',
+      triggerEventId: overLimitEventId,
+      reasonCode: recommendation.reasonCode,
+      timestamp: getTimestamp(),
+    });
+    await updateExecutionBudgetOutcome(execution.execution_id, {
+      timestamp: getTimestamp(),
+      budgetRejectionReason: budgetFit.rejectionReason,
+    });
+    await recordRejectedRequestLog({
+      request_id: requestId,
+      timestamp: getTimestamp(),
+      route: options.route || 'chat/completions',
+      session_id: session.session_id,
+      execution_id: execution.execution_id,
+      primary_model: primaryDescriptor.upstreamId,
+      model_used: primaryDescriptor.upstreamId,
+      input_tokens: acceptedEstimate.inputTokens,
+      output_tokens: 0,
+      estimated_cost_usd: 0,
+      status: 'rejected',
+      fallback_triggered: false,
+      failure_reason: budgetFit.rejectionReason,
+      endpoint: providerConfig.chatUrl,
+      error_code: budgetFit.rejectionReason,
+      status_code: 422,
+      response_body: '',
+      reserved_cost_usd: 0,
+    });
+    await transitionExecutionWithLease(execution.execution_id, EXECUTION_STATES.FAILED, {
+      requestId,
+      actorSource: 'runtime',
+      reasonCode: budgetFit.rejectionReason,
+      leaseId: executionLease.lease_id,
+      leaseHolder: executionLease.lease_holder,
+      leaseEpoch: executionLease.lease_epoch,
+      clearLease: true,
+    });
+    return {
+      error: {
+        statusCode: 422,
+        message: budgetFit.rejectionReason === 'reserved_output_exceeded'
+          ? 'Requested output tokens exceed provider limit'
+          : 'Requested context exceeds provider window',
+        type: 'invalid_request_error',
+        code: budgetFit.rejectionReason,
+      },
+      billing: {
+        request_id: requestId,
+        execution_id: execution.execution_id,
+        execution_lease_id: executionLease.lease_id,
+        execution_lease_holder: executionLease.lease_holder,
+        execution_lease_epoch: executionLease.lease_epoch,
+        timestamp: getTimestamp(),
+        route: options.route || 'chat/completions',
+        reserved: false,
+        reserved_cost_usd: 0,
+        primary_model: primaryDescriptor.upstreamId,
+        model_used: primaryDescriptor.upstreamId,
+        fallback_triggered: false,
+        failure_reason: budgetFit.rejectionReason,
+        cost_descriptor: primaryDescriptor,
+        finalized: true,
+        workspace_id: artifactBinding.workspace?.workspace_id || null,
+        artifact_id: artifactBinding.artifact?.artifact_id || null,
+      },
+      execution,
+    };
+  }
 
   const primaryUpstreamBody = buildUpstreamBody(effectiveBody, primaryDescriptor);
   const fallbackUpstreamBody = fallbackDescriptor ? buildUpstreamBody(effectiveBody, fallbackDescriptor) : null;
-  const timestamp = getTimestamp();
-  const estimated = estimateRequestTokens(effectiveBody);
+  const estimated = acceptedEstimate;
   const primaryEstimatedCost = estimateCostForDescriptor(primaryDescriptor, estimated.inputTokens, estimated.outputTokens);
   const fallbackEstimatedCost = fallbackDescriptor
     ? estimateCostForDescriptor(fallbackDescriptor, estimated.inputTokens, estimated.outputTokens)
@@ -2997,6 +5667,7 @@ async function executeChatFlow(session, body, options = {}) {
     timestamp,
     route,
     session_id: session.session_id,
+    execution_id: execution.execution_id,
     primary_model: primaryDescriptor.upstreamId,
     model_used: primaryDescriptor.upstreamId,
     input_tokens: estimated.inputTokens,
@@ -3005,6 +5676,15 @@ async function executeChatFlow(session, body, options = {}) {
   });
 
   if (!reservation.accepted) {
+    await transitionExecutionWithLease(execution.execution_id, EXECUTION_STATES.FAILED, {
+      requestId,
+      actorSource: 'runtime',
+      reasonCode: reservation.reason || 'credit_limit_exceeded',
+      leaseId: executionLease.lease_id,
+      leaseHolder: executionLease.lease_holder,
+      leaseEpoch: executionLease.lease_epoch,
+      clearLease: true,
+    });
     const rejectedStatusCode = reservation.reason === 'session_rate_limited' || reservation.reason === 'session_budget_exceeded'
       ? 429
       : 502;
@@ -3023,6 +5703,10 @@ async function executeChatFlow(session, body, options = {}) {
       },
       billing: {
         request_id: requestId,
+        execution_id: execution.execution_id,
+        execution_lease_id: executionLease.lease_id,
+        execution_lease_holder: executionLease.lease_holder,
+        execution_lease_epoch: executionLease.lease_epoch,
         timestamp,
         route,
         reserved: false,
@@ -3032,7 +5716,9 @@ async function executeChatFlow(session, body, options = {}) {
         fallback_triggered: false,
         failure_reason: reservation.reason || 'credit_limit_exceeded',
         cost_descriptor: primaryDescriptor,
+        finalized: true,
       },
+      execution,
     };
   }
 
@@ -3053,6 +5739,51 @@ async function executeChatFlow(session, body, options = {}) {
       : '');
 
   if (primaryAttempt.error || (primaryAttempt.upstream && !primaryAttempt.upstream.ok)) {
+    if (primaryAttempt.upstream && !primaryAttempt.upstream.ok && primaryAttempt.upstream.status === 400) {
+      try {
+        const text = await primaryAttempt.upstream.clone().text();
+        if (text.toLowerCase().includes('context size has been exceeded')) {
+          const downstreamOverflowEventId = await appendSessionContinuityEvent({
+            session_id: session.session_id,
+            execution_id: execution.execution_id,
+            pressure_state: pressure.state,
+            pressure_ratio: pressure.ratio,
+            event_type: 'downstream_overflow_detected',
+            decision: 'observe_only',
+            source: 'downstream_error',
+            reason_code: 'downstream_context_overflow',
+            created_at: getTimestamp(),
+          });
+          await appendSessionContinuityEvent({
+            session_id: session.session_id,
+            execution_id: execution.execution_id,
+            pressure_state: pressure.state,
+            pressure_ratio: pressure.ratio,
+            event_type: 'rollover_recommended',
+            decision: 'recommend_rollover',
+            source: 'downstream_error',
+            reason_code: 'downstream_context_overflow',
+            created_at: getTimestamp(),
+          });
+          const repeatedOverflow = (await getContinuityEventCounts(session.session_id, 'downstream_overflow_detected', new Date(Date.now() - (60 * 60 * 1000)).toISOString())) >= 2;
+          const recommendation = deriveContinuityRecommendation({
+            pressureState: pressure.state,
+            eventType: 'downstream_overflow_detected',
+            repeatedOverflow,
+            reasonCode: 'downstream_context_overflow',
+          });
+          await createOrUpdateSessionRecommendation({
+            sessionId: session.session_id,
+            executionId: execution.execution_id,
+            recommendationType: recommendation.type,
+            pressureState: pressure.state,
+            triggerEventId: downstreamOverflowEventId,
+            reasonCode: recommendation.reasonCode,
+            timestamp: getTimestamp(),
+          });
+        }
+      } catch (_) {}
+    }
     const canFallback = Boolean(fallbackDescriptor) && (primaryAttempt.error || isRetryableUpstreamStatus(primaryAttempt.upstream.status));
     if (!canFallback && !fallbackDescriptor) {
       logRoutingDecision('fallback_skipped_unconfigured', {
@@ -3089,6 +5820,10 @@ async function executeChatFlow(session, body, options = {}) {
           fallbackDescriptor,
           primaryFailureReason || 'retryable_primary_failure',
         ));
+        await updateExecutionCapabilityFallbackUse(execution.execution_id, fallbackDescriptor, {
+          timestamp: getTimestamp(),
+          timeoutProfile: 'remote_fallback',
+        });
         return {
           descriptor: fallbackDescriptor,
           responseAlias,
@@ -3096,6 +5831,10 @@ async function executeChatFlow(session, body, options = {}) {
           upstreamContext: fallbackAttempt.upstreamContext,
           billing: {
             request_id: requestId,
+            execution_id: execution.execution_id,
+            execution_lease_id: executionLease.lease_id,
+            execution_lease_holder: executionLease.lease_holder,
+            execution_lease_epoch: executionLease.lease_epoch,
             timestamp,
             route,
             reserved: true,
@@ -3109,9 +5848,12 @@ async function executeChatFlow(session, body, options = {}) {
             cost_descriptor: fallbackDescriptor,
             endpoint: providerConfig.chatUrl,
             finalized: false,
+            workspace_id: artifactBinding.workspace?.workspace_id || null,
+            artifact_id: artifactBinding.artifact?.artifact_id || null,
           },
           served_by: 'fallback',
           effective_body: effectiveBody,
+          execution,
         };
       }
 
@@ -3127,6 +5869,7 @@ async function executeChatFlow(session, body, options = {}) {
         timestamp: getTimestamp(),
         route,
         session_id: session.session_id,
+        execution_id: execution.execution_id,
         primary_model: primaryDescriptor.upstreamId,
         model_used: fallbackDescriptor.upstreamId,
         input_tokens: 0,
@@ -3141,11 +5884,24 @@ async function executeChatFlow(session, body, options = {}) {
         response_body: '',
         reserved_cost_usd: reservedCostUsd,
       });
+      await transitionExecutionWithLease(execution.execution_id, EXECUTION_STATES.FAILED, {
+        requestId,
+        actorSource: 'runtime',
+        reasonCode: finalFailureReason || 'upstream_error',
+        leaseId: executionLease.lease_id,
+        leaseHolder: executionLease.lease_holder,
+        leaseEpoch: executionLease.lease_epoch,
+        clearLease: true,
+      });
 
       return {
         error: fallbackAttempt?.error || { statusCode: 502, message: 'Upstream provider returned an error', type: 'provider_error', code: 'upstream_error' },
         billing: {
           request_id: requestId,
+          execution_id: execution.execution_id,
+          execution_lease_id: executionLease.lease_id,
+          execution_lease_holder: executionLease.lease_holder,
+          execution_lease_epoch: executionLease.lease_epoch,
           timestamp,
           route,
           reserved: true,
@@ -3156,7 +5912,10 @@ async function executeChatFlow(session, body, options = {}) {
           failure_reason: finalFailureReason,
           cost_descriptor: fallbackDescriptor,
           finalized: true,
+          workspace_id: artifactBinding.workspace?.workspace_id || null,
+          artifact_id: artifactBinding.artifact?.artifact_id || null,
         },
+        execution,
       };
     }
 
@@ -3165,6 +5924,7 @@ async function executeChatFlow(session, body, options = {}) {
       timestamp: getTimestamp(),
       route,
       session_id: session.session_id,
+      execution_id: execution.execution_id,
       primary_model: primaryDescriptor.upstreamId,
       model_used: primaryDescriptor.upstreamId,
       input_tokens: 0,
@@ -3179,11 +5939,24 @@ async function executeChatFlow(session, body, options = {}) {
       response_body: '',
       reserved_cost_usd: reservedCostUsd,
     });
+    await transitionExecutionWithLease(execution.execution_id, EXECUTION_STATES.FAILED, {
+      requestId,
+      actorSource: 'runtime',
+      reasonCode: primaryFailureReason || 'upstream_error',
+      leaseId: executionLease.lease_id,
+      leaseHolder: executionLease.lease_holder,
+      leaseEpoch: executionLease.lease_epoch,
+      clearLease: true,
+    });
 
     return {
       error: primaryAttempt?.error || { statusCode: 502, message: 'Upstream provider returned an error', type: 'provider_error', code: 'upstream_error' },
         billing: {
           request_id: requestId,
+          execution_id: execution.execution_id,
+          execution_lease_id: executionLease.lease_id,
+          execution_lease_holder: executionLease.lease_holder,
+          execution_lease_epoch: executionLease.lease_epoch,
           timestamp,
           route,
           reserved: true,
@@ -3194,17 +5967,25 @@ async function executeChatFlow(session, body, options = {}) {
           failure_reason: primaryFailureReason,
           cost_descriptor: primaryDescriptor,
           finalized: true,
+          workspace_id: artifactBinding.workspace?.workspace_id || null,
+          artifact_id: artifactBinding.artifact?.artifact_id || null,
         },
+        execution,
       };
   }
 
   return {
+    execution,
     descriptor: primaryDescriptor,
     responseAlias,
     upstream: primaryAttempt.upstream,
     upstreamContext: primaryAttempt.upstreamContext,
     billing: {
       request_id: requestId,
+      execution_id: execution.execution_id,
+      execution_lease_id: executionLease.lease_id,
+      execution_lease_holder: executionLease.lease_holder,
+      execution_lease_epoch: executionLease.lease_epoch,
       timestamp,
       route,
       reserved: true,
@@ -3218,6 +5999,8 @@ async function executeChatFlow(session, body, options = {}) {
       cost_descriptor: primaryDescriptor,
       endpoint: providerConfig.chatUrl,
       finalized: false,
+      workspace_id: artifactBinding.workspace?.workspace_id || null,
+      artifact_id: artifactBinding.artifact?.artifact_id || null,
     },
     served_by: 'primary',
     effective_body: effectiveBody,
@@ -3232,6 +6015,7 @@ async function proxyNonStreamingChat(res, session, descriptor, upstream, billing
         timestamp: billing.timestamp,
         route: billing.route,
         session_id: session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -3246,6 +6030,17 @@ async function proxyNonStreamingChat(res, session, descriptor, upstream, billing
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || failureReasonFromUpstreamStatus(upstream.status),
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider returned an error', 'provider_error', 'upstream_error');
   }
@@ -3260,6 +6055,7 @@ async function proxyNonStreamingChat(res, session, descriptor, upstream, billing
         timestamp: billing.timestamp,
         route: billing.route,
         session_id: session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -3274,37 +6070,27 @@ async function proxyNonStreamingChat(res, session, descriptor, upstream, billing
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || 'upstream_invalid_response',
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider returned an invalid response', 'provider_error', 'upstream_invalid_response');
   }
 
   const usage = extractUsageTokens(payload?.usage);
-  if (billing?.reserved) {
-    await finalizeBillingRequest({
-      request_id: billing.request_id,
-      timestamp: getTimestamp(),
-      route: billing.route,
-      session_id: session.session_id,
-      primary_model: billing.primary_model || '',
-      model_used: billing.model_used,
-      input_tokens: usage.inputTokens || billing.input_tokens || 0,
-      output_tokens: usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0)),
-      estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor,
-        usage.inputTokens || billing.input_tokens || 0,
-        usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0))
-      ),
-      status: 'success',
-      fallback_triggered: Number(Boolean(billing.fallback_triggered)),
-      failure_reason: billing.failure_reason || '',
-      endpoint: billing.endpoint || '',
-      error_code: '',
-      status_code: 200,
-      response_body: '',
-      reserved_cost_usd: billing.reserved_cost_usd,
-    });
-  }
   incrementUsage(session, usage.totalTokens);
-  return normalizeChatCompletionResponse(payload, responseAlias);
+  return {
+    payload: normalizeChatCompletionResponse(payload, responseAlias),
+    usage,
+  };
 }
 
 function writeChatSseFromNonStreamPayload(res, payload, responseAlias = PUBLIC_MODEL_ALIAS) {
@@ -3350,6 +6136,17 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
   if (!ENABLE_LOCAL_NON_STREAM_RETRY || !isLocalProviderDescriptor(descriptor)) {
     return false;
   }
+  if (billing?.execution_id) {
+    const retryEligibility = await canExecutionUseOptimisticRetry(billing.execution_id);
+    if (!retryEligibility.allowed) {
+      logRoutingDecision('local_nonstream_retry_skipped', {
+        request_id: billing?.request_id || '',
+        model: descriptor.upstreamId,
+        reason: retryEligibility.reason || 'retry_not_allowed',
+      });
+      return false;
+    }
+  }
 
   const originalBody = retryOptions.originalBody && typeof retryOptions.originalBody === 'object'
     ? retryOptions.originalBody
@@ -3363,6 +6160,25 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
     model: descriptor.upstreamId,
     reason: 'stream_first_token_timeout',
   });
+  if (billing?.execution_id && billing.execution_lease_id && billing.execution_lease_holder && billing.execution_lease_epoch) {
+    await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.RETRYING, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      reasonCode: 'execution_retrying',
+      notes: 'local_nonstream_retry_started',
+      leaseId: billing.execution_lease_id,
+      leaseHolder: billing.execution_lease_holder,
+      leaseEpoch: billing.execution_lease_epoch,
+    });
+    const retryLease = await acquireExecutionLease(billing.execution_id, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      isStreaming: true,
+    });
+    billing.execution_lease_id = retryLease.lease_id;
+    billing.execution_lease_holder = retryLease.lease_holder;
+    billing.execution_lease_epoch = retryLease.lease_epoch;
+  }
 
   const retryBody = {
     ...originalBody,
@@ -3401,8 +6217,46 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
 
   const normalized = normalizeChatCompletionResponse(payload, responseAlias);
   const assistantText = stringifyTextContent(normalized?.choices?.[0]?.message?.content ?? '');
-  const artifactError = validateArtifactHonestyOrError(req.body, assistantText);
+  const artifactError = await validateArtifactHonestyOrError(req.body, assistantText, {
+    executionId: billing?.execution_id || '',
+    requestId: billing?.request_id || '',
+    actorSource: 'runtime',
+    meaningfulOutputStarted: false,
+  });
   if (artifactError) {
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0,
+        status: 'failed',
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: artifactError.code || 'artifact_honesty_failed',
+        endpoint: billing.endpoint || '',
+        error_code: artifactError.code || 'artifact_honesty_failed',
+        status_code: artifactError.statusCode || 422,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        reasonCode: artifactError.code || 'artifact_honesty_failed',
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+        clearLease: true,
+      });
+    }
     sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
     return true;
   }
@@ -3414,6 +6268,7 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
       timestamp: getTimestamp(),
       route: billing.route,
       session_id: session.session_id,
+      execution_id: billing.execution_id || null,
       primary_model: billing.primary_model || '',
       model_used: billing.model_used,
       input_tokens: usage.inputTokens || billing.input_tokens || 0,
@@ -3430,6 +6285,26 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
       status_code: 200,
       response_body: '',
       reserved_cost_usd: billing.reserved_cost_usd,
+    });
+  }
+  if (billing?.execution_id) {
+    await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.RUNNING, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      reasonCode: 'execution_retry_resumed',
+      notes: 'local_nonstream_retry_success',
+      leaseId: billing.execution_lease_id,
+      leaseHolder: billing.execution_lease_holder,
+      leaseEpoch: billing.execution_lease_epoch,
+    });
+    await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.COMPLETED, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      reasonCode: 'completed_after_local_nonstream_retry',
+      leaseId: billing.execution_lease_id,
+      leaseHolder: billing.execution_lease_holder,
+      leaseEpoch: billing.execution_lease_epoch,
+      clearLease: true,
     });
   }
   incrementUsage(session, usage.totalTokens);
@@ -3449,6 +6324,7 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -3463,6 +6339,17 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        void transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || failureReasonFromUpstreamStatus(upstream.status),
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider returned an error', 'provider_error', 'upstream_error');
   }
@@ -3474,6 +6361,7 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -3488,6 +6376,17 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        void transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || 'upstream_invalid_response',
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider did not return a stream body', 'provider_error', 'upstream_invalid_response');
   }
@@ -3496,10 +6395,12 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
     buffer: '',
     pendingTotalTokens: 0,
     pendingInputTokens: 0,
+    text: '',
     created: Math.floor(Date.now() / 1000),
     idleTimer: null,
     wroteHeaders: false,
     firstTokenAt: null,
+    meaningfulOutputStarted: false,
     completed: false,
     billingFinalized: false,
     retriedLocalNonStream: false,
@@ -3513,6 +6414,51 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
     }
 
     state.billingFinalized = true;
+    let classification = classifyExecutionInterruption({
+      status,
+      errorCode: details.errorCode || '',
+      meaningfulOutputStarted: state.meaningfulOutputStarted,
+    });
+    if (billing.execution_id && state.meaningfulOutputStarted) {
+      const artifactError = await validateArtifactHonestyOrError(retryOptions.originalBody || req.body, state.text, {
+        executionId: billing.execution_id,
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        meaningfulOutputStarted: true,
+      });
+      if (artifactError) {
+        classification = {
+          targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+          billingStatus: 'interrupted',
+          reasonCode: artifactError.code || 'artifact_verification_failed',
+          recoveryReason: artifactError.reason || 'artifact_verification_failed',
+        };
+        details = {
+          ...details,
+          errorCode: artifactError.code || 'artifact_verification_failed',
+          notes: artifactError.message,
+        };
+      }
+    }
+    if (billing.execution_id && billing.execution_lease_id && billing.execution_lease_holder && billing.execution_lease_epoch) {
+      const leaseCheck = await assertExecutionLeaseHolder(billing.execution_id, {
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      });
+      if (!leaseCheck.matches) {
+        await transitionExecutionWithLease(billing.execution_id, classification.targetState, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: 'execution_finalize_rejected_stale_lease',
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: classification.targetState !== EXECUTION_STATES.RECOVERY_REQUIRED,
+        });
+        return;
+      }
+    }
     const inputTokens = Number.isFinite(details.inputTokens) ? details.inputTokens : (billing.input_tokens || 0);
     const outputTokens = Number.isFinite(details.outputTokens)
       ? details.outputTokens
@@ -3523,12 +6469,13 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
       timestamp: getTimestamp(),
       route: billing.route,
       session_id: session.session_id,
+      execution_id: billing.execution_id || null,
       primary_model: billing.primary_model || '',
       model_used: billing.model_used,
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor, inputTokens, outputTokens),
-      status,
+      status: classification.billingStatus,
       fallback_triggered: Number(Boolean(billing.fallback_triggered)),
       failure_reason: billing.failure_reason || '',
       endpoint: billing.endpoint || '',
@@ -3537,6 +6484,34 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
       response_body: details.responseBody || '',
       reserved_cost_usd: billing.reserved_cost_usd,
     });
+    if (billing.execution_id) {
+      if (classification.targetState === EXECUTION_STATES.RECOVERY_REQUIRED) {
+        await markExecutionRecoveryRequired(billing.execution_id, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: details.errorCode || 'execution_recovery_required',
+          recoveryReason: classification.recoveryReason || details.errorCode || 'execution_recovery_required',
+          recoveryNotes: details.notes || null,
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+        });
+      } else {
+        await transitionExecutionWithLease(
+          billing.execution_id,
+          classification.targetState,
+          {
+            requestId: billing.request_id,
+            actorSource: 'runtime',
+            reasonCode: classification.reasonCode,
+            leaseId: billing.execution_lease_id,
+            leaseHolder: billing.execution_lease_holder,
+            leaseEpoch: billing.execution_lease_epoch,
+            clearLease: true,
+          }
+        );
+      }
+    }
   };
 
   const resetIdleTimer = () => {
@@ -3682,12 +6657,27 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         }
 
         const normalized = normalizeChatChunkPayload(parsed, responseAlias, state.created);
+        const deltaText = extractChatDeltaContent(parsed);
+        if (deltaText) {
+          state.meaningfulOutputStarted = true;
+          state.text += deltaText;
+        }
         output += `data: ${JSON.stringify(normalized)}\n`;
       } catch (error) {
         output += `${rawLine}\n`;
       }
     }
 
+    if (billing?.execution_id && billing.execution_lease_id && billing.execution_lease_holder && billing.execution_lease_epoch) {
+      void refreshExecutionLease(billing.execution_id, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        isStreaming: true,
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      }).catch(() => {});
+    }
     writeHeadersIfNeeded();
     res.write(output);
   });
@@ -3736,6 +6726,11 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         }
 
           const normalized = normalizeChatChunkPayload(parsed, responseAlias, state.created);
+          const deltaText = extractChatDeltaContent(parsed);
+          if (deltaText) {
+            state.meaningfulOutputStarted = true;
+            state.text += deltaText;
+          }
           output += `data: ${JSON.stringify(normalized)}\n`;
         } catch (error) {
           output += `${rawLine}\n`;
@@ -3829,6 +6824,7 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -3843,6 +6839,17 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        void transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || failureReasonFromUpstreamStatus(upstream.status),
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider returned an error', 'provider_error', 'upstream_error');
   }
@@ -3854,6 +6861,7 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -3868,6 +6876,17 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        void transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || 'upstream_invalid_response',
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider did not return a stream body', 'provider_error', 'upstream_invalid_response');
   }
@@ -3889,6 +6908,7 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
     outputItemAdded: false,
     contentPartAdded: false,
     firstTokenAt: null,
+    meaningfulOutputStarted: false,
     completed: false,
     billingFinalized: false,
   };
@@ -3900,6 +6920,51 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
     }
 
     state.billingFinalized = true;
+    let classification = classifyExecutionInterruption({
+      status,
+      errorCode: details.errorCode || '',
+      meaningfulOutputStarted: state.meaningfulOutputStarted,
+    });
+    if (billing.execution_id && state.meaningfulOutputStarted) {
+      const artifactError = await validateArtifactHonestyOrError(retryOptions.originalBody || req.body, state.text, {
+        executionId: billing.execution_id,
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        meaningfulOutputStarted: true,
+      });
+      if (artifactError) {
+        classification = {
+          targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+          billingStatus: 'interrupted',
+          reasonCode: artifactError.code || 'artifact_verification_failed',
+          recoveryReason: artifactError.reason || 'artifact_verification_failed',
+        };
+        details = {
+          ...details,
+          errorCode: artifactError.code || 'artifact_verification_failed',
+          notes: artifactError.message,
+        };
+      }
+    }
+    if (billing.execution_id && billing.execution_lease_id && billing.execution_lease_holder && billing.execution_lease_epoch) {
+      const leaseCheck = await assertExecutionLeaseHolder(billing.execution_id, {
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      });
+      if (!leaseCheck.matches) {
+        await transitionExecutionWithLease(billing.execution_id, classification.targetState, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: 'execution_finalize_rejected_stale_lease',
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: classification.targetState !== EXECUTION_STATES.RECOVERY_REQUIRED,
+        });
+        return;
+      }
+    }
     const inputTokens = Number.isFinite(details.inputTokens) ? details.inputTokens : (billing.input_tokens || 0);
     const outputTokens = Number.isFinite(details.outputTokens)
       ? details.outputTokens
@@ -3910,12 +6975,13 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       timestamp: getTimestamp(),
       route: billing.route,
       session_id: session.session_id,
+      execution_id: billing.execution_id || null,
       primary_model: billing.primary_model || '',
       model_used: billing.model_used,
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor, inputTokens, outputTokens),
-      status,
+      status: classification.billingStatus,
       fallback_triggered: Number(Boolean(billing.fallback_triggered)),
       failure_reason: billing.failure_reason || '',
       endpoint: billing.endpoint || '',
@@ -3924,6 +6990,34 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       response_body: details.responseBody || '',
       reserved_cost_usd: billing.reserved_cost_usd,
     });
+    if (billing.execution_id) {
+      if (classification.targetState === EXECUTION_STATES.RECOVERY_REQUIRED) {
+        await markExecutionRecoveryRequired(billing.execution_id, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: details.errorCode || 'execution_recovery_required',
+          recoveryReason: classification.recoveryReason || details.errorCode || 'execution_recovery_required',
+          recoveryNotes: details.notes || null,
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+        });
+      } else {
+        await transitionExecutionWithLease(
+          billing.execution_id,
+          classification.targetState,
+          {
+            requestId: billing.request_id,
+            actorSource: 'runtime',
+            reasonCode: classification.reasonCode,
+            leaseId: billing.execution_lease_id,
+            leaseHolder: billing.execution_lease_holder,
+            leaseEpoch: billing.execution_lease_epoch,
+            clearLease: true,
+          }
+        );
+      }
+    }
   };
 
   const emit = (eventType, payload) => {
@@ -4055,6 +7149,8 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       return;
     }
 
+    state.meaningfulOutputStarted = true;
+
     writeHeadersIfNeeded();
     sendCreatedIfNeeded();
     sendOutputItemAddedIfNeeded();
@@ -4123,6 +7219,17 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       } catch (error) {
         continue;
       }
+    }
+
+    if (billing?.execution_id && billing.execution_lease_id && billing.execution_lease_holder && billing.execution_lease_epoch) {
+      void refreshExecutionLease(billing.execution_id, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        isStreaming: true,
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      }).catch(() => {});
     }
   });
 
@@ -4298,6 +7405,7 @@ async function handleChatCompletion(req, res) {
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -4329,15 +7437,91 @@ async function handleChatCompletion(req, res) {
     });
   }
 
-  const responsePayload = await proxyNonStreamingChat(res, req.session, descriptor, upstream, billing, responseAlias);
-  if (responsePayload === undefined) {
+  const responseResult = await proxyNonStreamingChat(res, req.session, descriptor, upstream, billing, responseAlias);
+  if (responseResult === undefined) {
     return undefined;
   }
+  const responsePayload = responseResult.payload;
 
   const assistantText = stringifyTextContent(responsePayload?.choices?.[0]?.message?.content ?? '');
-  const artifactError = validateArtifactHonestyOrError(req.body, assistantText);
+  const artifactError = await validateArtifactHonestyOrError(req.body, assistantText, {
+    executionId: billing?.execution_id || '',
+    requestId: billing?.request_id || '',
+    actorSource: 'runtime',
+    meaningfulOutputStarted: false,
+  });
   if (artifactError) {
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0,
+        status: 'failed',
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: artifactError.code || 'artifact_honesty_failed',
+        endpoint: billing.endpoint || '',
+        error_code: artifactError.code || 'artifact_honesty_failed',
+        status_code: artifactError.statusCode || 422,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        reasonCode: artifactError.code || 'artifact_honesty_failed',
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+        clearLease: true,
+      });
+    }
     return sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
+  }
+
+  if (billing?.reserved) {
+    const usage = responseResult.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    const inputTokens = usage.inputTokens || billing.input_tokens || 0;
+    const outputTokens = usage.outputTokens || Math.max(0, usage.totalTokens - inputTokens);
+    await finalizeBillingRequest({
+      request_id: billing.request_id,
+      timestamp: getTimestamp(),
+      route: billing.route,
+      session_id: req.session.session_id,
+      execution_id: billing.execution_id || null,
+      primary_model: billing.primary_model || '',
+      model_used: billing.model_used,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor, inputTokens, outputTokens),
+      status: 'success',
+      fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+      failure_reason: billing.failure_reason || '',
+      endpoint: billing.endpoint || '',
+      error_code: '',
+      status_code: 200,
+      response_body: '',
+      reserved_cost_usd: billing.reserved_cost_usd,
+    });
+  }
+  if (billing?.execution_id) {
+    await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.COMPLETED, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      reasonCode: 'request_completed',
+      leaseId: billing.execution_lease_id,
+      leaseHolder: billing.execution_lease_holder,
+      leaseEpoch: billing.execution_lease_epoch,
+      clearLease: true,
+    });
   }
 
   logRoutingDecision('response_served', {
@@ -4367,6 +7551,7 @@ async function handleResponsesCompatibility(req, res) {
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -4405,6 +7590,7 @@ async function handleResponsesCompatibility(req, res) {
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -4419,6 +7605,17 @@ async function handleResponsesCompatibility(req, res) {
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || failureReasonFromUpstreamStatus(upstream.status),
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider returned an error', 'provider_error', 'upstream_error');
   }
@@ -4433,6 +7630,7 @@ async function handleResponsesCompatibility(req, res) {
         timestamp: getTimestamp(),
         route: billing.route,
         session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
         primary_model: billing.primary_model || '',
         model_used: billing.model_used,
         input_tokens: 0,
@@ -4447,17 +7645,75 @@ async function handleResponsesCompatibility(req, res) {
         response_body: '',
         reserved_cost_usd: billing.reserved_cost_usd,
       });
+      if (billing.execution_id) {
+        await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: billing.failure_reason || 'upstream_invalid_response',
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+          clearLease: true,
+        });
+      }
     }
     return sendError(res, 502, 'Upstream provider returned an invalid response', 'provider_error', 'upstream_invalid_response');
   }
 
   const usage = extractUsageTokens(payload?.usage);
+  incrementUsage(req.session, payload?.usage?.total_tokens);
+  const chatPayload = normalizeChatCompletionResponse(payload, PUBLIC_MODEL_ALIAS);
+  const assistantText = stringifyTextContent(chatPayload?.choices?.[0]?.message?.content ?? '');
+  const artifactError = await validateArtifactHonestyOrError(req.body, assistantText, {
+    executionId: billing?.execution_id || '',
+    requestId: billing?.request_id || '',
+    actorSource: 'runtime',
+    meaningfulOutputStarted: false,
+  });
+  if (artifactError) {
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0,
+        status: 'failed',
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: artifactError.code || 'artifact_honesty_failed',
+        endpoint: billing.endpoint || '',
+        error_code: artifactError.code || 'artifact_honesty_failed',
+        status_code: artifactError.statusCode || 422,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.FAILED, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        reasonCode: artifactError.code || 'artifact_honesty_failed',
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+        clearLease: true,
+      });
+    }
+    return sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
+  }
+
   if (billing?.reserved) {
     await finalizeBillingRequest({
       request_id: billing.request_id,
       timestamp: getTimestamp(),
       route: billing.route,
       session_id: req.session.session_id,
+      execution_id: billing.execution_id || null,
       primary_model: billing.primary_model || '',
       model_used: billing.model_used,
       input_tokens: usage.inputTokens || billing.input_tokens || 0,
@@ -4476,12 +7732,16 @@ async function handleResponsesCompatibility(req, res) {
       reserved_cost_usd: billing.reserved_cost_usd,
     });
   }
-  incrementUsage(req.session, payload?.usage?.total_tokens);
-  const chatPayload = normalizeChatCompletionResponse(payload, PUBLIC_MODEL_ALIAS);
-  const assistantText = stringifyTextContent(chatPayload?.choices?.[0]?.message?.content ?? '');
-  const artifactError = validateArtifactHonestyOrError(req.body, assistantText);
-  if (artifactError) {
-    return sendError(res, artifactError.statusCode, artifactError.message, artifactError.type, artifactError.code);
+  if (billing?.execution_id) {
+    await transitionExecutionWithLease(billing.execution_id, EXECUTION_STATES.COMPLETED, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      reasonCode: 'request_completed',
+      leaseId: billing.execution_lease_id,
+      leaseHolder: billing.execution_lease_holder,
+      leaseEpoch: billing.execution_lease_epoch,
+      clearLease: true,
+    });
   }
 
   logRoutingDecision('response_served', {
@@ -4777,6 +8037,7 @@ async function startServer(port = PORT) {
   await preloadActiveSessions();
   startLocalWarmupLoop();
   return app.listen(port, HOST, () => {
+    writeRuntimeProfileMarker(port);
     console.log(`BlockFork AI Session Runtime listening on http://${HOST}:${port}`);
   });
 }
@@ -4803,6 +8064,52 @@ module.exports = {
   loadPersistedLiveKeyByApiKey,
   resolveLiveKeySession,
   preloadLiveKeys,
+  registerSessionState,
+  EXECUTION_STATES,
+  createExecutionRecord,
+  getExecutionById,
+  getExecutionByRequestId,
+  appendExecutionEvent,
+  acquireExecutionLease,
+  refreshExecutionLease,
+  releaseExecutionLease,
+  assertExecutionLeaseHolder,
+  getAllowedWorkspaceRoots,
+  resolveWorkspaceBindingForArtifact,
+  findOrCreateWorkspaceBinding,
+  getWorkspaceById,
+  attachExecutionWorkspace,
+  createExecutionArtifactRecord,
+  getExecutionArtifactByExecutionId,
+  updateExecutionArtifactVerification,
+  assertArtifactPathWithinWorkspace,
+  buildExecutionCapabilityRecord,
+  persistExecutionCapabilityRecord,
+  getExecutionCapabilityRecord,
+  updateExecutionCapabilityFallbackUse,
+  getExecutionCapabilityFreshness,
+  canExecutionUseOptimisticRetry,
+  buildExecutionBudgetRecord,
+  persistExecutionBudgetRecord,
+  getExecutionBudgetRecord,
+  updateExecutionBudgetOutcome,
+  classifyExecutionBudgetFit,
+  classifyContextPressure,
+  deriveContinuityRecommendation,
+  createOrUpdateSessionRecommendation,
+  supersedeActiveRecommendation,
+  resolveRecommendationFromLineage,
+  getActiveRecommendationForSession,
+  prepareArtifactBindingForExecution,
+  checkArtifactEvidence,
+  validateArtifactHonestyOrError,
+  markExecutionRecoveryRequired,
+  classifyExecutionInterruption,
+  transitionExecution,
+  transitionExecutionWithLease,
+  assertLegalExecutionTransition,
   MODEL_MAP,
+  getModelDescriptor,
+  executeChatFlow,
   startServer,
 };

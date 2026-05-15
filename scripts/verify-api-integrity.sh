@@ -412,7 +412,9 @@ art_missing_raw="$(http_status POST "$BASE_URL/v1/chat/completions" "Bearer $liv
 art_missing_code="$(extract_status "$art_missing_raw")"
 assert_status_in "$art_missing_code" "Artifact claim without evidence" 422
 
-tmp_artifact="$(mktemp /tmp/blockfork-artifact.XXXXXX.pdf)"
+tmp_artifact_base="$(mktemp /private/tmp/blockfork-artifact.XXXXXX)"
+tmp_artifact="${tmp_artifact_base}.pdf"
+mv "$tmp_artifact_base" "$tmp_artifact"
 printf 'artifact-proof\n' > "$tmp_artifact"
 art_ok_payload="$(cat <<JSON
 {"model":"managed","messages":[{"role":"user","content":"Reply with ok."}],"max_tokens":8,"metadata":{"blockfork_artifact_contract":{"requested":true,"evidence":{"path":"$tmp_artifact"}}}}
