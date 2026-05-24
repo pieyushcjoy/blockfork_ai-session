@@ -230,6 +230,21 @@
       color: var(--muted);
     }
 
+    .relay-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+
+    .relay-grid .wide {
+      grid-column: span 2;
+    }
+
+    .relay-grid .full {
+      grid-column: 1 / -1;
+    }
+
     @media (max-width: 960px) {
       .grid, .controls, .filters {
         grid-template-columns: 1fr 1fr;
@@ -247,6 +262,13 @@
         grid-template-columns: 1fr;
       }
       .controls button, .filters button {
+        grid-column: auto;
+      }
+      .relay-grid {
+        grid-template-columns: 1fr;
+      }
+      .relay-grid .wide,
+      .relay-grid .full {
         grid-column: auto;
       }
     }
@@ -368,6 +390,68 @@
       </div>
       <div class="footnote muted" id="requestCount"></div>
     </section>
+
+    <section class="panel section">
+      <div class="filters">
+        <label>
+          Relay Label
+          <input id="relayLabel" type="text" placeholder="cleanbench" value="cleanbench" />
+        </label>
+        <label>
+          Transport
+          <input id="relayTransport" type="text" placeholder="openclaw_cli" value="openclaw_cli" />
+        </label>
+        <label>
+          OpenClaw CLI
+          <input id="relayCliBin" type="text" placeholder="/path/to/openclaw" />
+        </label>
+      </div>
+      <div class="relay-grid">
+        <label class="wide">
+          OpenClaw Env File
+          <input id="relayEnvFile" type="text" placeholder="/path/to/service.env" />
+        </label>
+        <label class="wide">
+          OpenClaw Config Path
+          <input id="relayConfigPath" type="text" placeholder="/path/to/openclaw.json" />
+        </label>
+        <label class="wide">
+          OpenClaw State Dir
+          <input id="relayStateDir" type="text" placeholder="/path/to/state" />
+        </label>
+        <label>
+          Chat ID
+          <input id="relayChatId" type="text" placeholder="8407120350" />
+        </label>
+        <label>
+          Thread ID
+          <input id="relayThreadId" type="text" placeholder="Optional thread id" />
+        </label>
+        <label>
+          Service Name
+          <input id="relayServiceName" type="text" placeholder="ai.openclaw.cleanbench" />
+        </label>
+        <label>
+          Profile Name
+          <input id="relayProfileName" type="text" placeholder="cleanbench" />
+        </label>
+        <label class="wide">
+          Probe Message
+          <input id="relayProbeMessage" type="text" placeholder="BlockFork relay doctor dry-run" />
+        </label>
+        <label class="full">
+          Notes
+          <input id="relayNotes" type="text" placeholder="Safe relay config only; no credentials stored." />
+        </label>
+        <div class="full" style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button id="saveRelay" type="button">Save Relay Config</button>
+          <button id="doctorRelay" type="button" class="button-secondary">Run Relay Doctor</button>
+          <button id="refreshRelay" type="button" class="button-secondary">Refresh Relays</button>
+        </div>
+      </div>
+      <div class="codebox" id="relayResult">Save a relay profile or run the doctor to see readiness and setup commands here.</div>
+      <div class="livekey-list" id="relayList"></div>
+    </section>
   </div>
 
   <script>
@@ -382,6 +466,20 @@
     const liveKeyBudgetEl = document.getElementById('liveKeyBudget');
     const liveKeyResultEl = document.getElementById('liveKeyResult');
     const liveKeyListEl = document.getElementById('liveKeyList');
+    const relayLabelEl = document.getElementById('relayLabel');
+    const relayTransportEl = document.getElementById('relayTransport');
+    const relayCliBinEl = document.getElementById('relayCliBin');
+    const relayEnvFileEl = document.getElementById('relayEnvFile');
+    const relayConfigPathEl = document.getElementById('relayConfigPath');
+    const relayStateDirEl = document.getElementById('relayStateDir');
+    const relayChatIdEl = document.getElementById('relayChatId');
+    const relayThreadIdEl = document.getElementById('relayThreadId');
+    const relayServiceNameEl = document.getElementById('relayServiceName');
+    const relayProfileNameEl = document.getElementById('relayProfileName');
+    const relayProbeMessageEl = document.getElementById('relayProbeMessage');
+    const relayNotesEl = document.getElementById('relayNotes');
+    const relayResultEl = document.getElementById('relayResult');
+    const relayListEl = document.getElementById('relayList');
     const statusEl = document.getElementById('status');
     const totalCreditsEl = document.getElementById('totalCredits');
     const usedCreditsEl = document.getElementById('usedCredits');
@@ -461,9 +559,9 @@
       return payload;
     }
 
-    async function postJson(url, body = {}) {
+    async function requestJson(url, method, body = {}) {
       const response = await fetch(url, {
-        method: 'POST',
+        method,
         headers: {
           ...authHeaders(),
           'content-type': 'application/json',
@@ -475,6 +573,14 @@
         throw new Error(payload?.error?.message || payload?.error || 'Request failed');
       }
       return payload;
+    }
+
+    async function postJson(url, body = {}) {
+      return requestJson(url, 'POST', body);
+    }
+
+    async function putJson(url, body = {}) {
+      return requestJson(url, 'PUT', body);
     }
 
     async function loadSummary() {
@@ -520,9 +626,59 @@
       `).join('');
     }
 
+    function renderRelays(rows) {
+      if (!rows.length) {
+        relayListEl.innerHTML = '<div class="livekey-item">No relay configs saved yet.</div>';
+        return;
+      }
+
+      relayListEl.innerHTML = rows.map((row) => `
+        <div class="livekey-item">
+          <div><strong>${formatValue(row.relay_label)}</strong></div>
+          <div>Transport: ${formatValue(row.transport)}</div>
+          <div>CLI: ${formatValue(row.cli_bin)}</div>
+          <div>Env: ${formatValue(row.env_file)}</div>
+          <div>Config: ${formatValue(row.config_path)}</div>
+          <div>State: ${formatValue(row.state_dir)}</div>
+          <div>Chat: ${formatValue(row.chat_id)}</div>
+          <div>Thread: ${formatValue(row.thread_id)}</div>
+          <div>Service: ${formatValue(row.service_name)}</div>
+          <div>Profile: ${formatValue(row.profile_name)}</div>
+        </div>
+      `).join('');
+    }
+
     async function loadLiveKeys() {
       const payload = await fetchJson('/admin/api/live-keys');
       renderLiveKeys(payload.data || []);
+    }
+
+    async function loadRelays() {
+      const payload = await fetchJson('/admin/api/openclaw-relays');
+      renderRelays(payload.data || []);
+    }
+
+    function buildRelayBody() {
+      const body = {
+        relay_label: relayLabelEl.value.trim(),
+        transport: relayTransportEl.value.trim(),
+        cli_bin: relayCliBinEl.value.trim(),
+        env_file: relayEnvFileEl.value.trim(),
+        config_path: relayConfigPathEl.value.trim(),
+        state_dir: relayStateDirEl.value.trim(),
+        chat_id: relayChatIdEl.value.trim(),
+        thread_id: relayThreadIdEl.value.trim(),
+        service_name: relayServiceNameEl.value.trim(),
+        profile_name: relayProfileNameEl.value.trim(),
+        probe_message: relayProbeMessageEl.value.trim(),
+        notes: relayNotesEl.value.trim(),
+      };
+      Object.keys(body).forEach((key) => {
+        if (!body[key]) {
+          delete body[key];
+        }
+      });
+      return body;
     }
 
     async function mintLiveKey() {
@@ -559,6 +715,42 @@
       }
     }
 
+    async function saveRelay() {
+      const label = relayLabelEl.value.trim();
+      if (!label) {
+        setStatus('Relay label is required.', true);
+        return;
+      }
+      try {
+        setStatus('Saving relay config...');
+        const payload = await putJson(`/admin/api/openclaw-relays/${encodeURIComponent(label)}`, buildRelayBody());
+        relayResultEl.textContent = JSON.stringify(payload, null, 2);
+        setStatus('Relay config saved.');
+        await loadRelays();
+      } catch (error) {
+        setStatus(error.message || 'Unable to save relay config.', true);
+      }
+    }
+
+    async function doctorRelay() {
+      const label = relayLabelEl.value.trim();
+      if (!label) {
+        setStatus('Relay label is required.', true);
+        return;
+      }
+      try {
+        setStatus('Running relay doctor...');
+        const payload = await postJson(`/admin/api/openclaw-relays/${encodeURIComponent(label)}/doctor`, {
+          probe: true,
+          timeout_ms: 5000,
+        });
+        relayResultEl.textContent = JSON.stringify(payload, null, 2);
+        setStatus(`Relay doctor finished: ${payload.data?.readiness || 'unknown'}`);
+      } catch (error) {
+        setStatus(error.message || 'Unable to run relay doctor.', true);
+      }
+    }
+
     async function refresh() {
       const secret = getSecret();
       if (!secret) {
@@ -569,7 +761,7 @@
       secretEl.value = secret;
       try {
         setStatus('Loading admin data...');
-        await Promise.all([loadSummary(), loadRequests()]);
+        await Promise.all([loadSummary(), loadRequests(), loadRelays()]);
         setStatus('Admin data loaded.');
       } catch (error) {
         setStatus(error.message || 'Unable to load admin data.', true);
@@ -588,6 +780,17 @@
     document.getElementById('refresh').addEventListener('click', refresh);
     document.getElementById('mintLiveKey').addEventListener('click', mintLiveKey);
     document.getElementById('backfillLiveKeys').addEventListener('click', backfillLiveKeys);
+    document.getElementById('saveRelay').addEventListener('click', saveRelay);
+    document.getElementById('doctorRelay').addEventListener('click', doctorRelay);
+    document.getElementById('refreshRelay').addEventListener('click', async () => {
+      try {
+        setStatus('Loading relay configs...');
+        await loadRelays();
+        setStatus('Relay configs loaded.');
+      } catch (error) {
+        setStatus(error.message || 'Unable to load relay configs.', true);
+      }
+    });
     document.getElementById('refreshLiveKeys').addEventListener('click', async () => {
       try {
         setStatus('Loading live keys...');

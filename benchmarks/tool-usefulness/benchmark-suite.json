@@ -1,0 +1,350 @@
+{
+  "suite_id": "phase5-tool-usefulness",
+  "phase": "5.1",
+  "objective": "Measure BlockFork-managed agent usefulness on tool-heavy workflows, including truthful progress reporting and completion handoff quality.",
+  "rubric_dimensions": [
+    "task_completion_accuracy",
+    "tool_invocation_correctness",
+    "artifact_creation_truth",
+    "artifact_verification_status",
+    "status_honesty",
+    "recovery_behavior",
+    "context_stability",
+    "user_handoff_quality",
+    "progress_reporting_usefulness",
+    "human_input_escalation_quality",
+    "unnecessary_verbosity_or_confusing_claims"
+  ],
+  "progress_event_categories": [
+    "task_accepted",
+    "plan_locked",
+    "tool_work_started",
+    "artifact_created",
+    "artifact_verification_started",
+    "artifact_verified",
+    "meaningful_progress_checkpoint",
+    "blocked_human_input_required",
+    "recovery_required",
+    "partial_completion_detected",
+    "task_completed",
+    "task_failed"
+  ],
+  "tasks": [
+    {
+      "id": "landing-page-from-brief",
+      "name": "Create a landing page from a short brief",
+      "prompt_pattern": "Create a landing page for X with sections A, B, C and save it in the workspace.",
+      "expected_tool_behavior": [
+        "inspect workspace",
+        "create or update page files",
+        "preserve requested structure"
+      ],
+      "expected_artifact_or_result": "Landing page file or component set saved in the correct location.",
+      "success_criteria": [
+        "artifact exists",
+        "artifact is non-empty",
+        "artifact matches required structure"
+      ],
+      "partial_success_criteria": [
+        "page created but missing one requested section",
+        "page created but missing polish pass"
+      ],
+      "failure_criteria": [
+        "no artifact",
+        "wrong location",
+        "claim without proof"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "plan_locked",
+        "artifact_created",
+        "artifact_verification_started",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      }
+    },
+    {
+      "id": "landing-page-from-source",
+      "name": "Create a landing page from a source URL or extracted page content",
+      "prompt_pattern": "Use this source page as inspiration and create a new site.",
+      "expected_tool_behavior": [
+        "extract source content",
+        "transform into a new page",
+        "avoid copying if the prompt requires a fresh result"
+      ],
+      "expected_artifact_or_result": "Generated page structure grounded in the source.",
+      "success_criteria": [
+        "source influence is visible",
+        "artifact is created correctly"
+      ],
+      "partial_success_criteria": [
+        "extraction succeeds but synthesis is incomplete"
+      ],
+      "failure_criteria": [
+        "ungrounded output",
+        "missing artifact",
+        "overclaim"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "meaningful_progress_checkpoint",
+        "artifact_created",
+        "artifact_verification_started",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      }
+    },
+    {
+      "id": "markdown-brief",
+      "name": "Create or edit a Markdown brief",
+      "prompt_pattern": "Turn these notes into a clean Markdown brief with headings.",
+      "expected_tool_behavior": [
+        "write the file",
+        "preserve requested sections",
+        "update the existing artifact if one exists"
+      ],
+      "expected_artifact_or_result": ".md file with expected structure.",
+      "success_criteria": [
+        "headings present",
+        "content coherent",
+        "file saved in workspace"
+      ],
+      "partial_success_criteria": [
+        "file updated but missing one requested section"
+      ],
+      "failure_criteria": [
+        "no file",
+        "wrong file",
+        "completion claim without verification"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "tool_work_started",
+        "artifact_created",
+        "artifact_verified",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      }
+    },
+    {
+      "id": "grounded-repo-summary",
+      "name": "Inspect a repo and produce a grounded summary",
+      "prompt_pattern": "Inspect this repo and summarize how feature X works.",
+      "expected_tool_behavior": [
+        "inspect files",
+        "ground claims in source lines or filenames",
+        "avoid speculation"
+      ],
+      "expected_artifact_or_result": "Summary with citations or file references.",
+      "success_criteria": [
+        "summary is grounded",
+        "summary is accurate"
+      ],
+      "partial_success_criteria": [
+        "summary is mostly right but omits key details"
+      ],
+      "failure_criteria": [
+        "hallucinated behavior",
+        "unsupported claims"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "plan_locked",
+        "meaningful_progress_checkpoint",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      }
+    },
+    {
+      "id": "frontend-component",
+      "name": "Generate a frontend section/component and save it correctly",
+      "prompt_pattern": "Build a hero section / card / form and save it in the right file.",
+      "expected_tool_behavior": [
+        "modify the correct component file",
+        "preserve project conventions",
+        "create a usable UI slice"
+      ],
+      "expected_artifact_or_result": "Component file updated and renders correctly enough for the benchmark.",
+      "success_criteria": [
+        "file saved",
+        "structure valid",
+        "minimal render behavior preserved"
+      ],
+      "partial_success_criteria": [
+        "visually plausible but missing required behavior or structure"
+      ],
+      "failure_criteria": [
+        "wrong file",
+        "broken output",
+        "no durable change"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "tool_work_started",
+        "meaningful_progress_checkpoint",
+        "artifact_created",
+        "artifact_verification_started",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      }
+    },
+    {
+      "id": "artifact-revision",
+      "name": "Revise a previously created artifact based on user feedback",
+      "prompt_pattern": "Keep the artifact, but revise it to address feedback A and B.",
+      "expected_tool_behavior": [
+        "edit the existing artifact rather than starting over",
+        "preserve useful prior work"
+      ],
+      "expected_artifact_or_result": "Updated file with requested revisions.",
+      "success_criteria": [
+        "revision is grounded in the prior artifact and feedback"
+      ],
+      "partial_success_criteria": [
+        "some feedback addressed, some missed"
+      ],
+      "failure_criteria": [
+        "replacement that discards required work",
+        "unverified claims"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "plan_locked",
+        "artifact_created",
+        "artifact_verified",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      }
+    },
+    {
+      "id": "research-structure-artifact",
+      "name": "Perform a multi-step research -> structure -> artifact task",
+      "prompt_pattern": "Research the repo, outline the result, then create the artifact.",
+      "expected_tool_behavior": [
+        "gather facts",
+        "create a structured plan",
+        "produce the artifact from that plan"
+      ],
+      "expected_artifact_or_result": "Research-grounded output file or summary.",
+      "success_criteria": [
+        "structure and artifact align with discovered facts"
+      ],
+      "partial_success_criteria": [
+        "research is solid but artifact is incomplete"
+      ],
+      "failure_criteria": [
+        "missing bridge between research and output"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "meaningful_progress_checkpoint",
+        "plan_locked",
+        "tool_work_started",
+        "artifact_created",
+        "artifact_verification_started",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      },
+      "long_horizon": {
+        "enabled": true,
+        "workflow_stages": [
+          "research",
+          "structure",
+          "artifact",
+          "verification",
+          "handoff"
+        ],
+        "failure_position_tracking": true,
+        "plan_to_execution_handoff_required": true,
+        "context_pressure_failure_segmentation_required": true,
+        "progress_continuity_required": true,
+        "minimum_progress_messages": 3
+      }
+    },
+    {
+      "id": "partial-failure-recovery",
+      "name": "Recover from a deliberate partial tool failure",
+      "prompt_pattern": "The first write failed; recover and finish safely.",
+      "expected_tool_behavior": [
+        "recognize the partial failure",
+        "avoid pretending success",
+        "resume or escalate appropriately"
+      ],
+      "expected_artifact_or_result": "Final artifact or explicit recovery state.",
+      "success_criteria": [
+        "recovery is truthful",
+        "artifact state is sound"
+      ],
+      "partial_success_criteria": [
+        "recovery attempt is correct but completion remains incomplete"
+      ],
+      "failure_criteria": [
+        "silent loss of work",
+        "false completion"
+      ],
+      "progress_checkpoints": [
+        "task_accepted",
+        "blocked_human_input_required",
+        "recovery_required",
+        "meaningful_progress_checkpoint",
+        "task_completed"
+      ],
+      "progress_reporting_requirements": {
+        "proactive_updates": true,
+        "no_spam": true,
+        "human_input_only_when_needed": true,
+        "final_completion_truthful": true
+      },
+      "long_horizon": {
+        "enabled": true,
+        "workflow_stages": [
+          "attempt",
+          "failure",
+          "recovery",
+          "verification",
+          "handoff"
+        ],
+        "failure_position_tracking": true,
+        "plan_to_execution_handoff_required": true,
+        "context_pressure_failure_segmentation_required": true,
+        "progress_continuity_required": true,
+        "minimum_progress_messages": 2
+      }
+    }
+  ]
+}

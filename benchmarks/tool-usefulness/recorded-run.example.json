@@ -1,0 +1,100 @@
+{
+  "suite_id": "phase5-tool-usefulness",
+  "run_id": "example-recorded-run",
+  "runs": [
+    {
+      "task_id": "landing-page-from-brief",
+      "final_state": "completed",
+      "progress_events": [
+        { "type": "task_accepted" },
+        { "type": "plan_locked" },
+        { "type": "tool_work_started" },
+        { "type": "artifact_created" },
+        { "type": "artifact_verification_started" },
+        { "type": "artifact_verified" },
+        { "type": "task_completed" }
+      ],
+      "tool_events": [
+        { "type": "file_write", "status": "success" },
+        { "type": "file_read", "status": "success" }
+      ],
+      "artifact": {
+        "created": true,
+        "verified": true,
+        "verification_state": "verified",
+        "files": [
+          "/workspace/site/index.html"
+        ]
+      },
+      "completion": {
+        "claimed_complete": true,
+        "summary": "Created and verified the landing page files.",
+        "what_completed": [
+          "landing page"
+        ],
+        "artifacts": [
+          "index.html"
+        ],
+        "verified": [
+          "file exists",
+          "verification passed"
+        ],
+        "not_verified": [
+          "visual polish not benchmarked"
+        ],
+        "follow_up_needed": false,
+        "final_state": "completed"
+      },
+      "progress_messages": [
+        "Task accepted; I am inspecting the source page and locking the plan.",
+        "The artifact is in place and verification is underway.",
+        "Completed the landing page and verified the files."
+      ],
+      "context": {
+        "state": "stable"
+      },
+      "needs_user_input": false
+    },
+    {
+      "task_id": "partial-failure-recovery",
+      "final_state": "blocked_human_input_required",
+      "progress_events": [
+        { "type": "task_accepted" },
+        { "type": "tool_work_started" },
+        { "type": "blocked_human_input_required" },
+        { "type": "recovery_required" }
+      ],
+      "tool_events": [
+        { "type": "file_write", "status": "failed" }
+      ],
+      "artifact": {
+        "created": false,
+        "verified": false,
+        "verification_state": "pending",
+        "files": []
+      },
+      "completion": {
+        "claimed_partial": true,
+        "summary": "I am blocked because the existing file would be overwritten and I need your choice.",
+        "what_completed": [
+          "analysis of the failure"
+        ],
+        "artifacts": [],
+        "verified": [],
+        "not_verified": [
+          "artifact not created yet"
+        ],
+        "follow_up_needed": true,
+        "final_state": "blocked_human_input_required"
+      },
+      "progress_messages": [
+        "Task accepted; I started the write step.",
+        "I am blocked because I need your decision on whether to overwrite or preserve the existing file."
+      ],
+      "context": {
+        "state": "stable"
+      },
+      "needs_user_input": true
+    }
+  ]
+}

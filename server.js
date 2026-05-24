@@ -10,11 +10,13 @@ if (process.env.ENV_FILE && !fs.existsSync(RESOLVED_ENV_FILE)) {
   throw new Error(`ENV_FILE not found: ${process.env.ENV_FILE}`);
 }
 
-require('dotenv').config({ path: RESOLVED_ENV_FILE });
+const dotenv = require('dotenv');
+dotenv.config({ path: RESOLVED_ENV_FILE });
 
 const express = require('express');
 const fetch = require('node-fetch');
 const initSqlJs = require('sql.js');
+const { spawn } = require('child_process');
 
 const app = express();
 
@@ -107,6 +109,36 @@ const LOCAL_WARMUP_TIMEOUT_MS = Math.max(
     ? Number(process.env.BLOCKFORK_LOCAL_WARMUP_TIMEOUT_MS)
     : 12000,
 );
+const NOTIFICATION_DISPATCHER_ENABLED = /^(1|true|yes)$/i.test(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_ENABLED || '');
+const NOTIFICATION_DISPATCHER_INTERVAL_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_INTERVAL_MS))
+    ? Number(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_INTERVAL_MS)
+    : 5000,
+);
+const NOTIFICATION_DISPATCHER_RETRY_AFTER_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_RETRY_AFTER_MS))
+    ? Number(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_RETRY_AFTER_MS)
+    : 60000,
+);
+const NOTIFICATION_DISPATCHER_LIMIT = Math.max(
+  1,
+  Number.isFinite(Number(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_LIMIT))
+    ? Number(process.env.BLOCKFORK_NOTIFICATION_DISPATCHER_LIMIT)
+    : 10,
+);
+const BLOCKFORK_NOTIFICATION_TRANSPORT = (process.env.BLOCKFORK_NOTIFICATION_TRANSPORT || 'openclaw_cli').trim() || 'openclaw_cli';
+const BLOCKFORK_OPENCLAW_CLI_BIN = (process.env.BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw').trim() || 'openclaw';
+const BLOCKFORK_OPENCLAW_CLI_DRY_RUN = !/^(0|false|no)$/i.test(process.env.BLOCKFORK_OPENCLAW_CLI_DRY_RUN || '1');
+const BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS))
+    ? Number(process.env.BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS)
+    : 30000,
+);
+const OPENCLAW_RELAY_CONFIG_LABEL_PREFIX = 'relay_';
+const DEFAULT_OPENCLAW_RELAY_LABEL = 'default';
 const ALLOW_MODEL_OVERRIDE = /^(1|true|yes)$/i.test(process.env.BLOCKFORK_ALLOW_MODEL_OVERRIDE || '');
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
@@ -185,6 +217,13 @@ const EXECUTION_EVENT_ID_PREFIX = 'exevt_';
 const EXECUTION_LEASE_ID_PREFIX = 'lease_';
 const WORKSPACE_ID_PREFIX = 'ws_';
 const EXECUTION_ARTIFACT_ID_PREFIX = 'art_';
+const TASK_ID_PREFIX = 'task_';
+const TASK_EVENT_ID_PREFIX = 'tevt_';
+const TASK_PROGRESS_EVENT_ID_PREFIX = 'tpvt_';
+const TASK_COMPLETION_SUMMARY_ID_PREFIX = 'tcs_';
+const TASK_NOTIFICATION_ID_PREFIX = 'tnot_';
+const TASK_NOTIFICATION_DELIVERY_ATTEMPT_ID_PREFIX = 'tnda_';
+const TOOL_FAILURE_FACT_ID_PREFIX = 'tff_';
 const CONTINUITY_EVENT_ID_PREFIX = 'cevt_';
 const SESSION_LINEAGE_ID_PREFIX = 'lin_';
 const CONTINUITY_RECOMMENDATION_ID_PREFIX = 'crec_';
@@ -228,6 +267,115 @@ const ARTIFACT_VERIFICATION_STATES = Object.freeze({
   VERIFIED: 'verified',
   REJECTED: 'rejected',
 });
+const TASK_ARTIFACT_ASSESSMENT_ID_PREFIX = 'taas_';
+const TASK_ARTIFACT_STRUCTURE_STATES = Object.freeze({
+  MISSING: 'missing',
+  PARTIAL: 'partial',
+  VALID: 'valid',
+  INVALID: 'invalid',
+});
+const TASK_ARTIFACT_ALIGNMENT_STATES = Object.freeze({
+  MISSING: 'missing',
+  PARTIAL: 'partial',
+  ALIGNED: 'aligned',
+  MISMATCH: 'mismatch',
+});
+const TASK_ARTIFACT_CONFIDENCE_BANDS = Object.freeze({
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+});
+const TASK_PROGRESS_CATEGORIES = Object.freeze({
+  TASK_ACCEPTED: 'task_accepted',
+  PLAN_LOCKED: 'plan_locked',
+  TOOL_WORK_STARTED: 'tool_work_started',
+  MEANINGFUL_PROGRESS_CHECKPOINT: 'meaningful_progress_checkpoint',
+  ARTIFACT_VERIFICATION_STARTED: 'artifact_verification_started',
+  ARTIFACT_CREATED: 'artifact_created',
+  ARTIFACT_VERIFIED: 'artifact_verified',
+  BLOCKED_HUMAN_INPUT_REQUIRED: 'blocked_human_input_required',
+  RECOVERY_REQUIRED: 'recovery_required',
+  PARTIAL_COMPLETION_DETECTED: 'partial_completion_detected',
+  TASK_COMPLETED: 'task_completed',
+  TASK_FAILED: 'task_failed',
+});
+const TASK_NOTIFICATION_DELIVERY_STATES = Object.freeze({
+  PENDING: 'pending',
+  CLAIMED: 'claimed',
+  DELIVERED: 'delivered',
+  FAILED: 'failed',
+});
+const TASK_NOTIFICATION_POLICIES = Object.freeze({
+  SILENT: 'silent',
+  COMPLETION_ONLY: 'completion_only',
+  PROGRESS_AND_COMPLETION: 'progress_and_completion',
+  FAILURE_ONLY: 'failure_only',
+});
+const TASK_KINDS = Object.freeze({
+  SIMPLE_CHAT: 'simple_chat',
+  TEXT_GENERATION: 'text_generation',
+  STRUCTURED_TEXT: 'structured_text',
+  ARTIFACT_TASK: 'artifact_task',
+  CODE_TASK: 'code_task',
+  WEBSITE_TASK: 'website_task',
+  RESEARCH_TASK: 'research_task',
+  MEDIA_TASK: 'media_task',
+  LONG_RUNNING_TASK: 'long_running_task',
+  RECOVERY_OR_FAILURE: 'recovery_or_failure',
+});
+const TOOL_FAILURE_CATEGORIES = Object.freeze({
+  TOOL_NOT_INVOKED: 'tool_not_invoked',
+  TOOL_INVOCATION_FAILED: 'tool_invocation_failed',
+  TOOL_OUTPUT_INVALID: 'tool_output_invalid',
+  ARTIFACT_MISSING: 'artifact_missing',
+  ARTIFACT_PARTIAL: 'artifact_partial',
+  TERMINAL_PAYLOAD_MISSING: 'terminal_payload_missing',
+  EXECUTION_INTERRUPTED: 'execution_interrupted',
+  CONTEXT_COLLAPSED: 'context_collapsed',
+  STATUS_CLAIM_UNVERIFIED: 'status_claim_unverified',
+  USER_CONFIRMATION_WAITING: 'user_confirmation_waiting',
+  BLOCKED_FOR_INPUT: 'blocked_for_input',
+  RECOVERY_BLOCKED: 'recovery_blocked',
+});
+const TOOL_FAILURE_SCOPES = Object.freeze({
+  TASK: 'task',
+  EXECUTION: 'execution',
+  ARTIFACT: 'artifact',
+  CONTEXT: 'context',
+  TOOL: 'tool',
+});
+const TASK_STATES = Object.freeze({
+  RECEIVED: 'received',
+  ACKNOWLEDGED: 'acknowledged',
+  PLANNED: 'planned',
+  IN_PROGRESS: 'in_progress',
+  TOOL_WORK_STARTED: 'tool_work_started',
+  ARTIFACT_CREATED: 'artifact_created',
+  ARTIFACT_VERIFIED: 'artifact_verified',
+  BLOCKED_HUMAN_INPUT_REQUIRED: 'blocked_human_input_required',
+  PARTIALLY_COMPLETED: 'partially_completed',
+  RECOVERY_REQUIRED: 'recovery_required',
+  FAILED: 'failed',
+  COMPLETED: 'completed',
+});
+const TASK_TERMINAL_STATES = new Set([
+  TASK_STATES.FAILED,
+  TASK_STATES.COMPLETED,
+]);
+const TASK_LEGAL_TRANSITIONS = new Map([
+  [TASK_STATES.RECEIVED, new Set([TASK_STATES.ACKNOWLEDGED, TASK_STATES.PLANNED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED])],
+  [TASK_STATES.ACKNOWLEDGED, new Set([TASK_STATES.PLANNED, TASK_STATES.IN_PROGRESS, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED])],
+  [TASK_STATES.PLANNED, new Set([TASK_STATES.IN_PROGRESS, TASK_STATES.TOOL_WORK_STARTED, TASK_STATES.ARTIFACT_CREATED, TASK_STATES.ARTIFACT_VERIFIED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED])],
+  [TASK_STATES.IN_PROGRESS, new Set([TASK_STATES.TOOL_WORK_STARTED, TASK_STATES.ARTIFACT_CREATED, TASK_STATES.ARTIFACT_VERIFIED, TASK_STATES.PARTIALLY_COMPLETED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED, TASK_STATES.COMPLETED])],
+  [TASK_STATES.TOOL_WORK_STARTED, new Set([TASK_STATES.ARTIFACT_CREATED, TASK_STATES.ARTIFACT_VERIFIED, TASK_STATES.PARTIALLY_COMPLETED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED, TASK_STATES.COMPLETED])],
+  [TASK_STATES.ARTIFACT_CREATED, new Set([TASK_STATES.ARTIFACT_VERIFIED, TASK_STATES.PARTIALLY_COMPLETED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED, TASK_STATES.COMPLETED])],
+  [TASK_STATES.ARTIFACT_VERIFIED, new Set([TASK_STATES.COMPLETED, TASK_STATES.PARTIALLY_COMPLETED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.FAILED])],
+  [TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, new Set([TASK_STATES.ACKNOWLEDGED, TASK_STATES.PLANNED, TASK_STATES.IN_PROGRESS, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED, TASK_STATES.COMPLETED])],
+  [TASK_STATES.PARTIALLY_COMPLETED, new Set([TASK_STATES.COMPLETED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED])],
+  [TASK_STATES.RECOVERY_REQUIRED, new Set([TASK_STATES.ACKNOWLEDGED, TASK_STATES.PLANNED, TASK_STATES.IN_PROGRESS, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.FAILED, TASK_STATES.COMPLETED])],
+  [TASK_STATES.FAILED, new Set()],
+  [TASK_STATES.COMPLETED, new Set()],
+]);
 const publicDir = __dirname;
 const UPSTREAM_ERROR_BODY_LIMIT_BYTES = 2 * 1024;
 const ADMIN_SECRET_HEADER = 'x-admin-secret';
@@ -279,6 +427,38 @@ function createExecutionArtifactId() {
   return `${EXECUTION_ARTIFACT_ID_PREFIX}${crypto.randomUUID()}`;
 }
 
+function createTaskId() {
+  return `${TASK_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createTaskEventId() {
+  return `${TASK_EVENT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createTaskProgressEventId() {
+  return `${TASK_PROGRESS_EVENT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createTaskCompletionSummaryId() {
+  return `${TASK_COMPLETION_SUMMARY_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createTaskNotificationId() {
+  return `${TASK_NOTIFICATION_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createTaskNotificationDeliveryAttemptId() {
+  return `${TASK_NOTIFICATION_DELIVERY_ATTEMPT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createToolFailureFactId() {
+  return `${TOOL_FAILURE_FACT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createTaskArtifactAssessmentId() {
+  return `${TASK_ARTIFACT_ASSESSMENT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
 function createContinuityEventId() {
   return `${CONTINUITY_EVENT_ID_PREFIX}${crypto.randomUUID()}`;
 }
@@ -289,6 +469,24 @@ function createSessionLineageId() {
 
 function createContinuityRecommendationId() {
   return `${CONTINUITY_RECOMMENDATION_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function assertLegalTaskTransition(previousState, nextState) {
+  const from = String(previousState || '');
+  const to = String(nextState || '');
+  if (!from || !to) {
+    throw new Error('Task transition requires both previous and next state');
+  }
+  if (from === to) {
+    throw new Error(`Illegal task transition: ${from} -> ${to}`);
+  }
+  if (!TASK_LEGAL_TRANSITIONS.has(from)) {
+    throw new Error(`Unknown task state: ${from}`);
+  }
+  const allowed = TASK_LEGAL_TRANSITIONS.get(from);
+  if (!allowed || !allowed.has(to)) {
+    throw new Error(`Illegal task transition: ${from} -> ${to}`);
+  }
 }
 
 const CONTINUITY_RECOMMENDATION_TYPES = Object.freeze({
@@ -1223,6 +1421,554 @@ async function getStoredSessionById(db, sessionId) {
   return row;
 }
 
+function hydrateSessionDeliveryTargetRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  const threadId = row.thread_id === null || row.thread_id === undefined || row.thread_id === ''
+    ? null
+    : String(row.thread_id).trim();
+
+  return {
+    session_id: String(row.session_id || ''),
+    channel: String(row.channel || 'telegram'),
+    chat_id: String(row.chat_id || ''),
+    thread_id: threadId || null,
+    created_at: String(row.created_at || ''),
+    updated_at: String(row.updated_at || ''),
+  };
+}
+
+function hydrateLiveKeyDeliveryTargetRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  const threadId = row.thread_id === null || row.thread_id === undefined || row.thread_id === ''
+    ? null
+    : String(row.thread_id).trim();
+
+  return {
+    live_key_id: String(row.live_key_id || ''),
+    channel: String(row.channel || 'telegram'),
+    chat_id: String(row.chat_id || ''),
+    thread_id: threadId || null,
+    created_at: String(row.created_at || ''),
+    updated_at: String(row.updated_at || ''),
+  };
+}
+
+async function getStoredSessionDeliveryTargetBySessionId(db, sessionId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM session_delivery_targets
+    WHERE session_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([sessionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateSessionDeliveryTargetRow(row);
+}
+
+async function getStoredLiveKeyDeliveryTargetByLiveKeyId(db, liveKeyId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM live_key_delivery_targets
+    WHERE live_key_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([liveKeyId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateLiveKeyDeliveryTargetRow(row);
+}
+
+async function upsertSessionDeliveryTargetTx(db, sessionId, deliveryTarget, options = {}) {
+  const timestamp = options.timestamp || getTimestamp();
+  const normalized = normalizeSessionDeliveryTargetInput(deliveryTarget);
+  const insert = db.prepare(`
+    INSERT INTO session_delivery_targets (
+      session_id, channel, chat_id, thread_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET
+      channel = excluded.channel,
+      chat_id = excluded.chat_id,
+      thread_id = excluded.thread_id,
+      updated_at = excluded.updated_at
+  `);
+  insert.run([
+    sessionId,
+    normalized.channel,
+    normalized.chat_id,
+    normalized.thread_id,
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+  return getStoredSessionDeliveryTargetBySessionId(db, sessionId);
+}
+
+async function upsertLiveKeyDeliveryTargetTx(db, liveKeyId, deliveryTarget, options = {}) {
+  const timestamp = options.timestamp || getTimestamp();
+  const normalized = normalizeSessionDeliveryTargetInput(deliveryTarget);
+  const insert = db.prepare(`
+    INSERT INTO live_key_delivery_targets (
+      live_key_id, channel, chat_id, thread_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(live_key_id) DO UPDATE SET
+      channel = excluded.channel,
+      chat_id = excluded.chat_id,
+      thread_id = excluded.thread_id,
+      updated_at = excluded.updated_at
+  `);
+  insert.run([
+    liveKeyId,
+    normalized.channel,
+    normalized.chat_id,
+    normalized.thread_id,
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+  return getStoredLiveKeyDeliveryTargetByLiveKeyId(db, liveKeyId);
+}
+
+async function ensureSessionDeliveryTargetForSessionTx(db, sessionId, options = {}) {
+  const existing = await getStoredSessionDeliveryTargetBySessionId(db, sessionId);
+  if (existing) {
+    return existing;
+  }
+
+  const session = await getStoredSessionById(db, sessionId);
+  if (!session || !session.linked_live_key_id) {
+    return null;
+  }
+
+  const liveKeyTarget = await getStoredLiveKeyDeliveryTargetByLiveKeyId(db, String(session.linked_live_key_id));
+  if (!liveKeyTarget) {
+    return null;
+  }
+
+  return upsertSessionDeliveryTargetTx(db, sessionId, liveKeyTarget, options);
+}
+
+async function bindSessionDeliveryTarget(sessionId, deliveryTarget, options = {}) {
+  return withBillingWrite(async (db) => upsertSessionDeliveryTargetTx(db, sessionId, deliveryTarget, options));
+}
+
+async function bindLiveKeyDeliveryTarget(liveKeyId, deliveryTarget, options = {}) {
+  return withBillingWrite(async (db) => upsertLiveKeyDeliveryTargetTx(db, liveKeyId, deliveryTarget, options));
+}
+
+function normalizeSessionDeliveryTargetInput(input) {
+  const raw = input && typeof input === 'object' && input.delivery_target && typeof input.delivery_target === 'object'
+    ? input.delivery_target
+    : input;
+
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('delivery_target is required');
+  }
+
+  const channel = String(raw.channel || '').trim().toLowerCase();
+  if (channel !== 'telegram') {
+    throw new Error('delivery_target.channel must be telegram');
+  }
+
+  const chatId = String(raw.chat_id || '').trim();
+  if (!chatId) {
+    throw new Error('delivery_target.chat_id is required');
+  }
+
+  const threadIdRaw = raw.thread_id;
+  const threadId = threadIdRaw === null || threadIdRaw === undefined || threadIdRaw === ''
+    ? null
+    : String(threadIdRaw).trim();
+
+  return {
+    channel: 'telegram',
+    chat_id: chatId,
+    thread_id: threadId || null,
+  };
+}
+
+function normalizeOpenClawRelayLabel(input) {
+  const label = String(input || '').trim();
+  if (!label) {
+    throw new Error('relay_label is required');
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(label)) {
+    throw new Error('relay_label may only contain letters, numbers, dots, underscores, and hyphens');
+  }
+  return label;
+}
+
+function pickRelayString(input, keys, fallback = '') {
+  if (!input || typeof input !== 'object') {
+    return fallback;
+  }
+  for (const key of keys) {
+    const value = input[key];
+    if (value !== null && value !== undefined && String(value).trim()) {
+      return String(value).trim();
+    }
+  }
+  return fallback;
+}
+
+function hydrateOpenClawRelayConfigRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  const threadId = row.thread_id === null || row.thread_id === undefined || row.thread_id === ''
+    ? null
+    : String(row.thread_id).trim();
+
+  return {
+    relay_label: String(row.relay_label || ''),
+    transport: String(row.transport || 'openclaw_cli'),
+    service_name: String(row.service_name || ''),
+    profile_name: String(row.profile_name || ''),
+    cli_bin: String(row.cli_bin || 'openclaw'),
+    env_file: String(row.env_file || ''),
+    config_path: String(row.config_path || ''),
+    state_dir: String(row.state_dir || ''),
+    chat_id: String(row.chat_id || ''),
+    thread_id: threadId || null,
+    probe_message: String(row.probe_message || 'BlockFork relay doctor dry-run'),
+    notes: String(row.notes || ''),
+    created_at: String(row.created_at || ''),
+    updated_at: String(row.updated_at || ''),
+  };
+}
+
+function normalizeOpenClawRelayConfigInput(input = {}) {
+  const raw = input && typeof input === 'object' ? input : {};
+  const relayLabel = normalizeOpenClawRelayLabel(pickRelayString(raw, ['relay_label', 'label', 'name'], DEFAULT_OPENCLAW_RELAY_LABEL));
+  const transport = pickRelayString(raw, ['transport'], BLOCKFORK_NOTIFICATION_TRANSPORT).toLowerCase() || 'openclaw_cli';
+  if (transport !== 'openclaw_cli') {
+    throw new Error('openclaw relay transport must be openclaw_cli');
+  }
+
+  const threadIdRaw = pickRelayString(raw, ['thread_id', 'threadId'], '');
+  const threadId = threadIdRaw ? threadIdRaw : null;
+
+  return {
+    relay_label: relayLabel,
+    transport: 'openclaw_cli',
+    service_name: pickRelayString(raw, ['service_name', 'service', 'openclaw_service'], ''),
+    profile_name: pickRelayString(raw, ['profile_name', 'profile'], ''),
+    cli_bin: pickRelayString(raw, ['cli_bin', 'openclaw_cli_bin', 'binary_path'], BLOCKFORK_OPENCLAW_CLI_BIN),
+    env_file: pickRelayString(raw, ['env_file', 'env_path', 'openclaw_env_path'], ''),
+    config_path: pickRelayString(raw, ['config_path', 'openclaw_config_path'], ''),
+    state_dir: pickRelayString(raw, ['state_dir', 'openclaw_state_dir'], ''),
+    chat_id: pickRelayString(raw, ['chat_id', 'target_chat_id'], ''),
+    thread_id: threadId,
+    probe_message: pickRelayString(raw, ['probe_message', 'message', 'dry_run_message'], 'BlockFork relay doctor dry-run'),
+    notes: pickRelayString(raw, ['notes', 'description'], ''),
+  };
+}
+
+async function getStoredOpenClawRelayConfigByLabel(db, relayLabel) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM openclaw_relay_configs
+    WHERE relay_label = ?
+    LIMIT 1
+  `);
+  stmt.bind([relayLabel]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateOpenClawRelayConfigRow(row);
+}
+
+async function getOpenClawRelayConfigByLabel(relayLabel) {
+  const db = await ensureBillingDb();
+  return getStoredOpenClawRelayConfigByLabel(db, relayLabel);
+}
+
+async function listStoredOpenClawRelayConfigsTx(db) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM openclaw_relay_configs
+    ORDER BY relay_label ASC
+  `);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateOpenClawRelayConfigRow(stmt.getAsObject()));
+  }
+  stmt.free();
+  return rows;
+}
+
+async function listOpenClawRelayConfigs() {
+  const db = await ensureBillingDb();
+  return listStoredOpenClawRelayConfigsTx(db);
+}
+
+async function upsertOpenClawRelayConfigTx(db, input, options = {}) {
+  const normalized = normalizeOpenClawRelayConfigInput(input);
+  const timestamp = options.timestamp || getTimestamp();
+  const insert = db.prepare(`
+    INSERT INTO openclaw_relay_configs (
+      relay_label, transport, service_name, profile_name, cli_bin, env_file, config_path, state_dir,
+      chat_id, thread_id, probe_message, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(relay_label) DO UPDATE SET
+      transport = excluded.transport,
+      service_name = excluded.service_name,
+      profile_name = excluded.profile_name,
+      cli_bin = excluded.cli_bin,
+      env_file = excluded.env_file,
+      config_path = excluded.config_path,
+      state_dir = excluded.state_dir,
+      chat_id = excluded.chat_id,
+      thread_id = excluded.thread_id,
+      probe_message = excluded.probe_message,
+      notes = excluded.notes,
+      updated_at = excluded.updated_at
+  `);
+  insert.run([
+    normalized.relay_label,
+    normalized.transport,
+    normalized.service_name,
+    normalized.profile_name,
+    normalized.cli_bin,
+    normalized.env_file,
+    normalized.config_path,
+    normalized.state_dir,
+    normalized.chat_id,
+    normalized.thread_id,
+    normalized.probe_message,
+    normalized.notes,
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+  return getStoredOpenClawRelayConfigByLabel(db, normalized.relay_label);
+}
+
+async function upsertOpenClawRelayConfig(input, options = {}) {
+  return withBillingWrite(async (db) => upsertOpenClawRelayConfigTx(db, input, options));
+}
+
+function quoteShellArg(value) {
+  const text = String(value === null || value === undefined ? '' : value);
+  if (!text) {
+    return "''";
+  }
+  return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+function buildOpenClawRelaySetupCommands(config) {
+  const commands = [];
+  if (config.env_file) {
+    commands.push(`source ${quoteShellArg(config.env_file)}`);
+  }
+
+  const envParts = [];
+  if (config.config_path) {
+    envParts.push(`OPENCLAW_CONFIG_PATH=${quoteShellArg(config.config_path)}`);
+  }
+  if (config.state_dir) {
+    envParts.push(`OPENCLAW_STATE_DIR=${quoteShellArg(config.state_dir)}`);
+  }
+
+  const probeParts = [
+    quoteShellArg(config.cli_bin || 'openclaw'),
+    'message',
+    'send',
+    '--channel',
+    'telegram',
+    '--target',
+    quoteShellArg(config.chat_id || ''),
+  ];
+  if (config.thread_id) {
+    probeParts.push('--thread-id', quoteShellArg(config.thread_id));
+  }
+  probeParts.push('--message', quoteShellArg(config.probe_message || 'BlockFork relay doctor dry-run'));
+  probeParts.push('--dry-run', '--json');
+  commands.push([
+    ...envParts,
+    probeParts.join(' '),
+  ].filter(Boolean).join(' '));
+
+  return commands;
+}
+
+function assessOpenClawRelayStaticChecks(config) {
+  const checks = [];
+  const blockers = [];
+  const addCheck = (key, ok, detail, command = '') => {
+    const item = {
+      key,
+      ok: Boolean(ok),
+      detail: String(detail || ''),
+    };
+    if (command) {
+      item.command = String(command);
+    }
+    checks.push(item);
+    if (!ok) {
+      blockers.push(item);
+    }
+  };
+
+  addCheck('transport', config.transport === 'openclaw_cli', config.transport === 'openclaw_cli'
+    ? 'openclaw_cli transport selected'
+    : 'transport must be openclaw_cli');
+  addCheck('cli_bin', Boolean(config.cli_bin), config.cli_bin ? `CLI path configured: ${config.cli_bin}` : 'OpenClaw CLI binary path is missing');
+  addCheck('env_file', Boolean(config.env_file), config.env_file ? `Env file configured: ${config.env_file}` : 'OpenClaw env file path is missing');
+  addCheck('config_path', Boolean(config.config_path), config.config_path ? `OpenClaw config path configured: ${config.config_path}` : 'OpenClaw config path is missing');
+  addCheck('state_dir', Boolean(config.state_dir), config.state_dir ? `OpenClaw state dir configured: ${config.state_dir}` : 'OpenClaw state dir is missing');
+  addCheck('chat_id', Boolean(config.chat_id), config.chat_id ? `Telegram chat id configured: ${config.chat_id}` : 'Telegram chat id is missing');
+  addCheck('thread_id', true, config.thread_id ? `Telegram thread id configured: ${config.thread_id}` : 'No thread id configured');
+
+  if (config.cli_bin) {
+    addCheck('cli_exists', fs.existsSync(config.cli_bin), fs.existsSync(config.cli_bin)
+      ? 'OpenClaw CLI binary exists'
+      : `OpenClaw CLI binary not found: ${config.cli_bin}`);
+  }
+
+  if (config.env_file) {
+    addCheck('env_exists', fs.existsSync(config.env_file), fs.existsSync(config.env_file)
+      ? 'OpenClaw env file exists'
+      : `OpenClaw env file not found: ${config.env_file}`);
+  }
+
+  if (config.config_path) {
+    addCheck('config_exists', fs.existsSync(config.config_path), fs.existsSync(config.config_path)
+      ? 'OpenClaw config file exists'
+      : `OpenClaw config file not found: ${config.config_path}`);
+  }
+
+  if (config.state_dir) {
+    addCheck('state_dir_exists', fs.existsSync(config.state_dir), fs.existsSync(config.state_dir)
+      ? 'OpenClaw state dir exists'
+      : `OpenClaw state dir not found: ${config.state_dir}`);
+  }
+
+  return { checks, blockers };
+}
+
+function parseOpenClawRelayEnvFile(envFilePath) {
+  if (!envFilePath || !fs.existsSync(envFilePath)) {
+    return {};
+  }
+
+  try {
+    return dotenv.parse(fs.readFileSync(envFilePath));
+  } catch (error) {
+    return {};
+  }
+}
+
+async function runOpenClawRelayDoctor(relayInput, options = {}) {
+  const config = typeof relayInput === 'string'
+    ? await getOpenClawRelayConfigByLabel(relayInput)
+    : normalizeOpenClawRelayConfigInput(relayInput);
+
+  if (!config) {
+    return {
+      ok: false,
+      readiness: 'missing',
+      blockers: [{
+        key: 'relay_config',
+        ok: false,
+        detail: 'Relay config was not found',
+      }],
+      checks: [],
+      commands: [],
+      probe: null,
+      relay_config: null,
+    };
+  }
+
+  const staticReport = assessOpenClawRelayStaticChecks(config);
+  const commands = buildOpenClawRelaySetupCommands(config);
+  let probe = null;
+
+  if (options.probe) {
+    if (!config.cli_bin || !config.chat_id) {
+      probe = {
+        ok: false,
+        skipped: true,
+        error_code: 'missing_probe_inputs',
+        error_message: 'Probe requires both cli_bin and chat_id',
+      };
+    } else {
+      const probeEnv = {
+        ...process.env,
+        ...parseOpenClawRelayEnvFile(config.env_file),
+      };
+      if (config.config_path) {
+        probeEnv.OPENCLAW_CONFIG_PATH = config.config_path;
+      }
+      if (config.state_dir) {
+        probeEnv.OPENCLAW_STATE_DIR = config.state_dir;
+      }
+      probeEnv.BLOCKFORK_NOTIFICATION_TRANSPORT = 'openclaw_cli';
+      probeEnv.BLOCKFORK_OPENCLAW_CLI_BIN = config.cli_bin;
+      probeEnv.BLOCKFORK_OPENCLAW_CLI_DRY_RUN = '1';
+
+      probe = await runOpenClawCliDryRunAdapter({
+        delivery_target: {
+          channel: 'telegram',
+          chat_id: config.chat_id,
+          thread_id: config.thread_id,
+        },
+        outbound_text: config.probe_message || 'BlockFork relay doctor dry-run',
+      }, {
+        commandPath: config.cli_bin,
+        dryRun: true,
+        timeoutMs: options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS,
+        env: probeEnv,
+      });
+    }
+  }
+
+  let readiness = 'needs_review';
+  if (staticReport.blockers.length) {
+    readiness = 'blocked';
+  } else if (probe) {
+    readiness = probe.ok ? 'ready' : 'probe_failed';
+  } else {
+    readiness = 'ready_for_probe';
+  }
+
+  const suggestions = [];
+  if (staticReport.blockers.length) {
+    suggestions.push('Fill in the missing relay config paths and chat id, then save the relay profile.');
+  } else {
+    suggestions.push('Source the env file, then run the dry-run probe command shown below.');
+  }
+  if (probe && !probe.ok && probe.error_message) {
+    suggestions.push(`Probe error: ${probe.error_message}`);
+  }
+
+  return {
+    ok: true,
+    readiness,
+    blockers: staticReport.blockers,
+    checks: staticReport.checks,
+    commands,
+    probe,
+    suggestions,
+    relay_config: config,
+  };
+}
+
 async function markStoredSessionStatus(sessionId, status) {
   return withBillingWrite(async (db) => {
     const update = db.prepare(`
@@ -1310,6 +2056,12 @@ async function createLiveKeySessionRecord(db, liveKeyRow, ttlSelected = DEFAULT_
   return withBillingWrite(async (database) => {
     await persistSessionRecord(session, database);
     await registerSessionState(session, database);
+    await linkLiveKeyToSession(database, session.session_id, liveKey.id, liveKey.user_id || session.user_id || null);
+
+    session.linked_live_key_id = liveKey.id;
+    if (!session.user_id) {
+      session.user_id = liveKey.user_id || session.user_id || null;
+    }
 
     const updateLiveKey = database.prepare(`
       UPDATE live_keys
@@ -1318,6 +2070,10 @@ async function createLiveKeySessionRecord(db, liveKeyRow, ttlSelected = DEFAULT_
     `);
     updateLiveKey.run([session.session_id, liveKey.id]);
     updateLiveKey.free();
+
+    await ensureSessionDeliveryTargetForSessionTx(database, session.session_id, {
+      timestamp: session.created_at,
+    });
 
     if (previousSessionId && previousSessionId !== session.session_id) {
       const lineageTimestamp = getTimestamp();
@@ -1405,6 +2161,9 @@ async function resolveLiveKeySession(token, req = null) {
       if (recheckedActiveSession) {
         const recheckedState = await getSessionState(db, String(recheckedActiveSession.session_id || ''));
         const session = hydrateSessionFromStored(recheckedActiveSession, recheckedState);
+        await ensureSessionDeliveryTargetForSessionTx(db, session.session_id, {
+          timestamp: session.created_at,
+        });
         logJson('live_key_resolution', {
           outcome: 'resolved_after_lock',
           live_key_id: liveKey.id,
@@ -1434,6 +2193,9 @@ async function resolveLiveKeySession(token, req = null) {
 
   const sessionState = await getSessionState(db, String(sessionRow.session_id || ''));
   const session = hydrateSessionFromStored(sessionRow, sessionState);
+  await ensureSessionDeliveryTargetForSessionTx(db, session.session_id, {
+    timestamp: session.created_at,
+  });
   logJson('live_key_resolution', {
     outcome: 'resolved',
     live_key_id: liveKey.id,
@@ -1586,6 +2348,41 @@ async function ensureBillingDb() {
       token_usage INTEGER NOT NULL DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS session_delivery_targets (
+      session_id TEXT PRIMARY KEY,
+      channel TEXT NOT NULL DEFAULT 'telegram',
+      chat_id TEXT NOT NULL,
+      thread_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS live_key_delivery_targets (
+      live_key_id TEXT PRIMARY KEY,
+      channel TEXT NOT NULL DEFAULT 'telegram',
+      chat_id TEXT NOT NULL,
+      thread_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS openclaw_relay_configs (
+      relay_label TEXT PRIMARY KEY,
+      transport TEXT NOT NULL DEFAULT 'openclaw_cli',
+      service_name TEXT NOT NULL DEFAULT '',
+      profile_name TEXT NOT NULL DEFAULT '',
+      cli_bin TEXT NOT NULL DEFAULT 'openclaw',
+      env_file TEXT NOT NULL DEFAULT '',
+      config_path TEXT NOT NULL DEFAULT '',
+      state_dir TEXT NOT NULL DEFAULT '',
+      chat_id TEXT NOT NULL DEFAULT '',
+      thread_id TEXT,
+      probe_message TEXT NOT NULL DEFAULT 'BlockFork relay doctor dry-run',
+      notes TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS live_keys (
       id TEXT PRIMARY KEY,
       key TEXT UNIQUE NOT NULL,
@@ -1633,6 +2430,7 @@ async function ensureBillingDb() {
     CREATE TABLE IF NOT EXISTS executions (
       execution_id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
+      task_id TEXT,
       current_state TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -1649,6 +2447,23 @@ async function ensureBillingDb() {
       recovery_notes TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS tasks (
+      task_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      current_state TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_request_id TEXT NOT NULL DEFAULT '',
+      idempotency_key TEXT,
+      objective_text TEXT NOT NULL DEFAULT '',
+      objective_fingerprint TEXT NOT NULL DEFAULT '',
+      first_execution_id TEXT,
+      last_execution_id TEXT,
+      completed_execution_id TEXT,
+      recovery_reason TEXT,
+      recovery_notes TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS execution_events (
       event_id TEXT PRIMARY KEY,
       execution_id TEXT NOT NULL,
@@ -1659,6 +2474,137 @@ async function ensureBillingDb() {
       reason_code TEXT NOT NULL,
       request_id TEXT,
       notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      task_event_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      execution_id TEXT,
+      previous_state TEXT NOT NULL DEFAULT '',
+      new_state TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      actor_source TEXT NOT NULL,
+      reason_code TEXT NOT NULL,
+      request_id TEXT,
+      notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS task_progress_events (
+      progress_event_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      execution_id TEXT,
+      previous_state TEXT NOT NULL DEFAULT '',
+      new_state TEXT NOT NULL,
+      progress_category TEXT NOT NULL,
+      decision TEXT NOT NULL DEFAULT 'notify_user',
+      message_text TEXT NOT NULL DEFAULT '',
+      requires_user_input INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'runtime',
+      reason_code TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_artifact_assessments (
+      assessment_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL UNIQUE,
+      session_id TEXT NOT NULL,
+      execution_id TEXT,
+      artifact_id TEXT,
+      artifact_exists INTEGER NOT NULL DEFAULT 0,
+      artifact_verification_state TEXT NOT NULL DEFAULT '',
+      artifact_family TEXT NOT NULL DEFAULT 'unknown',
+      structure_state TEXT NOT NULL DEFAULT 'missing',
+      alignment_state TEXT NOT NULL DEFAULT 'missing',
+      confidence_score INTEGER NOT NULL DEFAULT 0,
+      confidence_band TEXT NOT NULL DEFAULT 'low',
+      reason_code TEXT NOT NULL DEFAULT '',
+      notes TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_completion_summaries (
+      completion_summary_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL UNIQUE,
+      session_id TEXT NOT NULL,
+      execution_id TEXT,
+      final_state TEXT NOT NULL DEFAULT '',
+      summary_text TEXT NOT NULL DEFAULT '',
+      what_completed_json TEXT NOT NULL DEFAULT '[]',
+      artifacts_json TEXT NOT NULL DEFAULT '[]',
+      verified_json TEXT NOT NULL DEFAULT '[]',
+      not_verified_json TEXT NOT NULL DEFAULT '[]',
+      follow_up_needed INTEGER NOT NULL DEFAULT 0,
+      proof_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_notifications (
+      notification_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      execution_id TEXT,
+      source_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      notification_kind TEXT NOT NULL,
+      delivery_channel TEXT NOT NULL DEFAULT 'openclaw_tg',
+      delivery_state TEXT NOT NULL DEFAULT 'pending',
+      title TEXT NOT NULL DEFAULT '',
+      body TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      dedupe_key TEXT NOT NULL DEFAULT '',
+      claim_count INTEGER NOT NULL DEFAULT 0,
+      claimed_at TEXT,
+      delivered_at TEXT,
+      delivered_message_id TEXT,
+      last_error TEXT NOT NULL DEFAULT '',
+      next_attempt_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      notification_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      transport TEXT NOT NULL DEFAULT 'openclaw_cli',
+      channel TEXT NOT NULL DEFAULT 'telegram',
+      target TEXT NOT NULL DEFAULT '',
+      thread_id TEXT,
+      dry_run INTEGER NOT NULL DEFAULT 1,
+      command_path TEXT NOT NULL DEFAULT '',
+      command_argv_json TEXT NOT NULL DEFAULT '[]',
+      started_at TEXT NOT NULL,
+      finished_at TEXT NOT NULL,
+      exit_code INTEGER NOT NULL DEFAULT 0,
+      stdout_text TEXT NOT NULL DEFAULT '',
+      stderr_text TEXT NOT NULL DEFAULT '',
+      stdout_json TEXT,
+      success INTEGER NOT NULL DEFAULT 0,
+      retryable INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT NOT NULL DEFAULT '',
+      error_message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS tool_failure_facts (
+      failure_fact_id TEXT PRIMARY KEY,
+      subject_type TEXT NOT NULL,
+      subject_id TEXT NOT NULL,
+      task_id TEXT,
+      execution_id TEXT,
+      failure_category TEXT NOT NULL,
+      failure_scope TEXT NOT NULL,
+      failure_stage TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'runtime',
+      reason_code TEXT NOT NULL DEFAULT '',
+      detail TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS workspaces (
@@ -1825,6 +2771,252 @@ async function ensureBillingDb() {
     }
   }
 
+  const taskColumnsStmt = billingDb.prepare('PRAGMA table_info(tasks)');
+  const taskColumns = new Set();
+  while (taskColumnsStmt.step()) {
+    taskColumns.add(String(taskColumnsStmt.getAsObject().name || ''));
+  }
+  taskColumnsStmt.free();
+
+  const taskAlterations = [
+    ['last_request_id', "TEXT NOT NULL DEFAULT ''"],
+    ['idempotency_key', 'TEXT'],
+    ['objective_text', "TEXT NOT NULL DEFAULT ''"],
+    ['objective_fingerprint', "TEXT NOT NULL DEFAULT ''"],
+    ['task_kind', "TEXT NOT NULL DEFAULT 'text_generation'"],
+    ['notification_policy', "TEXT NOT NULL DEFAULT 'silent'"],
+    ['notification_eligible', 'INTEGER NOT NULL DEFAULT 0'],
+    ['eligibility_reason', "TEXT NOT NULL DEFAULT ''"],
+    ['classified_at', 'TEXT'],
+    ['first_execution_id', 'TEXT'],
+    ['last_execution_id', 'TEXT'],
+    ['completed_execution_id', 'TEXT'],
+    ['recovery_reason', 'TEXT'],
+    ['recovery_notes', 'TEXT'],
+  ];
+
+  for (const [columnName, columnType] of taskAlterations) {
+    if (!taskColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE tasks ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const taskEventColumnsStmt = billingDb.prepare('PRAGMA table_info(task_events)');
+  const taskEventColumns = new Set();
+  while (taskEventColumnsStmt.step()) {
+    taskEventColumns.add(String(taskEventColumnsStmt.getAsObject().name || ''));
+  }
+  taskEventColumnsStmt.free();
+  if (!taskEventColumns.has('created_at')) {
+    billingDb.run('ALTER TABLE task_events ADD COLUMN created_at TEXT');
+  }
+
+  const taskProgressColumnsStmt = billingDb.prepare('PRAGMA table_info(task_progress_events)');
+  const taskProgressColumns = new Set();
+  while (taskProgressColumnsStmt.step()) {
+    taskProgressColumns.add(String(taskProgressColumnsStmt.getAsObject().name || ''));
+  }
+  taskProgressColumnsStmt.free();
+  const taskProgressAlterations = [
+    ['progress_event_id', 'TEXT PRIMARY KEY'],
+    ['task_id', "TEXT NOT NULL DEFAULT ''"],
+    ['execution_id', 'TEXT'],
+    ['previous_state', "TEXT NOT NULL DEFAULT ''"],
+    ['new_state', "TEXT NOT NULL DEFAULT ''"],
+    ['progress_category', "TEXT NOT NULL DEFAULT ''"],
+    ['decision', "TEXT NOT NULL DEFAULT 'notify_user'"],
+    ['message_text', "TEXT NOT NULL DEFAULT ''"],
+    ['requires_user_input', 'INTEGER NOT NULL DEFAULT 0'],
+    ['source', "TEXT NOT NULL DEFAULT 'runtime'"],
+    ['reason_code', "TEXT NOT NULL DEFAULT ''"],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of taskProgressAlterations) {
+    if (!taskProgressColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE task_progress_events ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const taskArtifactAssessmentColumnsStmt = billingDb.prepare('PRAGMA table_info(task_artifact_assessments)');
+  const taskArtifactAssessmentColumns = new Set();
+  while (taskArtifactAssessmentColumnsStmt.step()) {
+    taskArtifactAssessmentColumns.add(String(taskArtifactAssessmentColumnsStmt.getAsObject().name || ''));
+  }
+  taskArtifactAssessmentColumnsStmt.free();
+  const taskArtifactAssessmentAlterations = [
+    ['artifact_exists', 'INTEGER NOT NULL DEFAULT 0'],
+    ['artifact_verification_state', "TEXT NOT NULL DEFAULT ''"],
+    ['artifact_family', "TEXT NOT NULL DEFAULT 'unknown'"],
+    ['structure_state', "TEXT NOT NULL DEFAULT 'missing'"],
+    ['alignment_state', "TEXT NOT NULL DEFAULT 'missing'"],
+    ['confidence_score', 'INTEGER NOT NULL DEFAULT 0'],
+    ['confidence_band', "TEXT NOT NULL DEFAULT 'low'"],
+    ['reason_code', "TEXT NOT NULL DEFAULT ''"],
+    ['notes', 'TEXT'],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of taskArtifactAssessmentAlterations) {
+    if (!taskArtifactAssessmentColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE task_artifact_assessments ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const taskCompletionSummaryColumnsStmt = billingDb.prepare('PRAGMA table_info(task_completion_summaries)');
+  const taskCompletionSummaryColumns = new Set();
+  while (taskCompletionSummaryColumnsStmt.step()) {
+    taskCompletionSummaryColumns.add(String(taskCompletionSummaryColumnsStmt.getAsObject().name || ''));
+  }
+  taskCompletionSummaryColumnsStmt.free();
+  const taskCompletionSummaryAlterations = [
+    ['completion_summary_id', 'TEXT PRIMARY KEY'],
+    ['task_id', "TEXT NOT NULL DEFAULT ''"],
+    ['session_id', "TEXT NOT NULL DEFAULT ''"],
+    ['execution_id', 'TEXT'],
+    ['final_state', "TEXT NOT NULL DEFAULT ''"],
+    ['summary_text', "TEXT NOT NULL DEFAULT ''"],
+    ['what_completed_json', "TEXT NOT NULL DEFAULT '[]'"],
+    ['artifacts_json', "TEXT NOT NULL DEFAULT '[]'"],
+    ['verified_json', "TEXT NOT NULL DEFAULT '[]'"],
+    ['not_verified_json', "TEXT NOT NULL DEFAULT '[]'"],
+    ['follow_up_needed', 'INTEGER NOT NULL DEFAULT 0'],
+    ['proof_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of taskCompletionSummaryAlterations) {
+    if (!taskCompletionSummaryColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE task_completion_summaries ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const taskNotificationColumnsStmt = billingDb.prepare('PRAGMA table_info(task_notifications)');
+  const taskNotificationColumns = new Set();
+  while (taskNotificationColumnsStmt.step()) {
+    taskNotificationColumns.add(String(taskNotificationColumnsStmt.getAsObject().name || ''));
+  }
+  taskNotificationColumnsStmt.free();
+  const taskNotificationAlterations = [
+    ['delivery_channel', "TEXT NOT NULL DEFAULT 'openclaw_tg'"],
+    ['delivery_state', "TEXT NOT NULL DEFAULT 'pending'"],
+    ['title', "TEXT NOT NULL DEFAULT ''"],
+    ['body', "TEXT NOT NULL DEFAULT ''"],
+    ['task_kind', "TEXT NOT NULL DEFAULT 'text_generation'"],
+    ['notification_policy', "TEXT NOT NULL DEFAULT 'silent'"],
+    ['proactive_eligible', 'INTEGER NOT NULL DEFAULT 0'],
+    ['eligibility_reason', "TEXT NOT NULL DEFAULT ''"],
+    ['delivery_suppressed_reason', "TEXT NOT NULL DEFAULT ''"],
+    ['classified_at', 'TEXT'],
+    ['payload_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['dedupe_key', "TEXT NOT NULL DEFAULT ''"],
+    ['claim_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['claimed_at', 'TEXT'],
+    ['delivered_at', 'TEXT'],
+    ['delivered_message_id', 'TEXT'],
+    ['last_error', "TEXT NOT NULL DEFAULT ''"],
+    ['next_attempt_at', 'TEXT'],
+    ['attempt_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of taskNotificationAlterations) {
+    if (!taskNotificationColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE task_notifications ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const notificationDeliveryAttemptColumnsStmt = billingDb.prepare('PRAGMA table_info(notification_delivery_attempts)');
+  const notificationDeliveryAttemptColumns = new Set();
+  while (notificationDeliveryAttemptColumnsStmt.step()) {
+    notificationDeliveryAttemptColumns.add(String(notificationDeliveryAttemptColumnsStmt.getAsObject().name || ''));
+  }
+  notificationDeliveryAttemptColumnsStmt.free();
+  const notificationDeliveryAttemptAlterations = [
+    ['attempt_id', 'TEXT PRIMARY KEY'],
+    ['notification_id', "TEXT NOT NULL DEFAULT ''"],
+    ['session_id', "TEXT NOT NULL DEFAULT ''"],
+    ['task_id', "TEXT NOT NULL DEFAULT ''"],
+    ['transport', "TEXT NOT NULL DEFAULT 'openclaw_cli'"],
+    ['channel', "TEXT NOT NULL DEFAULT 'telegram'"],
+    ['target', "TEXT NOT NULL DEFAULT ''"],
+    ['thread_id', 'TEXT'],
+    ['dry_run', 'INTEGER NOT NULL DEFAULT 1'],
+    ['command_path', "TEXT NOT NULL DEFAULT ''"],
+    ['command_argv_json', "TEXT NOT NULL DEFAULT '[]'"],
+    ['started_at', "TEXT NOT NULL DEFAULT ''"],
+    ['finished_at', "TEXT NOT NULL DEFAULT ''"],
+    ['exit_code', 'INTEGER NOT NULL DEFAULT 0'],
+    ['stdout_text', "TEXT NOT NULL DEFAULT ''"],
+    ['stderr_text', "TEXT NOT NULL DEFAULT ''"],
+    ['stdout_json', 'TEXT'],
+    ['success', 'INTEGER NOT NULL DEFAULT 0'],
+    ['retryable', 'INTEGER NOT NULL DEFAULT 0'],
+    ['error_code', "TEXT NOT NULL DEFAULT ''"],
+    ['error_message', "TEXT NOT NULL DEFAULT ''"],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of notificationDeliveryAttemptAlterations) {
+    if (!notificationDeliveryAttemptColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE notification_delivery_attempts ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const openclawRelayConfigColumnsStmt = billingDb.prepare('PRAGMA table_info(openclaw_relay_configs)');
+  const openclawRelayConfigColumns = new Set();
+  while (openclawRelayConfigColumnsStmt.step()) {
+    openclawRelayConfigColumns.add(String(openclawRelayConfigColumnsStmt.getAsObject().name || ''));
+  }
+  openclawRelayConfigColumnsStmt.free();
+  const openclawRelayConfigAlterations = [
+    ['relay_label', 'TEXT PRIMARY KEY'],
+    ['transport', "TEXT NOT NULL DEFAULT 'openclaw_cli'"],
+    ['service_name', "TEXT NOT NULL DEFAULT ''"],
+    ['profile_name', "TEXT NOT NULL DEFAULT ''"],
+    ['cli_bin', "TEXT NOT NULL DEFAULT 'openclaw'"],
+    ['env_file', "TEXT NOT NULL DEFAULT ''"],
+    ['config_path', "TEXT NOT NULL DEFAULT ''"],
+    ['state_dir', "TEXT NOT NULL DEFAULT ''"],
+    ['chat_id', "TEXT NOT NULL DEFAULT ''"],
+    ['thread_id', 'TEXT'],
+    ['probe_message', "TEXT NOT NULL DEFAULT 'BlockFork relay doctor dry-run'"],
+    ['notes', "TEXT NOT NULL DEFAULT ''"],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of openclawRelayConfigAlterations) {
+    if (!openclawRelayConfigColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE openclaw_relay_configs ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
+  const toolFailureColumnsStmt = billingDb.prepare('PRAGMA table_info(tool_failure_facts)');
+  const toolFailureColumns = new Set();
+  while (toolFailureColumnsStmt.step()) {
+    toolFailureColumns.add(String(toolFailureColumnsStmt.getAsObject().name || ''));
+  }
+  toolFailureColumnsStmt.free();
+  const toolFailureAlterations = [
+    ['failure_fact_id', 'TEXT PRIMARY KEY'],
+    ['subject_type', "TEXT NOT NULL DEFAULT ''"],
+    ['subject_id', "TEXT NOT NULL DEFAULT ''"],
+    ['task_id', 'TEXT'],
+    ['execution_id', 'TEXT'],
+    ['failure_category', "TEXT NOT NULL DEFAULT ''"],
+    ['failure_scope', "TEXT NOT NULL DEFAULT ''"],
+    ['failure_stage', "TEXT NOT NULL DEFAULT ''"],
+    ['source', "TEXT NOT NULL DEFAULT 'runtime'"],
+    ['reason_code', "TEXT NOT NULL DEFAULT ''"],
+    ['detail', "TEXT NOT NULL DEFAULT ''"],
+    ['created_at', "TEXT NOT NULL DEFAULT ''"],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [columnName, columnType] of toolFailureAlterations) {
+    if (!toolFailureColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE tool_failure_facts ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
   billingDb.run(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_session_idempotency
     ON executions(session_id, idempotency_key)
@@ -1839,6 +3031,21 @@ async function ensureBillingDb() {
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_execution_artifacts_workspace_id ON execution_artifacts(workspace_id)');
   billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_capabilities_execution_id ON execution_capabilities(execution_id)');
   billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_budgets_execution_id ON execution_budgets(execution_id)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_id_idempotency_key ON tasks(session_id, idempotency_key)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_tasks_session_state_created ON tasks(session_id, current_state, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_events_task_created ON task_events(task_id, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_progress_events_task_created ON task_progress_events(task_id, created_at)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_artifact_assessments_task_id ON task_artifact_assessments(task_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_artifact_assessments_session_updated ON task_artifact_assessments(session_id, updated_at)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_completion_summaries_task_id ON task_completion_summaries(task_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_completion_summaries_session_updated ON task_completion_summaries(session_id, updated_at)');
+  billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_notifications_dedupe_key ON task_notifications(dedupe_key)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_session_state_created ON task_notifications(session_id, delivery_state, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_session_state_next_attempt_created ON task_notifications(session_id, delivery_state, next_attempt_at, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_task_created ON task_notifications(task_id, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_source ON task_notifications(source_type, source_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_notification_delivery_attempts_notification_created ON notification_delivery_attempts(notification_id, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_notification_delivery_attempts_session_created ON notification_delivery_attempts(session_id, created_at)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_events_session_created ON session_continuity_events(session_id, created_at)');
   billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_session_lineage_child_session ON session_lineage(child_session_id)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_recommendations_session_status_created ON session_continuity_recommendations(session_id, status, created_at)');
@@ -1852,6 +3059,7 @@ async function ensureBillingDb() {
   executionColumnsStmt.free();
 
   const executionAlterations = [
+    ['task_id', 'TEXT'],
     ['lease_id', 'TEXT'],
     ['lease_holder', 'TEXT'],
     ['lease_acquired_at', 'TEXT'],
@@ -1955,6 +3163,7 @@ async function ensureBillingDb() {
     }
   }
 
+  persistBillingDb();
   return billingDb;
 }
 
@@ -1992,6 +3201,7 @@ function hydrateExecutionRow(row) {
   return {
     execution_id: String(row.execution_id || ''),
     session_id: String(row.session_id || ''),
+    task_id: row.task_id || null,
     current_state: String(row.current_state || ''),
     created_at: row.created_at || '',
     updated_at: row.updated_at || '',
@@ -2006,6 +3216,173 @@ function hydrateExecutionRow(row) {
     last_heartbeat_at: row.last_heartbeat_at || null,
     recovery_reason: row.recovery_reason || null,
     recovery_notes: row.recovery_notes || null,
+  };
+}
+
+function hydrateTaskRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    task_id: String(row.task_id || ''),
+    session_id: String(row.session_id || ''),
+    current_state: String(row.current_state || ''),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+    last_request_id: String(row.last_request_id || ''),
+    idempotency_key: row.idempotency_key || null,
+    objective_text: String(row.objective_text || ''),
+    objective_fingerprint: String(row.objective_fingerprint || ''),
+    task_kind: String(row.task_kind || 'text_generation'),
+    notification_policy: String(row.notification_policy || 'silent'),
+    notification_eligible: Number(row.notification_eligible || 0),
+    eligibility_reason: String(row.eligibility_reason || ''),
+    classified_at: row.classified_at || null,
+    first_execution_id: row.first_execution_id || null,
+    last_execution_id: row.last_execution_id || null,
+    completed_execution_id: row.completed_execution_id || null,
+    recovery_reason: row.recovery_reason || null,
+    recovery_notes: row.recovery_notes || null,
+  };
+}
+
+function hydrateTaskArtifactAssessmentRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    assessment_id: String(row.assessment_id || ''),
+    task_id: String(row.task_id || ''),
+    session_id: String(row.session_id || ''),
+    execution_id: row.execution_id || null,
+    artifact_id: row.artifact_id || null,
+    artifact_exists: Number(row.artifact_exists || 0),
+    artifact_verification_state: String(row.artifact_verification_state || ''),
+    artifact_family: String(row.artifact_family || 'unknown'),
+    structure_state: String(row.structure_state || 'missing'),
+    alignment_state: String(row.alignment_state || 'missing'),
+    confidence_score: Number(row.confidence_score || 0),
+    confidence_band: String(row.confidence_band || 'low'),
+    reason_code: String(row.reason_code || ''),
+    notes: row.notes || null,
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateTaskProgressEventRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    progress_event_id: String(row.progress_event_id || ''),
+    task_id: String(row.task_id || ''),
+    execution_id: row.execution_id || null,
+    previous_state: String(row.previous_state || ''),
+    new_state: String(row.new_state || ''),
+    progress_category: String(row.progress_category || ''),
+    decision: String(row.decision || 'notify_user'),
+    message_text: String(row.message_text || ''),
+    requires_user_input: Number(row.requires_user_input || 0),
+    source: String(row.source || 'runtime'),
+    reason_code: String(row.reason_code || ''),
+    created_at: row.created_at || '',
+  };
+}
+
+function safeParseJson(value, fallback) {
+  if (value === null || value === undefined || value === '') {
+    return fallback;
+  }
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function hydrateTaskCompletionSummaryRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    completion_summary_id: String(row.completion_summary_id || ''),
+    task_id: String(row.task_id || ''),
+    session_id: String(row.session_id || ''),
+    execution_id: row.execution_id || null,
+    final_state: String(row.final_state || ''),
+    summary_text: String(row.summary_text || ''),
+    what_completed: Array.isArray(safeParseJson(row.what_completed_json, [])) ? safeParseJson(row.what_completed_json, []) : [],
+    artifacts: Array.isArray(safeParseJson(row.artifacts_json, [])) ? safeParseJson(row.artifacts_json, []) : [],
+    verified: Array.isArray(safeParseJson(row.verified_json, [])) ? safeParseJson(row.verified_json, []) : [],
+    not_verified: Array.isArray(safeParseJson(row.not_verified_json, [])) ? safeParseJson(row.not_verified_json, []) : [],
+    follow_up_needed: Number(row.follow_up_needed || 0),
+    proof: safeParseJson(row.proof_json, {}),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateTaskNotificationRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    notification_id: String(row.notification_id || ''),
+    task_id: String(row.task_id || ''),
+    session_id: String(row.session_id || ''),
+    execution_id: row.execution_id || null,
+    source_type: String(row.source_type || ''),
+    source_id: String(row.source_id || ''),
+    notification_kind: String(row.notification_kind || ''),
+    delivery_channel: String(row.delivery_channel || 'openclaw_tg'),
+    delivery_state: String(row.delivery_state || 'pending'),
+    title: String(row.title || ''),
+    body: String(row.body || ''),
+    task_kind: String(row.task_kind || 'text_generation'),
+    notification_policy: String(row.notification_policy || 'silent'),
+    proactive_eligible: Number(row.proactive_eligible || 0),
+    eligibility_reason: String(row.eligibility_reason || ''),
+    delivery_suppressed_reason: String(row.delivery_suppressed_reason || ''),
+    classified_at: row.classified_at || null,
+    payload: safeParseJson(row.payload_json, {}),
+    dedupe_key: String(row.dedupe_key || ''),
+    claim_count: Number(row.claim_count || 0),
+    claimed_at: row.claimed_at || null,
+    delivered_at: row.delivered_at || null,
+    delivered_message_id: row.delivered_message_id || null,
+    last_error: String(row.last_error || ''),
+    next_attempt_at: row.next_attempt_at || null,
+    attempt_count: Number(row.attempt_count || 0),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateToolFailureFactRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    failure_fact_id: String(row.failure_fact_id || ''),
+    subject_type: String(row.subject_type || ''),
+    subject_id: String(row.subject_id || ''),
+    task_id: row.task_id || null,
+    execution_id: row.execution_id || null,
+    failure_category: String(row.failure_category || ''),
+    failure_scope: String(row.failure_scope || ''),
+    failure_stage: String(row.failure_stage || ''),
+    source: String(row.source || 'runtime'),
+    reason_code: String(row.reason_code || ''),
+    detail: String(row.detail || ''),
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
   };
 }
 
@@ -2214,6 +3591,3575 @@ async function getExecutionCapabilityRecord(executionId) {
 async function getExecutionBudgetRecord(executionId) {
   const db = await ensureBillingDb();
   return getStoredExecutionBudgetByExecutionId(db, executionId);
+}
+
+function summarizeTaskObjectiveFromBody(body = {}) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const userMessages = messages
+    .filter((message) => String(message?.role || '').toLowerCase() === 'user')
+    .map((message) => stringifyTextContent(message?.content ?? message?.text ?? message?.value ?? ''))
+    .filter(Boolean);
+  const candidate =
+    userMessages[userMessages.length - 1]
+    || stringifyTextContent(body?.input)
+    || stringifyTextContent(body?.instructions)
+    || stringifyTextContent(body?.prompt)
+    || stringifyTextContent(body);
+  const normalized = String(candidate || '').replace(/\s+/g, ' ').trim();
+  if (normalized.length <= 4096) {
+    return normalized;
+  }
+  const head = normalized.slice(0, 1024);
+  const tail = normalized.slice(-3072);
+  return `${head}\n...\n${tail}`.trim();
+}
+
+function fingerprintTaskObjective(sessionId, objectiveText, idempotencyKey = '') {
+  return crypto.createHash('sha256')
+    .update(`${String(sessionId || '')}\n${String(idempotencyKey || '')}\n${String(objectiveText || '')}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
+function normalizeTaskClassificationText(text = '') {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function taskTextContainsAny(normalizedText, needles = []) {
+  return needles.some((needle) => {
+    const candidate = String(needle || '').toLowerCase().trim();
+    if (!candidate) {
+      return false;
+    }
+    return normalizedText.includes(candidate);
+  });
+}
+
+function classifyTaskKindFromObjective(objectiveText = '') {
+  const normalized = normalizeTaskClassificationText(objectiveText);
+  const rawLength = String(objectiveText || '').trim().length;
+  const shortGreetingPattern = /^(hi|hey|hello|wassup|what'?s up|yo|ok|okay|thanks|thank you|sure|yep|yup)[.!? ]*$/i;
+
+  if (rawLength <= 40 && shortGreetingPattern.test(String(objectiveText || '').trim())) {
+    return {
+      task_kind: TASK_KINDS.SIMPLE_CHAT,
+      eligibility_reason: 'short greeting or acknowledgement',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'create file',
+    'create a file',
+    'file named',
+    'markdown file',
+    'save as',
+    'generate report',
+    'report',
+    'document',
+    'pdf',
+    'docx',
+    'spreadsheet',
+    'csv',
+    'json file',
+    'artifact',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.ARTIFACT_TASK,
+      eligibility_reason: 'file or artifact-style prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'build landing page',
+    'landing page',
+    'build website',
+    'website',
+    'web page',
+    'homepage',
+    'site',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.WEBSITE_TASK,
+      eligibility_reason: 'website or landing-page prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'transcribe',
+    'audio',
+    'video',
+    'image',
+    'photo',
+    'ocr',
+    'caption',
+    'media',
+    'process image',
+    'process audio',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.MEDIA_TASK,
+      eligibility_reason: 'media processing prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'analyze repo',
+    'analyze repository',
+    'research',
+    'deep research',
+    'investigate',
+    'compare sources',
+    'literature',
+    'source',
+    'study',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.RESEARCH_TASK,
+      eligibility_reason: 'research or repository analysis prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'run tests',
+    'test suite',
+    'deploy',
+    'benchmark',
+    'crawl',
+    'scrape',
+    'long report',
+    'long-running',
+    'multiple steps',
+    'end-to-end',
+    'process large',
+    'migration',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.LONG_RUNNING_TASK,
+      eligibility_reason: 'long-running or operational prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'repo',
+    'repository',
+    'code',
+    'github',
+    'branch',
+    'pull request',
+    'pr ',
+    'implement',
+    'refactor',
+    'fix bug',
+    'build app',
+    'create app',
+    'run lint',
+    'run tests',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.CODE_TASK,
+      eligibility_reason: 'code or repository prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'summarize',
+    'summary',
+    'bullet',
+    'bullets',
+    'bullet points',
+    'list',
+    'outline',
+    'table',
+    'brief',
+    'points',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.STRUCTURED_TEXT,
+      eligibility_reason: 'structured text prompt',
+    };
+  }
+
+  if (taskTextContainsAny(normalized, [
+    'reply with',
+    'write',
+    'compose',
+    'draft',
+    'answer',
+    'tell me',
+    'provide',
+    'generate',
+    'respond',
+  ])) {
+    return {
+      task_kind: TASK_KINDS.TEXT_GENERATION,
+      eligibility_reason: 'plain text generation prompt',
+    };
+  }
+
+  return {
+    task_kind: TASK_KINDS.TEXT_GENERATION,
+    eligibility_reason: 'defaulted to plain text generation',
+  };
+}
+
+function shouldUseStructuredTextCompletionPolicy(objectiveText = '') {
+  const normalized = normalizeTaskClassificationText(objectiveText);
+  const hasLongInputHints = taskTextContainsAny(normalized, [
+    'this',
+    'following',
+    'below',
+    'attached',
+    'document',
+    'report',
+    'repo',
+    'repository',
+    'workspace',
+    'file',
+    'article',
+    'conversation',
+    'notes',
+  ]);
+  return String(objectiveText || '').trim().length >= 120 || hasLongInputHints;
+}
+
+function getStoredRequestLogByRequestIdTx(db, requestId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM request_logs
+    WHERE request_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([requestId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return row;
+}
+
+function refreshTaskNotificationProfileTx(db, taskId, options = {}) {
+  const taskRow = getStoredTaskByIdTx(db, taskId);
+  if (!taskRow) {
+    return null;
+  }
+
+  const requestLogRow = taskRow.last_request_id
+    ? getStoredRequestLogByRequestIdTx(db, taskRow.last_request_id)
+    : null;
+  const profile = deriveTaskNotificationProfileFromTask(taskRow, requestLogRow, {
+    currentState: options.currentState || taskRow.current_state || '',
+    classifiedAt: options.classifiedAt || getTimestamp(),
+  });
+  const timestamp = profile.classified_at || options.classifiedAt || getTimestamp();
+  const update = db.prepare(`
+    UPDATE tasks
+    SET task_kind = ?,
+        notification_policy = ?,
+        notification_eligible = ?,
+        eligibility_reason = ?,
+        classified_at = ?,
+        updated_at = ?
+    WHERE task_id = ?
+  `);
+  update.run([
+    profile.task_kind,
+    profile.notification_policy,
+    Number(profile.notification_eligible || 0),
+    profile.eligibility_reason || '',
+    timestamp,
+    timestamp,
+    taskId,
+  ]);
+  update.free();
+
+  return {
+    ...taskRow,
+    task_kind: profile.task_kind,
+    notification_policy: profile.notification_policy,
+    notification_eligible: Number(profile.notification_eligible || 0),
+    eligibility_reason: profile.eligibility_reason || '',
+    classified_at: timestamp,
+  };
+}
+
+function deriveTaskNotificationProfileFromTask(task, requestLogRow = null, options = {}) {
+  const classifiedAt = options.classifiedAt || getTimestamp();
+  const objectiveText = String(task?.objective_text || '');
+  const baseClassification = classifyTaskKindFromObjective(objectiveText);
+  const currentState = String(options.currentState || task?.current_state || '');
+  const requestStatus = String(requestLogRow?.status || '');
+  const requestOutputTokens = Number(requestLogRow?.output_tokens || 0);
+  const requestErrorCode = String(requestLogRow?.error_code || '');
+  const requestHadUsableOutput = requestStatus === 'success' && requestOutputTokens > 0 && !requestErrorCode;
+  const requestInterruptedForTerminalPayload = requestStatus !== 'success' || requestErrorCode === TOOL_FAILURE_CATEGORIES.TERMINAL_PAYLOAD_MISSING;
+  const isRecoveryState = currentState === TASK_STATES.RECOVERY_REQUIRED || currentState === TASK_STATES.FAILED;
+  const isHumanBlocked = currentState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED;
+  const longRunningKinds = new Set([
+    TASK_KINDS.ARTIFACT_TASK,
+    TASK_KINDS.CODE_TASK,
+    TASK_KINDS.WEBSITE_TASK,
+    TASK_KINDS.RESEARCH_TASK,
+    TASK_KINDS.MEDIA_TASK,
+    TASK_KINDS.LONG_RUNNING_TASK,
+  ]);
+
+  if (isRecoveryState) {
+    if (requestHadUsableOutput && !longRunningKinds.has(baseClassification.task_kind)) {
+      return {
+        task_kind: baseClassification.task_kind,
+        notification_policy: TASK_NOTIFICATION_POLICIES.SILENT,
+        notification_eligible: 0,
+        eligibility_reason: 'fallback_already_delivered',
+        classified_at: classifiedAt,
+      };
+    }
+
+    return {
+      task_kind: TASK_KINDS.RECOVERY_OR_FAILURE,
+      notification_policy: TASK_NOTIFICATION_POLICIES.FAILURE_ONLY,
+      notification_eligible: 1,
+      eligibility_reason: requestInterruptedForTerminalPayload
+        ? 'recovery_or_failure_without_usable_output'
+        : 'recovery_or_failure_notification',
+      classified_at: classifiedAt,
+    };
+  }
+
+  if (isHumanBlocked) {
+    return {
+      task_kind: TASK_KINDS.RECOVERY_OR_FAILURE,
+      notification_policy: TASK_NOTIFICATION_POLICIES.FAILURE_ONLY,
+      notification_eligible: 1,
+      eligibility_reason: 'human_input_required',
+      classified_at: classifiedAt,
+    };
+  }
+
+  switch (baseClassification.task_kind) {
+    case TASK_KINDS.ARTIFACT_TASK:
+    case TASK_KINDS.CODE_TASK:
+    case TASK_KINDS.WEBSITE_TASK:
+    case TASK_KINDS.RESEARCH_TASK:
+    case TASK_KINDS.MEDIA_TASK:
+    case TASK_KINDS.LONG_RUNNING_TASK:
+      return {
+        task_kind: baseClassification.task_kind,
+        notification_policy: TASK_NOTIFICATION_POLICIES.PROGRESS_AND_COMPLETION,
+        notification_eligible: 1,
+        eligibility_reason: baseClassification.eligibility_reason,
+        classified_at: classifiedAt,
+      };
+    case TASK_KINDS.STRUCTURED_TEXT: {
+      const completionOnly = shouldUseStructuredTextCompletionPolicy(objectiveText);
+      return {
+        task_kind: TASK_KINDS.STRUCTURED_TEXT,
+        notification_policy: completionOnly
+          ? TASK_NOTIFICATION_POLICIES.COMPLETION_ONLY
+          : TASK_NOTIFICATION_POLICIES.SILENT,
+        notification_eligible: completionOnly ? 1 : 0,
+        eligibility_reason: completionOnly
+          ? 'structured_text_completion_only'
+          : 'structured_text_silent',
+        classified_at: classifiedAt,
+      };
+    }
+    case TASK_KINDS.SIMPLE_CHAT:
+    case TASK_KINDS.TEXT_GENERATION:
+    default:
+      return {
+        task_kind: baseClassification.task_kind,
+        notification_policy: TASK_NOTIFICATION_POLICIES.SILENT,
+        notification_eligible: 0,
+        eligibility_reason: baseClassification.eligibility_reason,
+        classified_at: classifiedAt,
+      };
+  }
+}
+
+function deriveTaskNotificationDispatchability(task, progressEvent, taskProfile = null) {
+  const profile = taskProfile || deriveTaskNotificationProfileFromTask(task, null, {
+    currentState: task?.current_state || progressEvent?.new_state || '',
+  });
+  const progressCategory = String(progressEvent?.progress_category || '');
+  const taskState = String(task?.current_state || progressEvent?.new_state || '');
+  const deliverySuppressedReason = profile.notification_eligible ? '' : profile.eligibility_reason || 'silent_policy';
+  const eligibilityReason = profile.eligibility_reason || '';
+  const longRunningKinds = new Set([
+    TASK_KINDS.ARTIFACT_TASK,
+    TASK_KINDS.CODE_TASK,
+    TASK_KINDS.WEBSITE_TASK,
+    TASK_KINDS.RESEARCH_TASK,
+    TASK_KINDS.MEDIA_TASK,
+    TASK_KINDS.LONG_RUNNING_TASK,
+  ]);
+  const isFailureState = taskState === TASK_STATES.RECOVERY_REQUIRED || taskState === TASK_STATES.FAILED;
+
+  const shouldNotifyForProgress = profile.notification_policy === TASK_NOTIFICATION_POLICIES.PROGRESS_AND_COMPLETION
+    && [
+      TASK_PROGRESS_CATEGORIES.TASK_ACCEPTED,
+      TASK_PROGRESS_CATEGORIES.PLAN_LOCKED,
+      TASK_PROGRESS_CATEGORIES.TOOL_WORK_STARTED,
+      TASK_PROGRESS_CATEGORIES.MEANINGFUL_PROGRESS_CHECKPOINT,
+      TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFICATION_STARTED,
+      TASK_PROGRESS_CATEGORIES.ARTIFACT_CREATED,
+      TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFIED,
+      TASK_PROGRESS_CATEGORIES.TASK_COMPLETED,
+    ].includes(progressCategory);
+
+  const shouldNotifyForCompletion = profile.notification_policy === TASK_NOTIFICATION_POLICIES.COMPLETION_ONLY
+    && progressCategory === TASK_PROGRESS_CATEGORIES.TASK_COMPLETED;
+
+  const shouldNotifyForFailure = isFailureState && (
+    longRunningKinds.has(profile.task_kind)
+    || profile.notification_policy === TASK_NOTIFICATION_POLICIES.FAILURE_ONLY
+  );
+
+  const proactiveEligible = Boolean(shouldNotifyForProgress || shouldNotifyForCompletion || shouldNotifyForFailure || progressCategory === TASK_PROGRESS_CATEGORIES.BLOCKED_HUMAN_INPUT_REQUIRED);
+
+  return {
+    task_kind: profile.task_kind,
+    notification_policy: profile.notification_policy,
+    proactive_eligible: proactiveEligible ? 1 : 0,
+    eligibility_reason: proactiveEligible
+      ? (shouldNotifyForFailure && profile.notification_policy === TASK_NOTIFICATION_POLICIES.SILENT
+        ? 'failure_notification_no_usable_output'
+        : (eligibilityReason || 'notification_policy_allows_delivery'))
+      : eligibilityReason || 'silent_policy',
+    delivery_suppressed_reason: proactiveEligible ? '' : deliverySuppressedReason || 'silent_policy',
+    classified_at: profile.classified_at || getTimestamp(),
+    has_usable_output: Boolean(profile.notification_policy !== TASK_NOTIFICATION_POLICIES.SILENT && !isFailureState),
+  };
+}
+
+async function getStoredTaskById(db, taskId) {
+  return getStoredTaskByIdTx(db, taskId);
+}
+
+function getStoredTaskByIdTx(db, taskId) {
+  const stmt = db.prepare('SELECT * FROM tasks WHERE task_id = ? LIMIT 1');
+  stmt.bind([taskId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateTaskRow(row);
+}
+
+async function getTaskById(taskId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskById(db, taskId);
+}
+
+async function getTaskByExecutionId(executionId) {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare('SELECT task_id FROM executions WHERE execution_id = ? LIMIT 1');
+  stmt.bind([executionId]);
+  let taskId = '';
+  if (stmt.step()) {
+    taskId = String(stmt.getAsObject().task_id || '');
+  }
+  stmt.free();
+  if (!taskId) {
+    return null;
+  }
+  return getStoredTaskById(db, taskId);
+}
+
+async function getTaskByRequestId(requestId) {
+  const db = await ensureBillingDb();
+  const stmt = db.prepare('SELECT execution_id FROM request_logs WHERE request_id = ? LIMIT 1');
+  stmt.bind([requestId]);
+  let executionId = '';
+  if (stmt.step()) {
+    executionId = String(stmt.getAsObject().execution_id || '');
+  }
+  stmt.free();
+  if (!executionId) {
+    return null;
+  }
+  return getTaskByExecutionId(executionId);
+}
+
+async function getStoredTaskArtifactAssessmentByTaskId(db, taskId) {
+  const stmt = db.prepare('SELECT * FROM task_artifact_assessments WHERE task_id = ? LIMIT 1');
+  stmt.bind([taskId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateTaskArtifactAssessmentRow(row);
+}
+
+async function getTaskArtifactAssessmentByTaskId(taskId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskArtifactAssessmentByTaskId(db, taskId);
+}
+
+async function getVerifiedTaskArtifactAssessmentForExecutionId(executionId) {
+  const task = await getTaskByExecutionId(executionId);
+  if (!task) {
+    return null;
+  }
+
+  const assessment = await getTaskArtifactAssessmentByTaskId(task.task_id);
+  if (!assessment || !assessment.artifact_exists) {
+    return null;
+  }
+
+  if (assessment.artifact_verification_state !== ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    return null;
+  }
+
+  return assessment;
+}
+
+function classifyManagedTerminalCompletionIntegrity(options = {}) {
+  const status = String(options.status || '');
+  const outputTextLength = Number(options.outputTextLength || 0);
+  const verifiedArtifactExists = Boolean(options.verifiedArtifactExists);
+
+  if (status !== 'success') {
+    return null;
+  }
+
+  if (outputTextLength > 0 || verifiedArtifactExists) {
+    return null;
+  }
+
+  return {
+    targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+    billingStatus: 'interrupted',
+    reasonCode: 'terminal_payload_missing',
+    recoveryReason: 'empty_terminal_response',
+    reasonDetail: 'Managed response completed without a usable terminal payload',
+  };
+}
+
+async function getStoredTaskProgressEventsByTaskId(db, taskId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_progress_events
+    WHERE task_id = ?
+    ORDER BY created_at ASC, rowid ASC
+  `);
+  stmt.bind([taskId]);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateTaskProgressEventRow(stmt.getAsObject()));
+  }
+  stmt.free();
+  return rows;
+}
+
+async function getTaskProgressEventsByTaskId(taskId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskProgressEventsByTaskId(db, taskId);
+}
+
+async function getStoredTaskCompletionSummaryByTaskId(db, taskId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_completion_summaries
+    WHERE task_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([taskId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateTaskCompletionSummaryRow(row);
+}
+
+async function getTaskCompletionSummaryByTaskId(taskId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskCompletionSummaryByTaskId(db, taskId);
+}
+
+async function getStoredTaskNotificationById(db, notificationId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_notifications
+    WHERE notification_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([notificationId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateTaskNotificationRow(row);
+}
+
+async function getTaskNotificationById(notificationId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskNotificationById(db, notificationId);
+}
+
+async function getStoredTaskNotificationsByTaskId(db, taskId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_notifications
+    WHERE task_id = ?
+    ORDER BY created_at ASC, rowid ASC
+  `);
+  stmt.bind([taskId]);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateTaskNotificationRow(stmt.getAsObject()));
+  }
+  stmt.free();
+  return rows;
+}
+
+async function getTaskNotificationsByTaskId(taskId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskNotificationsByTaskId(db, taskId);
+}
+
+async function claimTaskNotificationsForSession(sessionId, options = {}) {
+  return withBillingWrite(async (db) => claimStoredTaskNotificationsForSessionTx(db, String(sessionId || ''), options));
+}
+
+async function markTaskNotificationDelivered(notificationId, options = {}) {
+  return withBillingWrite(async (db) => markStoredTaskNotificationDeliveredTx(db, String(notificationId || ''), options));
+}
+
+async function claimTaskNotificationById(notificationId, options = {}) {
+  return withBillingWrite(async (db) => claimStoredTaskNotificationByIdTx(db, String(notificationId || ''), options));
+}
+
+async function getStoredTaskNotificationsBySessionId(db, sessionId, options = {}) {
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : 20;
+  const state = String(options.deliveryState || '').trim();
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_notifications
+    WHERE session_id = ?
+      AND (? = '' OR delivery_state = ?)
+    ORDER BY created_at ASC, rowid ASC
+    LIMIT ?
+  `);
+  stmt.bind([sessionId, state, state, limit]);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateTaskNotificationRow(stmt.getAsObject()));
+  }
+  stmt.free();
+  return rows;
+}
+
+async function claimStoredTaskNotificationsForSessionTx(db, sessionId, options = {}) {
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : 10;
+  const staleAfterMs = Number.isFinite(Number(options.staleAfterMs)) ? Math.max(0, Number(options.staleAfterMs)) : 5 * 60 * 1000;
+  const now = options.timestamp || getTimestamp();
+  const nowMillis = Number.isFinite(Date.parse(now)) ? Date.parse(now) : Date.now();
+  const staleCutoff = new Date(Math.max(0, nowMillis - staleAfterMs)).toISOString();
+
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_notifications
+    WHERE session_id = ?
+      AND proactive_eligible = 1
+      AND (
+        (delivery_state = ? AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?))
+        OR (delivery_state = ? AND claimed_at IS NOT NULL AND claimed_at <= ?)
+      )
+    ORDER BY created_at ASC, rowid ASC
+    LIMIT ?
+  `);
+  stmt.bind([sessionId, TASK_NOTIFICATION_DELIVERY_STATES.PENDING, now, TASK_NOTIFICATION_DELIVERY_STATES.CLAIMED, staleCutoff, limit]);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateTaskNotificationRow(stmt.getAsObject()));
+  }
+  stmt.free();
+
+  if (!rows.length) {
+    return [];
+  }
+
+  const update = db.prepare(`
+    UPDATE task_notifications
+    SET delivery_state = ?,
+        claim_count = claim_count + 1,
+        claimed_at = ?,
+        updated_at = ?
+    WHERE notification_id = ?
+  `);
+  for (const row of rows) {
+    update.run([
+      TASK_NOTIFICATION_DELIVERY_STATES.CLAIMED,
+      now,
+      now,
+      row.notification_id,
+    ]);
+  }
+  update.free();
+
+  return rows.map((row) => ({
+    ...row,
+    delivery_state: TASK_NOTIFICATION_DELIVERY_STATES.CLAIMED,
+    claim_count: row.claim_count + 1,
+    claimed_at: now,
+    updated_at: now,
+  }));
+}
+
+async function markStoredTaskNotificationDeliveredTx(db, notificationId, options = {}) {
+  const current = await getStoredTaskNotificationById(db, notificationId);
+  if (!current) {
+    return null;
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  const update = db.prepare(`
+    UPDATE task_notifications
+    SET delivery_state = ?,
+        delivered_at = ?,
+        delivered_message_id = ?,
+        last_error = ?,
+        next_attempt_at = NULL,
+        updated_at = ?
+    WHERE notification_id = ?
+  `);
+  update.run([
+    TASK_NOTIFICATION_DELIVERY_STATES.DELIVERED,
+    timestamp,
+    options.deliveredMessageId || null,
+    '',
+    timestamp,
+    notificationId,
+  ]);
+  update.free();
+
+  return getStoredTaskNotificationById(db, notificationId);
+}
+
+async function claimStoredTaskNotificationByIdTx(db, notificationId, options = {}) {
+  const current = await getStoredTaskNotificationById(db, notificationId);
+  if (!current) {
+    return {
+      ok: false,
+      reason_code: 'not_found',
+      reason_message: 'Notification not found',
+      notification: null,
+      claimed_notification: null,
+    };
+  }
+
+  const overrideEligibility = Boolean(options.overrideEligibility);
+  if (Number(current.proactive_eligible || 0) !== 1 && !overrideEligibility) {
+    return {
+      ok: false,
+      reason_code: 'eligibility_suppressed',
+      reason_message: 'Notification is not eligible for proactive dispatch',
+      notification: current,
+      claimed_notification: null,
+    };
+  }
+
+  const allowDelivered = Boolean(options.allowDelivered);
+  if (current.delivery_state === TASK_NOTIFICATION_DELIVERY_STATES.DELIVERED && !allowDelivered) {
+    return {
+      ok: false,
+      reason_code: 'already_delivered',
+      reason_message: 'Notification is already delivered',
+      notification: current,
+      claimed_notification: null,
+    };
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  const staleAfterMs = Number.isFinite(Number(options.staleAfterMs)) ? Math.max(0, Number(options.staleAfterMs)) : 5 * 60 * 1000;
+  const nowMillis = Number.isFinite(Date.parse(timestamp)) ? Date.parse(timestamp) : Date.now();
+  const staleCutoff = new Date(Math.max(0, nowMillis - staleAfterMs)).toISOString();
+  const isPendingAndDue = current.delivery_state === TASK_NOTIFICATION_DELIVERY_STATES.PENDING
+    && (!current.next_attempt_at || current.next_attempt_at <= timestamp);
+  const isClaimedAndStale = current.delivery_state === TASK_NOTIFICATION_DELIVERY_STATES.CLAIMED
+    && current.claimed_at
+    && current.claimed_at <= staleCutoff;
+
+  if (!isPendingAndDue && !isClaimedAndStale) {
+    return {
+      ok: false,
+      reason_code: 'not_claimable',
+      reason_message: 'Notification is not claimable',
+      notification: current,
+      claimed_notification: null,
+    };
+  }
+
+  const update = db.prepare(`
+    UPDATE task_notifications
+    SET delivery_state = ?,
+        claim_count = claim_count + 1,
+        claimed_at = ?,
+        updated_at = ?
+    WHERE notification_id = ?
+  `);
+  update.run([
+    TASK_NOTIFICATION_DELIVERY_STATES.CLAIMED,
+    timestamp,
+    timestamp,
+    notificationId,
+  ]);
+  update.free();
+
+  const claimed = await getStoredTaskNotificationById(db, notificationId);
+  return {
+    ok: true,
+    reason_code: '',
+    reason_message: '',
+    notification: claimed,
+    claimed_notification: claimed,
+  };
+}
+
+function hydrateNotificationDeliveryAttemptRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    attempt_id: String(row.attempt_id || ''),
+    notification_id: String(row.notification_id || ''),
+    session_id: String(row.session_id || ''),
+    task_id: String(row.task_id || ''),
+    transport: String(row.transport || 'openclaw_cli'),
+    channel: String(row.channel || 'telegram'),
+    target: String(row.target || ''),
+    thread_id: row.thread_id === null || row.thread_id === undefined || row.thread_id === ''
+      ? null
+      : String(row.thread_id),
+    dry_run: Number(row.dry_run || 0) === 1,
+    command_path: String(row.command_path || ''),
+    command_argv: safeParseJson(row.command_argv_json, []),
+    started_at: String(row.started_at || ''),
+    finished_at: String(row.finished_at || ''),
+    exit_code: Number(row.exit_code || 0),
+    stdout_text: String(row.stdout_text || ''),
+    stderr_text: String(row.stderr_text || ''),
+    stdout_json: safeParseJson(row.stdout_json, null),
+    success: Number(row.success || 0) === 1,
+    retryable: Number(row.retryable || 0) === 1,
+    error_code: String(row.error_code || ''),
+    error_message: String(row.error_message || ''),
+    created_at: String(row.created_at || ''),
+    updated_at: String(row.updated_at || ''),
+  };
+}
+
+function getNotificationDispatchRetryTimestamp(baseTimestamp = getTimestamp(), retryAfterMs = NOTIFICATION_DISPATCHER_RETRY_AFTER_MS) {
+  const baseMillis = Number.isFinite(Date.parse(baseTimestamp)) ? Date.parse(baseTimestamp) : Date.now();
+  return new Date(baseMillis + Math.max(0, Number(retryAfterMs) || 0)).toISOString();
+}
+
+function getStoredNotificationDeliveryAttemptByNotificationId(db, notificationId, options = {}) {
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : 1;
+  const stmt = db.prepare(`
+    SELECT *
+    FROM notification_delivery_attempts
+    WHERE notification_id = ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT ?
+  `);
+  stmt.bind([notificationId, limit]);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateNotificationDeliveryAttemptRow(stmt.getAsObject()));
+  }
+  stmt.free();
+  return limit === 1 ? (rows[0] || null) : rows;
+}
+
+async function getNotificationDeliveryAttemptByNotificationId(notificationId) {
+  const db = await ensureBillingDb();
+  return getStoredNotificationDeliveryAttemptByNotificationId(db, notificationId, { limit: 1 });
+}
+
+async function getNotificationDeliveryAttemptsByNotificationId(notificationId, options = {}) {
+  const db = await ensureBillingDb();
+  return getStoredNotificationDeliveryAttemptByNotificationId(db, notificationId, options);
+}
+
+async function recordStoredNotificationDeliveryAttemptTx(db, attempt) {
+  const timestamp = attempt.created_at || getTimestamp();
+  const insert = db.prepare(`
+    INSERT INTO notification_delivery_attempts (
+      attempt_id, notification_id, session_id, task_id, transport, channel, target, thread_id, dry_run,
+      command_path, command_argv_json, started_at, finished_at, exit_code, stdout_text, stderr_text,
+      stdout_json, success, retryable, error_code, error_message, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    attempt.attempt_id || createTaskNotificationDeliveryAttemptId(),
+    attempt.notification_id || '',
+    attempt.session_id || '',
+    attempt.task_id || '',
+    attempt.transport || BLOCKFORK_NOTIFICATION_TRANSPORT,
+    attempt.channel || 'telegram',
+    attempt.target || '',
+    attempt.thread_id || null,
+    Number(Boolean(attempt.dry_run)),
+    attempt.command_path || '',
+    JSON.stringify(Array.isArray(attempt.command_argv) ? attempt.command_argv : []),
+    attempt.started_at || timestamp,
+    attempt.finished_at || timestamp,
+    Number(attempt.exit_code || 0),
+    truncateText(attempt.stdout_text || '', 8192),
+    truncateText(attempt.stderr_text || '', 8192),
+    attempt.stdout_json === undefined || attempt.stdout_json === null ? null : JSON.stringify(attempt.stdout_json),
+    Number(Boolean(attempt.success)),
+    Number(Boolean(attempt.retryable)),
+    attempt.error_code || '',
+    attempt.error_message || '',
+    timestamp,
+    attempt.updated_at || timestamp,
+  ]);
+  insert.free();
+  return getStoredNotificationDeliveryAttemptByNotificationId(db, attempt.notification_id, { limit: 1 });
+}
+
+async function markStoredTaskNotificationDispatchOutcomeTx(db, notificationId, options = {}) {
+  const current = await getStoredTaskNotificationById(db, notificationId);
+  if (!current) {
+    return null;
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  const success = Boolean(options.success);
+  const retryable = Boolean(options.retryable);
+  const update = db.prepare(success ? `
+    UPDATE task_notifications
+    SET delivery_state = ?,
+        delivered_at = ?,
+        delivered_message_id = ?,
+        last_error = ?,
+        next_attempt_at = NULL,
+        attempt_count = attempt_count + 1,
+        updated_at = ?
+    WHERE notification_id = ?
+  ` : `
+    UPDATE task_notifications
+    SET delivery_state = ?,
+        claimed_at = NULL,
+        delivered_at = NULL,
+        delivered_message_id = NULL,
+        last_error = ?,
+        next_attempt_at = ?,
+        attempt_count = attempt_count + 1,
+        updated_at = ?
+    WHERE notification_id = ?
+  `);
+  update.run(success ? [
+    TASK_NOTIFICATION_DELIVERY_STATES.DELIVERED,
+    timestamp,
+    options.deliveredMessageId || null,
+    '',
+    timestamp,
+    notificationId,
+  ] : [
+    retryable ? TASK_NOTIFICATION_DELIVERY_STATES.PENDING : TASK_NOTIFICATION_DELIVERY_STATES.FAILED,
+    options.lastError || '',
+    retryable ? (options.nextAttemptAt || null) : null,
+    timestamp,
+    notificationId,
+  ]);
+  update.free();
+  return getStoredTaskNotificationById(db, notificationId);
+}
+
+async function listDispatchableNotificationSessionsTx(db, options = {}) {
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : NOTIFICATION_DISPATCHER_LIMIT;
+  const now = options.timestamp || getTimestamp();
+  const stmt = db.prepare(`
+    SELECT
+      session_id,
+      MIN(created_at) AS oldest_created_at,
+      COUNT(*) AS pending_count
+    FROM task_notifications
+    WHERE delivery_state = ?
+      AND proactive_eligible = 1
+      AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?)
+    GROUP BY session_id
+    ORDER BY oldest_created_at ASC, session_id ASC
+    LIMIT ?
+  `);
+  stmt.bind([TASK_NOTIFICATION_DELIVERY_STATES.PENDING, now, limit]);
+  const rows = [];
+  while (stmt.step()) {
+    const row = stmt.getAsObject();
+    rows.push({
+      session_id: String(row.session_id || ''),
+      oldest_created_at: String(row.oldest_created_at || ''),
+      pending_count: Number(row.pending_count || 0),
+    });
+  }
+  stmt.free();
+  return rows;
+}
+
+async function listDispatchableNotificationSessions(options = {}) {
+  return withBillingWrite(async (writeDb) => listDispatchableNotificationSessionsTx(writeDb, options));
+}
+
+function buildOpenClawCliNotificationDispatchArgs(notificationView, options = {}) {
+  const deliveryTarget = notificationView?.delivery_target || null;
+  if (!deliveryTarget || !deliveryTarget.chat_id) {
+    throw new Error('delivery_target is required for OpenClaw CLI dispatch');
+  }
+
+  const args = [
+    'message',
+    'send',
+    '--channel',
+    'telegram',
+    '--target',
+    String(deliveryTarget.chat_id),
+  ];
+
+  if (deliveryTarget.thread_id !== null && deliveryTarget.thread_id !== undefined && String(deliveryTarget.thread_id).trim()) {
+    args.push('--thread-id', String(deliveryTarget.thread_id));
+  }
+
+  args.push('--message', String(notificationView.outbound_text || ''));
+
+  if (options.dryRun !== false) {
+    args.push('--dry-run');
+  }
+
+  args.push('--json');
+  return args;
+}
+
+function normalizeOpenClawCliTelegramTargetFromPayload(payload = {}) {
+  const directChatId = String(payload?.payload?.chatId || payload?.chatId || '').trim();
+  if (directChatId) {
+    return directChatId;
+  }
+
+  const toValue = String(payload?.payload?.to || payload?.to || '').trim();
+  if (toValue.toLowerCase().startsWith('telegram:')) {
+    return toValue.slice('telegram:'.length).trim();
+  }
+
+  return '';
+}
+
+async function runCommandWithTimeout(commandPath, args, options = {}) {
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS));
+  const cwd = options.cwd || process.cwd();
+  const env = options.env || process.env;
+  const startedAt = options.startedAt || getTimestamp();
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let exited = false;
+    let timedOut = false;
+
+    const child = spawn(commandPath, args, {
+      cwd,
+      env,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', (error) => {
+      if (exited) {
+        return;
+      }
+      exited = true;
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        timed_out: false,
+        started_at: startedAt,
+        finished_at: options.finishedAt || getTimestamp(),
+        exit_code: null,
+        stdout,
+        stderr: `${stderr}${stderr ? '\n' : ''}${error.message || String(error)}`.trim(),
+        error_code: 'spawn_failed',
+        error_message: error.message || String(error),
+      });
+    });
+    child.on('close', (code, signal) => {
+      if (exited) {
+        return;
+      }
+      exited = true;
+      clearTimeout(timer);
+      resolve({
+        ok: !timedOut && code === 0,
+        timed_out: timedOut,
+        started_at: startedAt,
+        finished_at: options.finishedAt || getTimestamp(),
+        exit_code: timedOut ? null : code,
+        signal: timedOut ? signal || 'SIGKILL' : signal || null,
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+async function runOpenClawCliDryRunAdapter(notificationView, options = {}) {
+  const dryRun = options.dryRun !== undefined ? Boolean(options.dryRun) : BLOCKFORK_OPENCLAW_CLI_DRY_RUN;
+  const commandPath = String(options.commandPath || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw').trim() || 'openclaw';
+  const commandArgs = buildOpenClawCliNotificationDispatchArgs(notificationView, { dryRun });
+  const startedAt = options.startedAt || getTimestamp();
+  const result = await runCommandWithTimeout(commandPath, commandArgs, {
+    timeoutMs: options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS,
+    env: options.env || process.env,
+    startedAt,
+  });
+
+  let parsed = null;
+  if (result.stdout && result.stdout.trim()) {
+    try {
+      parsed = JSON.parse(result.stdout);
+    } catch (error) {
+      parsed = null;
+      if (result.ok) {
+        return {
+          ok: false,
+          retryable: true,
+          error_code: 'invalid_json',
+          error_message: 'OpenClaw CLI returned non-JSON output',
+          stdout_text: result.stdout,
+          stderr_text: result.stderr,
+          stdout_json: null,
+          command_path: commandPath,
+          command_args: commandArgs,
+          started_at: result.started_at,
+          finished_at: result.finished_at,
+          exit_code: result.exit_code,
+        };
+      }
+    }
+  }
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      retryable: true,
+      error_code: result.timed_out ? 'timeout' : 'non_zero_exit',
+      error_message: result.timed_out ? 'OpenClaw CLI timed out' : 'OpenClaw CLI returned a non-zero exit code',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  const payload = parsed || {};
+  const payloadAction = String(payload.action || payload.payload?.action || '').trim().toLowerCase();
+  const payloadChannel = String(payload.channel || payload.payload?.channel || '').trim().toLowerCase();
+  const payloadDryRun = payload && typeof payload === 'object' && (payload.dryRun === true || payload.payload?.dryRun === true);
+  const payloadHandledBy = String(payload.handledBy || payload.payload?.handledBy || '').trim().toLowerCase();
+  const payloadChatId = normalizeOpenClawCliTelegramTargetFromPayload(payload);
+  const payloadMessageId = String(payload.payload?.messageId || payload.messageId || '').trim();
+  const expectedChatId = String(notificationView?.delivery_target?.chat_id || '').trim();
+
+  if (payloadAction !== 'send') {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response did not confirm send action',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (payloadChannel !== 'telegram') {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response did not confirm telegram channel',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (expectedChatId && !payloadChatId) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response did not include a target chat id',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (expectedChatId && payloadChatId && payloadChatId !== expectedChatId) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response target did not match expected chat id',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (dryRun) {
+    if (!payloadDryRun) {
+      return {
+        ok: false,
+        retryable: false,
+        error_code: 'contract_violation',
+        error_message: 'OpenClaw CLI dry-run response did not confirm dryRun=true',
+        stdout_text: result.stdout,
+        stderr_text: result.stderr,
+        stdout_json: parsed,
+        command_path: commandPath,
+        command_args: commandArgs,
+        started_at: result.started_at,
+        finished_at: result.finished_at,
+        exit_code: result.exit_code,
+      };
+    }
+
+    return {
+      ok: true,
+      retryable: false,
+      error_code: '',
+      error_message: '',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (payloadDryRun) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response unexpectedly reported dryRun=true',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (payloadHandledBy !== 'plugin') {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response did not confirm handledBy=plugin',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (!payload || typeof payload !== 'object' || payload.payload?.ok !== true) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response did not confirm payload.ok=true',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (!payloadMessageId) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response did not include a messageId',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  return {
+    ok: true,
+    retryable: false,
+    error_code: '',
+    error_message: '',
+    stdout_text: result.stdout,
+    stderr_text: result.stderr,
+    stdout_json: parsed,
+    command_path: commandPath,
+    command_args: commandArgs,
+    started_at: result.started_at,
+    finished_at: result.finished_at,
+    exit_code: result.exit_code,
+  };
+}
+
+function computeNotificationDispatchBackoffMs(attemptCount = 0) {
+  const base = Math.max(1000, Number(NOTIFICATION_DISPATCHER_RETRY_AFTER_MS) || 60000);
+  const exponent = Math.max(0, Number(attemptCount) || 0);
+  return Math.min(base * Math.pow(2, Math.min(exponent, 4)), 30 * 60 * 1000);
+}
+
+async function dispatchPendingTaskNotifications(options = {}) {
+  const transport = String(options.transport || BLOCKFORK_NOTIFICATION_TRANSPORT || 'openclaw_cli');
+  if (transport !== 'openclaw_cli') {
+    throw new Error(`Unsupported notification transport: ${transport}`);
+  }
+
+  const dispatchTimestamp = options.timestamp || getTimestamp();
+  const sessionLimit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : NOTIFICATION_DISPATCHER_LIMIT;
+  const claimLimit = Number.isFinite(Number(options.claimLimit)) ? Math.max(1, Number(options.claimLimit)) : 10;
+  const dryRun = options.dryRun !== undefined ? Boolean(options.dryRun) : BLOCKFORK_OPENCLAW_CLI_DRY_RUN;
+  const commandPath = String(options.commandPath || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw').trim() || 'openclaw';
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS));
+  const summary = {
+    transport,
+    dry_run: dryRun,
+    command_path: commandPath,
+    scanned_session_count: 0,
+    claimed_notification_count: 0,
+    delivered_notification_count: 0,
+    failed_notification_count: 0,
+    skipped_notification_count: 0,
+    attempts: [],
+  };
+
+  if (!dryRun) {
+    throw new Error('Real-send is not supported by the bulk dispatcher; use dispatchTaskNotificationById with maxRealSends=1');
+  }
+
+  const pendingSessions = await withBillingWrite(async (db) => listDispatchableNotificationSessionsTx(db, {
+    limit: sessionLimit,
+    timestamp: dispatchTimestamp,
+  }));
+  summary.scanned_session_count = pendingSessions.length;
+
+  for (const sessionEntry of pendingSessions) {
+    const dispatchPack = await withBillingWrite(async (db) => {
+      const deliveryTarget = await ensureSessionDeliveryTargetForSessionTx(db, sessionEntry.session_id, {
+        timestamp: dispatchTimestamp,
+      });
+      if (!deliveryTarget) {
+        return {
+          session_id: sessionEntry.session_id,
+          delivery_target: null,
+          notifications: [],
+        };
+      }
+
+      const claimed = await claimStoredTaskNotificationsForSessionTx(db, sessionEntry.session_id, {
+        limit: claimLimit,
+        timestamp: dispatchTimestamp,
+      });
+
+      const notifications = claimed.map((notification) => renderTaskNotificationViewTx(db, notification)).filter(Boolean);
+      return {
+        session_id: sessionEntry.session_id,
+        delivery_target: deliveryTarget,
+        notifications,
+      };
+    });
+
+    if (!dispatchPack.delivery_target || !dispatchPack.notifications.length) {
+      summary.skipped_notification_count += 1;
+      continue;
+    }
+
+    for (const notification of dispatchPack.notifications) {
+      summary.claimed_notification_count += 1;
+      const attemptStartedAt = getTimestamp();
+      const adapterResult = await runOpenClawCliDryRunAdapter(notification, {
+        commandPath,
+        dryRun,
+        timeoutMs,
+        startedAt: attemptStartedAt,
+      });
+
+      const attemptRecord = {
+        notification_id: notification.notification_id,
+        session_id: notification.session_id,
+        task_id: notification.task_id,
+        transport,
+        channel: notification.delivery_target?.channel || 'telegram',
+        target: notification.delivery_target?.chat_id || '',
+        thread_id: notification.delivery_target?.thread_id || null,
+        dry_run: dryRun,
+        command_path: commandPath,
+        command_argv: buildOpenClawCliNotificationDispatchArgs(notification, { dryRun }),
+        started_at: adapterResult.started_at || attemptStartedAt,
+        finished_at: adapterResult.finished_at || getTimestamp(),
+        exit_code: adapterResult.exit_code === null || adapterResult.exit_code === undefined ? -1 : Number(adapterResult.exit_code),
+        stdout_text: adapterResult.stdout_text || '',
+        stderr_text: adapterResult.stderr_text || '',
+        stdout_json: adapterResult.stdout_json,
+        success: Boolean(adapterResult.ok),
+        retryable: Boolean(adapterResult.retryable),
+        error_code: adapterResult.error_code || '',
+        error_message: adapterResult.error_message || '',
+        created_at: adapterResult.finished_at || getTimestamp(),
+        updated_at: adapterResult.finished_at || getTimestamp(),
+      };
+
+      await withBillingWrite(async (db) => {
+        await recordStoredNotificationDeliveryAttemptTx(db, attemptRecord);
+        if (adapterResult.ok) {
+          await markStoredTaskNotificationDispatchOutcomeTx(db, notification.notification_id, {
+            success: true,
+            deliveredMessageId: adapterResult.stdout_json && typeof adapterResult.stdout_json === 'object'
+              ? String(adapterResult.stdout_json.message_id || adapterResult.stdout_json.payload?.message_id || '')
+              : null,
+            timestamp: adapterResult.finished_at || getTimestamp(),
+          });
+        } else {
+          const nextAttemptAt = getNotificationDispatchRetryTimestamp(adapterResult.finished_at || getTimestamp(), computeNotificationDispatchBackoffMs(notification.attempt_count || 0));
+          await markStoredTaskNotificationDispatchOutcomeTx(db, notification.notification_id, {
+            success: false,
+            retryable: Boolean(adapterResult.retryable),
+            lastError: adapterResult.error_message || adapterResult.error_code || 'dispatch_failed',
+            nextAttemptAt,
+            timestamp: adapterResult.finished_at || getTimestamp(),
+          });
+        }
+      });
+
+      if (adapterResult.ok) {
+        summary.delivered_notification_count += 1;
+      } else {
+        summary.failed_notification_count += 1;
+      }
+      summary.attempts.push({
+        notification_id: notification.notification_id,
+        session_id: notification.session_id,
+        task_id: notification.task_id,
+        success: Boolean(adapterResult.ok),
+        retryable: Boolean(adapterResult.retryable),
+        error_code: adapterResult.error_code || '',
+      });
+    }
+  }
+
+  return summary;
+}
+
+async function dispatchTaskNotificationById(notificationId, options = {}) {
+  const exactNotificationId = String(notificationId || '').trim();
+  if (!exactNotificationId) {
+    throw new Error('notificationId is required');
+  }
+
+  const transport = String(options.transport || BLOCKFORK_NOTIFICATION_TRANSPORT || 'openclaw_cli');
+  if (transport !== 'openclaw_cli') {
+    throw new Error(`Unsupported notification transport: ${transport}`);
+  }
+
+  const dryRun = options.dryRun !== undefined ? Boolean(options.dryRun) : BLOCKFORK_OPENCLAW_CLI_DRY_RUN;
+  const commandPath = String(options.commandPath || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw').trim() || 'openclaw';
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS));
+  const dispatchTimestamp = options.timestamp || getTimestamp();
+  const allowDelivered = Boolean(options.allowDelivered);
+
+  if (!dryRun && Number(options.maxRealSends || 0) !== 1) {
+    throw new Error('Real-send notification dispatch requires maxRealSends=1');
+  }
+
+  const preflight = await withBillingWrite(async (db) => {
+    const current = await getStoredTaskNotificationById(db, exactNotificationId);
+    if (!current) {
+      return {
+        ok: false,
+        status: 'not_found',
+        reason_code: 'not_found',
+        reason_message: 'Notification not found',
+        notification: null,
+        delivery_target: null,
+      };
+    }
+
+    const deliveryTarget = await ensureSessionDeliveryTargetForSessionTx(db, current.session_id, {
+      timestamp: dispatchTimestamp,
+    });
+    if (!deliveryTarget || !deliveryTarget.chat_id) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'no_delivery_target',
+        reason_message: 'Notification has no delivery target',
+        notification: current,
+        delivery_target: null,
+      };
+    }
+
+    const claimed = await claimStoredTaskNotificationByIdTx(db, exactNotificationId, {
+      timestamp: dispatchTimestamp,
+      allowDelivered,
+      overrideEligibility: Boolean(options.overrideEligibility),
+    });
+    if (!claimed.ok) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: claimed.reason_code || 'not_claimable',
+        reason_message: claimed.reason_message || 'Notification is not claimable',
+        notification: claimed.notification || current,
+        delivery_target: {
+          channel: deliveryTarget.channel || 'telegram',
+          chat_id: deliveryTarget.chat_id || '',
+          thread_id: deliveryTarget.thread_id || null,
+        },
+      };
+    }
+
+    const rendered = renderTaskNotificationViewTx(db, claimed.claimed_notification);
+    if (!rendered) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'render_failed',
+        reason_message: 'Notification could not be rendered',
+        notification: claimed.claimed_notification,
+        delivery_target: {
+          channel: deliveryTarget.channel || 'telegram',
+          chat_id: deliveryTarget.chat_id || '',
+          thread_id: deliveryTarget.thread_id || null,
+        },
+      };
+    }
+
+    if (String(rendered.delivery_target?.channel || 'telegram').toLowerCase() !== 'telegram') {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'unsupported_channel',
+        reason_message: 'Notification delivery target channel is not telegram',
+        notification: rendered,
+        delivery_target: rendered.delivery_target,
+      };
+    }
+
+    return {
+      ok: true,
+      status: 'ready',
+      notification: rendered,
+      delivery_target: rendered.delivery_target,
+    };
+  });
+
+  if (!preflight.ok) {
+    return {
+      transport,
+      dry_run: dryRun,
+      command_path: commandPath,
+      notification_id: exactNotificationId,
+      status: preflight.status,
+      reason_code: preflight.reason_code,
+      reason_message: preflight.reason_message,
+      delivery_target: preflight.delivery_target || null,
+      attempt: null,
+      notification: preflight.notification || null,
+    };
+  }
+
+  const adapterResult = await runOpenClawCliDryRunAdapter(preflight.notification, {
+    commandPath,
+    dryRun,
+    timeoutMs,
+    startedAt: dispatchTimestamp,
+  });
+
+  const attemptRecord = {
+    notification_id: preflight.notification.notification_id,
+    session_id: preflight.notification.session_id,
+    task_id: preflight.notification.task_id,
+    transport,
+    channel: preflight.delivery_target?.channel || 'telegram',
+    target: preflight.delivery_target?.chat_id || '',
+    thread_id: preflight.delivery_target?.thread_id || null,
+    dry_run: dryRun,
+    command_path: commandPath,
+    command_argv: buildOpenClawCliNotificationDispatchArgs(preflight.notification, { dryRun }),
+    started_at: adapterResult.started_at || dispatchTimestamp,
+    finished_at: adapterResult.finished_at || getTimestamp(),
+    exit_code: adapterResult.exit_code === null || adapterResult.exit_code === undefined ? -1 : Number(adapterResult.exit_code),
+    stdout_text: adapterResult.stdout_text || '',
+    stderr_text: adapterResult.stderr_text || '',
+    stdout_json: adapterResult.stdout_json,
+    success: Boolean(adapterResult.ok),
+    retryable: Boolean(adapterResult.retryable),
+    error_code: adapterResult.error_code || '',
+    error_message: adapterResult.error_message || '',
+    created_at: adapterResult.finished_at || getTimestamp(),
+    updated_at: adapterResult.finished_at || getTimestamp(),
+  };
+
+  const finalNotification = await withBillingWrite(async (db) => {
+    await recordStoredNotificationDeliveryAttemptTx(db, attemptRecord);
+    if (adapterResult.ok) {
+      return markStoredTaskNotificationDispatchOutcomeTx(db, preflight.notification.notification_id, {
+        success: true,
+        deliveredMessageId: adapterResult.stdout_json && typeof adapterResult.stdout_json === 'object'
+          ? String(adapterResult.stdout_json.messageId || adapterResult.stdout_json.payload?.messageId || adapterResult.stdout_json.payload?.message_id || '')
+          : null,
+        timestamp: adapterResult.finished_at || getTimestamp(),
+      });
+    }
+
+    const nextAttemptAt = getNotificationDispatchRetryTimestamp(adapterResult.finished_at || getTimestamp(), computeNotificationDispatchBackoffMs(preflight.notification.attempt_count || 0));
+    return markStoredTaskNotificationDispatchOutcomeTx(db, preflight.notification.notification_id, {
+      success: false,
+      retryable: Boolean(adapterResult.retryable),
+      lastError: adapterResult.error_message || adapterResult.error_code || 'dispatch_failed',
+      nextAttemptAt,
+      timestamp: adapterResult.finished_at || getTimestamp(),
+    });
+  });
+
+  return {
+    transport,
+    dry_run: dryRun,
+    command_path: commandPath,
+    notification_id: preflight.notification.notification_id,
+    session_id: preflight.notification.session_id,
+    task_id: preflight.notification.task_id,
+    status: adapterResult.ok ? 'delivered' : (adapterResult.retryable ? 'retryable' : 'failed'),
+    reason_code: adapterResult.error_code || '',
+    reason_message: adapterResult.error_message || '',
+    delivery_target: preflight.delivery_target,
+    attempt: attemptRecord,
+    notification: finalNotification,
+    adapter_result: adapterResult,
+  };
+}
+
+function buildTaskNotificationOutboundText(notification, task, summary, assessment, failureFact) {
+  const finalState = String(task?.current_state || notification?.payload?.task_state || notification?.payload?.new_state || '');
+  const body = String(notification?.body || '').trim();
+  const summaryText = String(summary?.summary_text || '').trim();
+
+  if (finalState === TASK_STATES.COMPLETED || finalState === TASK_STATES.FAILED || finalState === TASK_STATES.RECOVERY_REQUIRED || finalState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED || finalState === TASK_STATES.PARTIALLY_COMPLETED) {
+    return summaryText || body;
+  }
+
+  if (summaryText && body && summaryText !== body) {
+    return `${body}\n${summaryText}`;
+  }
+
+  return body || summaryText || taskProgressCategoryToLabel(notification?.notification_kind || '');
+}
+
+function renderTaskNotificationViewTx(db, notificationRow) {
+  const notification = hydrateTaskNotificationRow(notificationRow);
+  if (!notification) {
+    return null;
+  }
+
+  const task = getStoredTaskByIdTx(db, notification.task_id);
+  const summaryStmt = db.prepare(`
+    SELECT *
+    FROM task_completion_summaries
+    WHERE task_id = ?
+    LIMIT 1
+  `);
+  summaryStmt.bind([notification.task_id]);
+  let summaryRow = null;
+  if (summaryStmt.step()) {
+    summaryRow = summaryStmt.getAsObject();
+  }
+  summaryStmt.free();
+  const taskSummary = hydrateTaskCompletionSummaryRow(summaryRow);
+
+  const progressStmt = db.prepare(`
+    SELECT *
+    FROM task_progress_events
+    WHERE progress_event_id = ?
+    LIMIT 1
+  `);
+  progressStmt.bind([notification.source_id]);
+  let progressRow = null;
+  if (progressStmt.step()) {
+    progressRow = progressStmt.getAsObject();
+  }
+  progressStmt.free();
+  const progressEvent = hydrateTaskProgressEventRow(progressRow);
+
+  const assessmentStmt = db.prepare(`
+    SELECT *
+    FROM task_artifact_assessments
+    WHERE task_id = ?
+    LIMIT 1
+  `);
+  assessmentStmt.bind([notification.task_id]);
+  let assessmentRow = null;
+  if (assessmentStmt.step()) {
+    assessmentRow = assessmentStmt.getAsObject();
+  }
+  assessmentStmt.free();
+  const assessment = hydrateTaskArtifactAssessmentRow(assessmentRow);
+
+  const failureStmt = db.prepare(`
+    SELECT *
+    FROM tool_failure_facts
+    WHERE subject_type = ? AND subject_id = ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT 1
+  `);
+  failureStmt.bind(['task', notification.task_id]);
+  let failureRow = null;
+  if (failureStmt.step()) {
+    failureRow = failureStmt.getAsObject();
+  }
+  failureStmt.free();
+  const failureFact = hydrateToolFailureFactRow(failureRow);
+  const deliveryTarget = getStoredSessionDeliveryTargetBySessionIdTx(db, notification.session_id);
+  const latestAttempt = getStoredNotificationDeliveryAttemptByNotificationId(db, notification.notification_id, { limit: 1 });
+
+  const outboundText = buildTaskNotificationOutboundText(notification, task, taskSummary, assessment, failureFact);
+  const payload = {
+    ...(notification.payload || {}),
+    task_state: String(task?.current_state || notification.payload?.task_state || ''),
+    summary_text: String(taskSummary?.summary_text || ''),
+    what_completed: taskSummary?.what_completed || [],
+    artifacts: taskSummary?.artifacts || [],
+    verified: taskSummary?.verified || [],
+    not_verified: taskSummary?.not_verified || [],
+    follow_up_needed: Number(taskSummary?.follow_up_needed || 0),
+    artifact_assessment: assessment ? {
+      assessment_id: assessment.assessment_id || null,
+      artifact_exists: Number(assessment.artifact_exists || 0) === 1,
+      artifact_verification_state: assessment.artifact_verification_state || '',
+      artifact_family: assessment.artifact_family || 'unknown',
+      structure_state: assessment.structure_state || 'missing',
+      alignment_state: assessment.alignment_state || 'missing',
+      confidence_score: Number(assessment.confidence_score || 0),
+      confidence_band: assessment.confidence_band || 'low',
+      reason_code: assessment.reason_code || '',
+      notes: assessment.notes || null,
+    } : null,
+    failure_fact: failureFact ? {
+      failure_fact_id: failureFact.failure_fact_id || null,
+      failure_category: failureFact.failure_category || '',
+      failure_scope: failureFact.failure_scope || '',
+      failure_stage: failureFact.failure_stage || '',
+      reason_code: failureFact.reason_code || '',
+      detail: failureFact.detail || '',
+    } : null,
+  };
+
+  return {
+    ...notification,
+    delivery_target: deliveryTarget ? {
+      channel: deliveryTarget.channel || 'telegram',
+      chat_id: deliveryTarget.chat_id || '',
+      thread_id: deliveryTarget.thread_id || null,
+    } : null,
+    task_state: String(task?.current_state || notification.payload?.task_state || ''),
+    progress_event: progressEvent,
+    completion_summary: taskSummary,
+    artifact_assessment: assessment,
+    failure_fact: failureFact,
+    outbound_text: outboundText,
+    latest_delivery_attempt: latestAttempt ? {
+      attempt_id: latestAttempt.attempt_id || null,
+      transport: latestAttempt.transport || 'openclaw_cli',
+      dry_run: Boolean(latestAttempt.dry_run),
+      target: latestAttempt.target || '',
+      thread_id: latestAttempt.thread_id || null,
+      command_path: latestAttempt.command_path || '',
+      command_argv: Array.isArray(latestAttempt.command_argv) ? latestAttempt.command_argv : [],
+      exit_code: Number(latestAttempt.exit_code || 0),
+      success: Boolean(latestAttempt.success),
+      retryable: Boolean(latestAttempt.retryable),
+      error_code: latestAttempt.error_code || '',
+      error_message: latestAttempt.error_message || '',
+      started_at: latestAttempt.started_at || '',
+      finished_at: latestAttempt.finished_at || '',
+      stdout_json: latestAttempt.stdout_json || null,
+    } : null,
+    payload,
+  };
+}
+
+function getStoredSessionDeliveryTargetBySessionIdTx(db, sessionId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM session_delivery_targets
+    WHERE session_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([sessionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateSessionDeliveryTargetRow(row);
+}
+
+async function pullTaskNotificationsForSession(sessionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const deliveryTarget = await ensureSessionDeliveryTargetForSessionTx(db, sessionId, options);
+    if (!deliveryTarget) {
+      return [];
+    }
+
+    const claimed = await claimStoredTaskNotificationsForSessionTx(db, sessionId, options);
+    return claimed.map((notification) => renderTaskNotificationViewTx(db, notification)).filter(Boolean);
+  });
+}
+
+async function renderTaskNotificationView(notificationId) {
+  const db = await ensureBillingDb();
+  const row = await getStoredTaskNotificationById(db, notificationId);
+  return renderTaskNotificationViewTx(db, row);
+}
+
+function getTaskProgressSpec(previousState, nextState, options = {}) {
+  const state = String(nextState || '');
+  const blocked = Boolean(options.requiresUserInput || options.blockedForInput);
+  switch (state) {
+    case TASK_STATES.ACKNOWLEDGED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.TASK_ACCEPTED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'Task accepted. I am starting the work now.',
+      };
+    case TASK_STATES.PLANNED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.PLAN_LOCKED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'I have locked the plan and am moving into execution.',
+      };
+    case TASK_STATES.IN_PROGRESS:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.MEANINGFUL_PROGRESS_CHECKPOINT,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'Meaningful progress checkpoint reached.',
+      };
+    case TASK_STATES.TOOL_WORK_STARTED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.TOOL_WORK_STARTED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'Tool work has started.',
+      };
+    case TASK_STATES.ARTIFACT_CREATED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.ARTIFACT_CREATED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'The artifact exists and verification is underway.',
+      };
+    case TASK_STATES.ARTIFACT_VERIFIED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFIED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'The artifact is verified.',
+      };
+    case TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.BLOCKED_HUMAN_INPUT_REQUIRED,
+        decision: 'interrupt_user',
+        requiresUserInput: true,
+        message: options.message || 'I am blocked and need your input to continue safely.',
+      };
+    case TASK_STATES.PARTIALLY_COMPLETED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.PARTIAL_COMPLETION_DETECTED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'I made partial progress, but the task is not complete yet.',
+      };
+    case TASK_STATES.RECOVERY_REQUIRED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.RECOVERY_REQUIRED,
+        decision: blocked ? 'interrupt_user' : 'notify_user',
+        requiresUserInput: blocked,
+        message: blocked
+          ? (options.message || 'I hit a recoverable issue and need your help to continue safely.')
+          : 'I hit a recoverable issue and am attempting recovery.',
+      };
+    case TASK_STATES.FAILED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.TASK_FAILED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'The task failed.',
+      };
+    case TASK_STATES.COMPLETED:
+      return {
+        category: TASK_PROGRESS_CATEGORIES.TASK_COMPLETED,
+        decision: 'notify_user',
+        requiresUserInput: false,
+        message: 'The task is complete.',
+      };
+    default:
+      return null;
+  }
+}
+
+function progressEventShouldEmit(previousState, nextState, options = {}) {
+  if (!previousState || !nextState) {
+    return false;
+  }
+  const spec = getTaskProgressSpec(previousState, nextState, options);
+  return Boolean(spec);
+}
+
+function taskProgressCategoryToNotificationTitle(category) {
+  switch (String(category || '')) {
+    case TASK_PROGRESS_CATEGORIES.TASK_ACCEPTED:
+      return 'Task accepted';
+    case TASK_PROGRESS_CATEGORIES.PLAN_LOCKED:
+      return 'Plan locked';
+    case TASK_PROGRESS_CATEGORIES.TOOL_WORK_STARTED:
+      return 'Tool work started';
+    case TASK_PROGRESS_CATEGORIES.MEANINGFUL_PROGRESS_CHECKPOINT:
+      return 'Progress checkpoint';
+    case TASK_PROGRESS_CATEGORIES.ARTIFACT_CREATED:
+      return 'Artifact created';
+    case TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFICATION_STARTED:
+      return 'Artifact verification started';
+    case TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFIED:
+      return 'Artifact verified';
+    case TASK_PROGRESS_CATEGORIES.BLOCKED_HUMAN_INPUT_REQUIRED:
+      return 'Input required';
+    case TASK_PROGRESS_CATEGORIES.RECOVERY_REQUIRED:
+      return 'Recovery required';
+    case TASK_PROGRESS_CATEGORIES.PARTIAL_COMPLETION_DETECTED:
+      return 'Partial completion';
+    case TASK_PROGRESS_CATEGORIES.TASK_COMPLETED:
+      return 'Task completed';
+    case TASK_PROGRESS_CATEGORIES.TASK_FAILED:
+      return 'Task failed';
+    default:
+      return 'Task update';
+  }
+}
+
+function buildTaskNotificationSnapshot(db, task, progressEvent) {
+  const progressCategory = String(progressEvent?.progress_category || '');
+  const taskState = String(task?.current_state || progressEvent?.new_state || '');
+  const title = taskProgressCategoryToNotificationTitle(progressCategory);
+  const body = String(progressEvent?.message_text || '').trim() || taskProgressCategoryToLabel(progressCategory);
+  const requestLogRow = task?.last_request_id ? getStoredRequestLogByRequestIdTx(db, task.last_request_id) : null;
+  const taskProfile = deriveTaskNotificationProfileFromTask(task, requestLogRow, {
+    currentState: taskState,
+    classifiedAt: task?.classified_at || progressEvent?.created_at || getTimestamp(),
+  });
+  const dispatchability = deriveTaskNotificationDispatchability(task, progressEvent, taskProfile);
+
+  return {
+    task_id: String(task?.task_id || progressEvent?.task_id || ''),
+    session_id: String(task?.session_id || ''),
+    execution_id: progressEvent?.execution_id || task?.last_execution_id || null,
+    progress_event_id: String(progressEvent?.progress_event_id || ''),
+    progress_category: progressCategory,
+    previous_state: String(progressEvent?.previous_state || ''),
+    new_state: String(progressEvent?.new_state || taskState || ''),
+    task_state: taskState,
+    decision: String(progressEvent?.decision || 'notify_user'),
+    requires_user_input: Number(progressEvent?.requires_user_input || 0),
+    message_text: String(progressEvent?.message_text || ''),
+    title,
+    body,
+    task_kind: dispatchability.task_kind,
+    notification_policy: dispatchability.notification_policy,
+    proactive_eligible: Number(dispatchability.proactive_eligible || 0),
+    eligibility_reason: String(dispatchability.eligibility_reason || ''),
+    delivery_suppressed_reason: String(dispatchability.delivery_suppressed_reason || ''),
+    classified_at: dispatchability.classified_at || taskProfile.classified_at || getTimestamp(),
+    source_type: 'task_progress_event',
+    source_id: String(progressEvent?.progress_event_id || ''),
+    dedupe_key: `${String(progressEvent?.progress_event_id || '')}:${String(task?.task_id || progressEvent?.task_id || '')}`,
+    delivery_channel: 'openclaw_tg',
+  };
+}
+
+function appendTaskNotificationTx(db, notification) {
+  const snapshot = {
+    ...notification,
+    payload: notification.payload || {},
+  };
+  const timestamp = notification.created_at || getTimestamp();
+  const insert = db.prepare(`
+    INSERT INTO task_notifications (
+      notification_id, task_id, session_id, execution_id, source_type, source_id, notification_kind,
+      delivery_channel, delivery_state, title, body, task_kind, notification_policy, proactive_eligible,
+      eligibility_reason, delivery_suppressed_reason, classified_at, payload_json, dedupe_key, claim_count,
+      claimed_at, delivered_at, delivered_message_id, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(dedupe_key) DO UPDATE SET
+      task_id = excluded.task_id,
+      session_id = excluded.session_id,
+      execution_id = excluded.execution_id,
+      source_type = excluded.source_type,
+      source_id = excluded.source_id,
+      notification_kind = excluded.notification_kind,
+      delivery_channel = excluded.delivery_channel,
+      title = excluded.title,
+      body = excluded.body,
+      task_kind = excluded.task_kind,
+      notification_policy = excluded.notification_policy,
+      proactive_eligible = excluded.proactive_eligible,
+      eligibility_reason = excluded.eligibility_reason,
+      delivery_suppressed_reason = excluded.delivery_suppressed_reason,
+      classified_at = excluded.classified_at,
+      payload_json = excluded.payload_json,
+      updated_at = excluded.updated_at
+  `);
+  insert.run([
+    snapshot.notification_id || createTaskNotificationId(),
+    snapshot.task_id,
+    snapshot.session_id,
+    snapshot.execution_id || null,
+    snapshot.source_type || 'task_progress_event',
+    snapshot.source_id || '',
+    snapshot.notification_kind || snapshot.progress_category || '',
+    snapshot.delivery_channel || 'openclaw_tg',
+    snapshot.delivery_state || TASK_NOTIFICATION_DELIVERY_STATES.PENDING,
+    snapshot.title || '',
+    snapshot.body || '',
+    snapshot.task_kind || TASK_KINDS.TEXT_GENERATION,
+    snapshot.notification_policy || TASK_NOTIFICATION_POLICIES.SILENT,
+    Number(snapshot.proactive_eligible || 0),
+    snapshot.eligibility_reason || '',
+    snapshot.delivery_suppressed_reason || '',
+    snapshot.classified_at || timestamp,
+    JSON.stringify(snapshot.payload || {}),
+    snapshot.dedupe_key || '',
+    Number(snapshot.claim_count || 0),
+    snapshot.claimed_at || null,
+    snapshot.delivered_at || null,
+    snapshot.delivered_message_id || null,
+    snapshot.last_error || '',
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+}
+
+function enqueueTaskNotificationFromProgressEventTx(db, progressEvent) {
+  if (!progressEvent || !progressEvent.task_id || !progressEvent.progress_category) {
+    return null;
+  }
+
+  const decision = String(progressEvent.decision || 'notify_user');
+  if (!['notify_user', 'interrupt_user'].includes(decision)) {
+    return null;
+  }
+
+  const task = getStoredTaskByIdTx(db, progressEvent.task_id);
+  if (!task) {
+    return null;
+  }
+
+  const snapshot = buildTaskNotificationSnapshot(db, task, progressEvent);
+  const payload = {
+    task_id: snapshot.task_id,
+    session_id: snapshot.session_id,
+    execution_id: snapshot.execution_id,
+    progress_event_id: snapshot.progress_event_id,
+    progress_category: snapshot.progress_category,
+    previous_state: snapshot.previous_state,
+    new_state: snapshot.new_state,
+    task_state: snapshot.task_state,
+    decision: snapshot.decision,
+    requires_user_input: snapshot.requires_user_input,
+    message_text: snapshot.message_text,
+    title: snapshot.title,
+    body: snapshot.body,
+    task_kind: snapshot.task_kind,
+    notification_policy: snapshot.notification_policy,
+    proactive_eligible: snapshot.proactive_eligible,
+    eligibility_reason: snapshot.eligibility_reason,
+    delivery_suppressed_reason: snapshot.delivery_suppressed_reason,
+    classified_at: snapshot.classified_at,
+  };
+
+  appendTaskNotificationTx(db, {
+    notification_id: createTaskNotificationId(),
+    task_id: snapshot.task_id,
+    session_id: snapshot.session_id,
+    execution_id: snapshot.execution_id,
+    source_type: snapshot.source_type,
+    source_id: snapshot.source_id,
+    notification_kind: snapshot.progress_category,
+    delivery_channel: snapshot.delivery_channel,
+    delivery_state: TASK_NOTIFICATION_DELIVERY_STATES.PENDING,
+    title: snapshot.title,
+    body: snapshot.body,
+    task_kind: snapshot.task_kind,
+    notification_policy: snapshot.notification_policy,
+    proactive_eligible: snapshot.proactive_eligible,
+    eligibility_reason: snapshot.eligibility_reason,
+    delivery_suppressed_reason: snapshot.delivery_suppressed_reason,
+    classified_at: snapshot.classified_at,
+    payload,
+    dedupe_key: snapshot.dedupe_key,
+    created_at: progressEvent.created_at || getTimestamp(),
+  });
+
+  return snapshot;
+}
+
+function appendTaskProgressEventTx(db, event) {
+  const progressEventId = event.progress_event_id || createTaskProgressEventId();
+  const timestamp = event.created_at || getTimestamp();
+  const insert = db.prepare(`
+    INSERT INTO task_progress_events (
+      progress_event_id, task_id, execution_id, previous_state, new_state, progress_category, decision,
+      message_text, requires_user_input, source, reason_code, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    progressEventId,
+    event.task_id,
+    event.execution_id || null,
+    event.previous_state || '',
+    event.new_state || '',
+    event.progress_category,
+    event.decision || 'notify_user',
+    event.message_text || '',
+    Number(Boolean(event.requires_user_input)),
+    event.source || 'runtime',
+    event.reason_code || '',
+    timestamp,
+  ]);
+  insert.free();
+  enqueueTaskNotificationFromProgressEventTx(db, {
+    ...event,
+    progress_event_id: progressEventId,
+    created_at: timestamp,
+  });
+}
+
+async function appendTaskProgressEvent(event) {
+  return withBillingWrite(async (db) => {
+    appendTaskProgressEventTx(db, event);
+    return event;
+  });
+}
+
+function taskProgressCategoryToLabel(category) {
+  switch (String(category || '')) {
+    case TASK_PROGRESS_CATEGORIES.TASK_ACCEPTED:
+      return 'task accepted';
+    case TASK_PROGRESS_CATEGORIES.PLAN_LOCKED:
+      return 'plan locked';
+    case TASK_PROGRESS_CATEGORIES.TOOL_WORK_STARTED:
+      return 'tool work started';
+    case TASK_PROGRESS_CATEGORIES.MEANINGFUL_PROGRESS_CHECKPOINT:
+      return 'meaningful progress checkpoint';
+    case TASK_PROGRESS_CATEGORIES.ARTIFACT_CREATED:
+      return 'artifact created';
+    case TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFICATION_STARTED:
+      return 'artifact verification started';
+    case TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFIED:
+      return 'artifact verified';
+    case TASK_PROGRESS_CATEGORIES.BLOCKED_HUMAN_INPUT_REQUIRED:
+      return 'blocked human input required';
+    case TASK_PROGRESS_CATEGORIES.RECOVERY_REQUIRED:
+      return 'recovery required';
+    case TASK_PROGRESS_CATEGORIES.PARTIAL_COMPLETION_DETECTED:
+      return 'partial completion detected';
+    case TASK_PROGRESS_CATEGORIES.TASK_COMPLETED:
+      return 'task completed';
+    case TASK_PROGRESS_CATEGORIES.TASK_FAILED:
+      return 'task failed';
+    default:
+      return String(category || '');
+  }
+}
+
+function summarizeTaskCompletionState(task, assessment, failureFact) {
+  const finalState = String(task?.current_state || '');
+  const confidenceBand = String(assessment?.confidence_band || '');
+  const verificationState = String(assessment?.artifact_verification_state || '');
+  const hasArtifact = Number(assessment?.artifact_exists || 0) === 1;
+  const artifactVerified = verificationState === ARTIFACT_VERIFICATION_STATES.VERIFIED;
+  const highConfidence = confidenceBand === TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH;
+  const failureReason = String(failureFact?.reason_code || '');
+
+  if (finalState === TASK_STATES.COMPLETED) {
+    if (artifactVerified && highConfidence) {
+      return 'Task completed successfully.';
+    }
+    return 'Task completed, but artifact confidence or verification is not fully strong.';
+  }
+
+  if (finalState === TASK_STATES.PARTIALLY_COMPLETED) {
+    return 'Task partially completed.';
+  }
+
+  if (finalState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED) {
+    return 'Task is blocked and waiting for your input.';
+  }
+
+  if (finalState === TASK_STATES.RECOVERY_REQUIRED) {
+    if (['terminal_payload_missing', 'empty_terminal_response'].includes(failureReason)) {
+      return 'Task ended without a usable terminal response; recovery or retry may be needed.';
+    }
+    return 'Task needs recovery before it can safely continue.';
+  }
+
+  if (finalState === TASK_STATES.FAILED) {
+    return 'Task failed.';
+  }
+
+  if (artifactVerified || hasArtifact) {
+    return 'Task produced an artifact, but the final state is not complete.';
+  }
+
+  if (failureFact) {
+    if (['terminal_payload_missing', 'empty_terminal_response'].includes(failureReason)) {
+      return 'Task ended without a usable terminal response.';
+    }
+    return 'Task ended with a recorded failure.';
+  }
+
+  return 'Task completion state was recorded.';
+}
+
+function buildTaskCompletionSummaryTx(db, task, options = {}) {
+  if (!task) {
+    return null;
+  }
+
+  const progressStmt = db.prepare(`
+    SELECT *
+    FROM task_progress_events
+    WHERE task_id = ?
+    ORDER BY created_at ASC, rowid ASC
+  `);
+  progressStmt.bind([task.task_id]);
+  const progressEvents = [];
+  while (progressStmt.step()) {
+    progressEvents.push(hydrateTaskProgressEventRow(progressStmt.getAsObject()));
+  }
+  progressStmt.free();
+
+  const assessmentStmt = db.prepare(`
+    SELECT *
+    FROM task_artifact_assessments
+    WHERE task_id = ?
+    LIMIT 1
+  `);
+  assessmentStmt.bind([task.task_id]);
+  let assessmentRow = null;
+  if (assessmentStmt.step()) {
+    assessmentRow = assessmentStmt.getAsObject();
+  }
+  assessmentStmt.free();
+  const assessment = hydrateTaskArtifactAssessmentRow(assessmentRow);
+
+  const failureStmt = db.prepare(`
+    SELECT *
+    FROM tool_failure_facts
+    WHERE subject_type = ? AND subject_id = ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT 1
+  `);
+  failureStmt.bind(['task', task.task_id]);
+  let failureRow = null;
+  if (failureStmt.step()) {
+    failureRow = failureStmt.getAsObject();
+  }
+  failureStmt.free();
+  const failureFact = hydrateToolFailureFactRow(failureRow);
+  const progressLabels = progressEvents.map((event) => taskProgressCategoryToLabel(event.progress_category));
+  const completionExecutionId = task.completed_execution_id || task.last_execution_id || null;
+  const finalState = String(task.current_state || '');
+
+  const whatCompleted = [];
+  const seenCompleted = new Set();
+  for (const label of progressLabels) {
+    if (!label || seenCompleted.has(label)) {
+      continue;
+    }
+    seenCompleted.add(label);
+    whatCompleted.push(label);
+  }
+
+  if (assessment?.artifact_exists) {
+    whatCompleted.push('artifact exists');
+  }
+  if (assessment?.artifact_verification_state === ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    whatCompleted.push('artifact verified');
+  }
+  if (finalState === TASK_STATES.COMPLETED) {
+    whatCompleted.push('task completed');
+  } else if (finalState === TASK_STATES.PARTIALLY_COMPLETED) {
+    whatCompleted.push('task partially completed');
+  } else if (finalState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED) {
+    whatCompleted.push('task blocked for human input');
+  } else if (finalState === TASK_STATES.RECOVERY_REQUIRED) {
+    whatCompleted.push('task recovery required');
+  } else if (finalState === TASK_STATES.FAILED) {
+    whatCompleted.push('task failed');
+  }
+
+  const artifacts = assessment ? [{
+    artifact_id: assessment.artifact_id || null,
+    artifact_exists: Number(assessment.artifact_exists || 0) === 1,
+    verification_state: assessment.artifact_verification_state || '',
+    artifact_family: assessment.artifact_family || 'unknown',
+    structure_state: assessment.structure_state || 'missing',
+    alignment_state: assessment.alignment_state || 'missing',
+    confidence_score: Number(assessment.confidence_score || 0),
+    confidence_band: assessment.confidence_band || 'low',
+    reason_code: assessment.reason_code || '',
+  }] : [];
+
+  const verified = [];
+  if (finalState === TASK_STATES.COMPLETED) {
+    verified.push('task completed');
+  }
+  if (assessment?.artifact_exists) {
+    verified.push('artifact exists');
+  }
+  if (assessment?.artifact_verification_state === ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    verified.push('artifact verified');
+  }
+  if (assessment?.structure_state === TASK_ARTIFACT_STRUCTURE_STATES.VALID) {
+    verified.push('artifact structurally valid');
+  }
+  if (assessment?.alignment_state === TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED) {
+    verified.push('artifact aligned to task');
+  }
+
+  const notVerified = [];
+  if (!assessment?.artifact_exists) {
+    notVerified.push('artifact not present');
+  } else if (assessment?.artifact_verification_state !== ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    notVerified.push(`artifact verification state: ${assessment?.artifact_verification_state || 'unknown'}`);
+  }
+  if (assessment && assessment.confidence_band !== TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH) {
+    notVerified.push(`artifact confidence band: ${assessment.confidence_band || 'low'}`);
+  }
+  if (failureFact) {
+    notVerified.push(`failure category: ${failureFact.failure_category}`);
+  }
+  if (failureFact && ['terminal_payload_missing', 'empty_terminal_response'].includes(String(failureFact.reason_code || ''))) {
+    notVerified.push('terminal payload missing');
+  }
+  if (finalState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED) {
+    notVerified.push('requires user input');
+  }
+  if (finalState === TASK_STATES.RECOVERY_REQUIRED) {
+    notVerified.push('recovery required');
+  }
+  if (finalState === TASK_STATES.PARTIALLY_COMPLETED) {
+    notVerified.push('partial completion');
+  }
+
+  const followUpNeeded = finalState !== TASK_STATES.COMPLETED
+    || !assessment
+    || assessment.artifact_verification_state !== ARTIFACT_VERIFICATION_STATES.VERIFIED
+    || assessment.confidence_band !== TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH
+    || finalState === TASK_STATES.RECOVERY_REQUIRED
+    || finalState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED
+    || finalState === TASK_STATES.PARTIALLY_COMPLETED
+    || finalState === TASK_STATES.FAILED;
+
+  const proof = {
+    task_event_count: progressEvents.length,
+    progress_event_count: progressEvents.length,
+    first_execution_id: task.first_execution_id || null,
+    last_execution_id: task.last_execution_id || null,
+    completed_execution_id: completionExecutionId,
+    assessment_id: assessment?.assessment_id || null,
+    artifact_id: assessment?.artifact_id || null,
+    failure_fact_id: failureFact?.failure_fact_id || null,
+    final_state: finalState,
+  };
+
+  return {
+    completion_summary_id: options.completionSummaryId || createTaskCompletionSummaryId(),
+    task_id: task.task_id,
+    session_id: task.session_id,
+    execution_id: completionExecutionId,
+    final_state: finalState,
+    summary_text: summarizeTaskCompletionState(task, assessment, failureFact),
+    what_completed: whatCompleted,
+    artifacts,
+    verified,
+    not_verified: notVerified,
+    follow_up_needed: Number(Boolean(followUpNeeded)),
+    proof,
+  };
+}
+
+function syncTaskCompletionSummaryTx(db, taskId, options = {}) {
+  const taskStmt = db.prepare('SELECT * FROM tasks WHERE task_id = ? LIMIT 1');
+  taskStmt.bind([taskId]);
+  let taskRow = null;
+  if (taskStmt.step()) {
+    taskRow = taskStmt.getAsObject();
+  }
+  taskStmt.free();
+  const task = hydrateTaskRow(taskRow);
+  if (!task) {
+    return null;
+  }
+
+  const summary = buildTaskCompletionSummaryTx(db, task, options);
+  if (!summary) {
+    return null;
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  const insert = db.prepare(`
+    INSERT INTO task_completion_summaries (
+      completion_summary_id, task_id, session_id, execution_id, final_state, summary_text,
+      what_completed_json, artifacts_json, verified_json, not_verified_json, follow_up_needed,
+      proof_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      session_id = excluded.session_id,
+      execution_id = excluded.execution_id,
+      final_state = excluded.final_state,
+      summary_text = excluded.summary_text,
+      what_completed_json = excluded.what_completed_json,
+      artifacts_json = excluded.artifacts_json,
+      verified_json = excluded.verified_json,
+      not_verified_json = excluded.not_verified_json,
+      follow_up_needed = excluded.follow_up_needed,
+      proof_json = excluded.proof_json,
+      updated_at = excluded.updated_at
+  `);
+  insert.run([
+    summary.completion_summary_id,
+    summary.task_id,
+    summary.session_id,
+    summary.execution_id,
+    summary.final_state,
+    summary.summary_text,
+    JSON.stringify(summary.what_completed),
+    JSON.stringify(summary.artifacts),
+    JSON.stringify(summary.verified),
+    JSON.stringify(summary.not_verified),
+    summary.follow_up_needed,
+    JSON.stringify(summary.proof),
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+
+  return getStoredTaskCompletionSummaryByTaskId(db, taskId);
+}
+
+async function syncTaskCompletionSummary(options = {}) {
+  return withBillingWrite(async (db) => syncTaskCompletionSummaryTx(db, String(options.taskId || ''), options));
+}
+
+async function getStoredToolFailureFactBySubjectId(db, subjectType, subjectId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM tool_failure_facts
+    WHERE subject_type = ? AND subject_id = ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT 1
+  `);
+  stmt.bind([subjectType, subjectId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateToolFailureFactRow(row);
+}
+
+async function getToolFailureFactBySubjectId(subjectType, subjectId) {
+  const db = await ensureBillingDb();
+  return getStoredToolFailureFactBySubjectId(db, subjectType, subjectId);
+}
+
+function appendTaskEventTx(db, event) {
+  const insert = db.prepare(`
+    INSERT INTO task_events (
+      task_event_id, task_id, execution_id, previous_state, new_state, created_at, actor_source, reason_code, request_id, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    event.task_event_id || createTaskEventId(),
+    event.task_id,
+    event.execution_id || null,
+    event.previous_state || '',
+    event.new_state,
+    event.created_at || event.timestamp || getTimestamp(),
+    event.actor_source || 'runtime',
+    event.reason_code || 'task_state_transition',
+    event.request_id || null,
+    event.notes || null,
+  ]);
+  insert.free();
+}
+
+async function appendTaskEvent(event) {
+  return withBillingWrite(async (db) => {
+    appendTaskEventTx(db, event);
+    return event;
+  });
+}
+
+async function createTaskRecord(options = {}) {
+  return withBillingWrite(async (db) => {
+    const sessionId = String(options.sessionId || '');
+    if (!sessionId) {
+      throw new Error('Task creation requires sessionId');
+    }
+
+    const idempotencyKey = options.idempotencyKey ? String(options.idempotencyKey) : '';
+    const objectiveText = String(options.objectiveText || '');
+    const objectiveFingerprint = String(options.objectiveFingerprint || fingerprintTaskObjective(sessionId, objectiveText, idempotencyKey));
+    const timestamp = options.timestamp || getTimestamp();
+    const draftTask = {
+      task_id: '',
+      session_id: sessionId,
+      current_state: TASK_STATES.RECEIVED,
+      objective_text: objectiveText,
+      last_request_id: String(options.requestId || ''),
+      recovery_reason: null,
+      recovery_notes: null,
+    };
+    const classification = deriveTaskNotificationProfileFromTask(draftTask, null, {
+      currentState: TASK_STATES.RECEIVED,
+      classifiedAt: timestamp,
+    });
+
+    if (idempotencyKey) {
+      const existingStmt = db.prepare(`
+        SELECT *
+        FROM tasks
+        WHERE session_id = ? AND idempotency_key = ?
+        LIMIT 1
+      `);
+      existingStmt.bind([sessionId, idempotencyKey]);
+      let existingRow = null;
+      if (existingStmt.step()) {
+        existingRow = existingStmt.getAsObject();
+      }
+      existingStmt.free();
+
+      if (existingRow) {
+        const existing = hydrateTaskRow(existingRow);
+        const update = db.prepare(`
+          UPDATE tasks
+          SET updated_at = ?, last_request_id = ?, objective_text = ?, objective_fingerprint = ?,
+              task_kind = ?, notification_policy = ?, notification_eligible = ?,
+              eligibility_reason = ?, classified_at = ?
+          WHERE task_id = ?
+        `);
+        update.run([
+          timestamp,
+          options.requestId || existing.last_request_id || '',
+          objectiveText || existing.objective_text || '',
+          objectiveFingerprint || existing.objective_fingerprint || '',
+          classification.task_kind,
+          classification.notification_policy,
+          Number(classification.notification_eligible || 0),
+          classification.eligibility_reason || '',
+          classification.classified_at || timestamp,
+          existing.task_id,
+        ]);
+        update.free();
+        return {
+          task: {
+            ...existing,
+            updated_at: timestamp,
+            last_request_id: options.requestId || existing.last_request_id || '',
+            objective_text: objectiveText || existing.objective_text || '',
+            objective_fingerprint: objectiveFingerprint || existing.objective_fingerprint || '',
+            task_kind: classification.task_kind,
+            notification_policy: classification.notification_policy,
+            notification_eligible: Number(classification.notification_eligible || 0),
+            eligibility_reason: classification.eligibility_reason || '',
+            classified_at: classification.classified_at || timestamp,
+          },
+          reused: true,
+        };
+      }
+    }
+
+    const taskId = createTaskId();
+    const insert = db.prepare(`
+      INSERT INTO tasks (
+        task_id, session_id, current_state, created_at, updated_at, last_request_id, idempotency_key,
+        objective_text, objective_fingerprint, task_kind, notification_policy, notification_eligible,
+        eligibility_reason, classified_at, first_execution_id, last_execution_id, completed_execution_id,
+        recovery_reason, recovery_notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run([
+      taskId,
+      sessionId,
+      TASK_STATES.RECEIVED,
+      timestamp,
+      timestamp,
+      options.requestId || '',
+      idempotencyKey || null,
+      objectiveText,
+      objectiveFingerprint,
+      classification.task_kind,
+      classification.notification_policy,
+      Number(classification.notification_eligible || 0),
+      classification.eligibility_reason || '',
+      classification.classified_at || timestamp,
+      options.firstExecutionId || null,
+      options.firstExecutionId || null,
+      null,
+      null,
+      null,
+    ]);
+    insert.free();
+
+    appendTaskEventTx(db, {
+      task_id: taskId,
+      execution_id: options.firstExecutionId || null,
+      previous_state: '',
+      new_state: TASK_STATES.RECEIVED,
+      timestamp,
+      actor_source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'task_received',
+      request_id: options.requestId || null,
+      notes: objectiveFingerprint,
+    });
+
+    return {
+      task: {
+        task_id: taskId,
+        session_id: sessionId,
+        current_state: TASK_STATES.RECEIVED,
+        created_at: timestamp,
+        updated_at: timestamp,
+        last_request_id: options.requestId || '',
+        idempotency_key: idempotencyKey || null,
+        objective_text: objectiveText,
+        objective_fingerprint: objectiveFingerprint,
+        task_kind: classification.task_kind,
+        notification_policy: classification.notification_policy,
+        notification_eligible: Number(classification.notification_eligible || 0),
+        eligibility_reason: classification.eligibility_reason || '',
+        classified_at: classification.classified_at || timestamp,
+        first_execution_id: options.firstExecutionId || null,
+        last_execution_id: options.firstExecutionId || null,
+        completed_execution_id: null,
+        recovery_reason: null,
+        recovery_notes: null,
+      },
+      reused: false,
+    };
+  });
+}
+
+function taskStateFromExecutionState(nextState) {
+  switch (String(nextState || '')) {
+    case EXECUTION_STATES.QUEUED:
+      return TASK_STATES.PLANNED;
+    case EXECUTION_STATES.RUNNING:
+    case EXECUTION_STATES.RETRYING:
+      return TASK_STATES.TOOL_WORK_STARTED;
+    case EXECUTION_STATES.WAITING:
+      return TASK_STATES.IN_PROGRESS;
+    case EXECUTION_STATES.RECOVERY_REQUIRED:
+      return TASK_STATES.RECOVERY_REQUIRED;
+    case EXECUTION_STATES.COMPLETED:
+      return TASK_STATES.COMPLETED;
+    case EXECUTION_STATES.CANCELLED:
+    case EXECUTION_STATES.EXPIRED:
+    case EXECUTION_STATES.FAILED:
+      return TASK_STATES.FAILED;
+    default:
+      return null;
+  }
+}
+
+function taskStateFromArtifactVerification(verificationState, currentState) {
+  if (verificationState === ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    return TASK_STATES.ARTIFACT_VERIFIED;
+  }
+  if (verificationState === ARTIFACT_VERIFICATION_STATES.REJECTED) {
+    if (currentState === TASK_STATES.ARTIFACT_CREATED || currentState === TASK_STATES.ARTIFACT_VERIFIED) {
+      return TASK_STATES.PARTIALLY_COMPLETED;
+    }
+    return TASK_STATES.FAILED;
+  }
+  if (verificationState === ARTIFACT_VERIFICATION_STATES.PENDING) {
+    return TASK_STATES.ARTIFACT_CREATED;
+  }
+  return null;
+}
+
+function transitionTaskTx(db, taskId, nextState, options = {}) {
+  const current = db.prepare('SELECT * FROM tasks WHERE task_id = ? LIMIT 1');
+  current.bind([taskId]);
+  let currentRow = null;
+  if (current.step()) {
+    currentRow = current.getAsObject();
+  }
+  current.free();
+  if (!currentRow) {
+    throw new Error(`Task not found: ${taskId}`);
+  }
+
+  const task = hydrateTaskRow(currentRow);
+  if (task.current_state === nextState) {
+    return task;
+  }
+  if (TASK_TERMINAL_STATES.has(task.current_state)) {
+    return task;
+  }
+
+  assertLegalTaskTransition(task.current_state, nextState);
+  const timestamp = options.timestamp || getTimestamp();
+  const update = db.prepare(`
+    UPDATE tasks
+    SET current_state = ?,
+        updated_at = ?,
+        last_request_id = ?,
+        recovery_reason = ?,
+        recovery_notes = ?,
+        first_execution_id = CASE
+          WHEN first_execution_id IS NULL THEN ?
+          ELSE first_execution_id
+        END,
+        last_execution_id = COALESCE(?, last_execution_id),
+        completed_execution_id = CASE WHEN ? = ? THEN COALESCE(?, completed_execution_id) ELSE completed_execution_id END
+    WHERE task_id = ?
+  `);
+  update.run([
+    nextState,
+    timestamp,
+    options.requestId || task.last_request_id || '',
+    options.recoveryReason === undefined ? (nextState === TASK_STATES.RECOVERY_REQUIRED ? (task.recovery_reason || options.reasonCode || 'task_recovery_required') : null) : options.recoveryReason,
+    options.recoveryNotes === undefined ? (nextState === TASK_STATES.RECOVERY_REQUIRED ? (options.notes || task.recovery_notes || null) : null) : options.recoveryNotes,
+    options.executionId || null,
+    options.executionId || null,
+    nextState,
+    TASK_STATES.COMPLETED,
+    options.executionId || null,
+    taskId,
+  ]);
+  update.free();
+
+  appendTaskEventTx(db, {
+    task_id: taskId,
+    execution_id: options.executionId || null,
+    previous_state: task.current_state,
+    new_state: nextState,
+    timestamp,
+    actor_source: options.actorSource || 'runtime',
+    reason_code: options.reasonCode || 'task_state_transition',
+    request_id: options.requestId || null,
+    notes: options.notes || null,
+  });
+
+  const progressSpec = getTaskProgressSpec(task.current_state, nextState, {
+    message: options.message || options.notes || '',
+    requiresUserInput: Boolean(options.requiresUserInput),
+    blockedForInput: nextState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED,
+  });
+  if (progressSpec) {
+    appendTaskProgressEventTx(db, {
+      task_id: taskId,
+      execution_id: options.executionId || null,
+      previous_state: task.current_state,
+      new_state: nextState,
+      progress_category: progressSpec.category,
+      decision: progressSpec.decision,
+      message_text: options.message || progressSpec.message,
+      requires_user_input: progressSpec.requiresUserInput,
+      source: options.actorSource || 'runtime',
+      reason_code: options.reasonCode || 'task_progress_transition',
+      created_at: timestamp,
+    });
+  }
+
+  if ([TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED, TASK_STATES.FAILED].includes(nextState)) {
+    void recordToolFailureObservationTx(db, {
+      subjectType: 'task',
+      subjectId: taskId,
+      taskId,
+      executionId: options.executionId || null,
+      taskState: nextState,
+      reasonCode: options.reasonCode || 'task_state_transition',
+      recoveryReason: options.recoveryReason || null,
+      notes: options.notes || options.recoveryNotes || null,
+      source: options.actorSource || 'runtime',
+      requiresHumanInput: nextState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED,
+      blockedForInput: nextState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED,
+      status: nextState === TASK_STATES.FAILED ? 'failed' : 'interrupted',
+    });
+  }
+
+  if ([TASK_STATES.COMPLETED, TASK_STATES.FAILED, TASK_STATES.PARTIALLY_COMPLETED, TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED, TASK_STATES.RECOVERY_REQUIRED].includes(nextState)) {
+    syncTaskCompletionSummaryTx(db, taskId, {
+      executionId: options.executionId || null,
+      reasonCode: options.reasonCode || 'task_completion_summary_updated',
+      timestamp,
+    });
+  }
+
+  refreshTaskNotificationProfileTx(db, taskId, {
+    currentState: nextState,
+    classifiedAt: timestamp,
+  });
+
+  return {
+    ...task,
+    current_state: nextState,
+    updated_at: timestamp,
+    last_request_id: options.requestId || task.last_request_id || '',
+    recovery_reason: nextState === TASK_STATES.RECOVERY_REQUIRED
+      ? (options.recoveryReason === undefined ? (task.recovery_reason || options.reasonCode || 'task_recovery_required') : options.recoveryReason)
+      : null,
+    recovery_notes: nextState === TASK_STATES.RECOVERY_REQUIRED
+      ? (options.recoveryNotes === undefined ? (options.notes || task.recovery_notes || null) : options.recoveryNotes)
+      : null,
+    first_execution_id: options.executionId || task.first_execution_id || null,
+    last_execution_id: options.executionId || task.last_execution_id || null,
+    completed_execution_id: nextState === TASK_STATES.COMPLETED ? (options.executionId || task.completed_execution_id || null) : task.completed_execution_id,
+  };
+}
+
+async function transitionTask(taskId, nextState, options = {}) {
+  return withBillingWrite(async (db) => transitionTaskTx(db, taskId, nextState, options));
+}
+
+function syncTaskStateForExecutionTx(db, execution, nextExecutionState, options = {}) {
+  const taskId = String(execution?.task_id || options.taskId || '');
+  if (!taskId) {
+    return null;
+  }
+  const nextTaskState = taskStateFromExecutionState(nextExecutionState);
+  if (!nextTaskState) {
+    return null;
+  }
+  return transitionTaskTx(db, taskId, nextTaskState, {
+    executionId: execution.execution_id,
+    requestId: options.requestId || execution.last_request_id || null,
+    actorSource: options.actorSource || 'runtime',
+    reasonCode: options.reasonCode || 'execution_state_sync',
+    notes: options.notes || null,
+    recoveryReason: options.recoveryReason,
+    recoveryNotes: options.recoveryNotes,
+    timestamp: options.timestamp || getTimestamp(),
+  });
+}
+
+function syncTaskStateForArtifactTx(db, executionId, verificationState, options = {}) {
+  const currentStmt = db.prepare('SELECT task_id FROM executions WHERE execution_id = ? LIMIT 1');
+  currentStmt.bind([executionId]);
+  let taskId = '';
+  if (currentStmt.step()) {
+    taskId = String(currentStmt.getAsObject().task_id || '');
+  }
+  currentStmt.free();
+  if (!taskId) {
+    return null;
+  }
+  const taskCurrentStmt = db.prepare('SELECT current_state FROM tasks WHERE task_id = ? LIMIT 1');
+  taskCurrentStmt.bind([taskId]);
+  let currentTaskState = String(options.currentTaskState || '');
+  if (taskCurrentStmt.step()) {
+    currentTaskState = String(taskCurrentStmt.getAsObject().current_state || currentTaskState || '');
+  }
+  taskCurrentStmt.free();
+  const taskState = taskStateFromArtifactVerification(verificationState, currentTaskState || '');
+  if (!taskState) {
+    return null;
+  }
+  return transitionTaskTx(db, taskId, taskState, {
+    executionId,
+    requestId: options.requestId || null,
+    actorSource: options.actorSource || 'runtime',
+    reasonCode: options.reasonCode || 'artifact_state_sync',
+    notes: options.notes || null,
+    timestamp: options.timestamp || getTimestamp(),
+  });
+}
+
+function normalizeArtifactTextSample(text, limit = 8192) {
+  return String(text || '').replace(/\0/g, '').slice(0, limit);
+}
+
+function tokenizeTaskObjective(text = '') {
+  return String(text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4 && !['this', 'that', 'with', 'from', 'have', 'into', 'your', 'need', 'using', 'create', 'build', 'make', 'page'].includes(token));
+}
+
+function inferArtifactFamily(taskObjectiveText = '', declaredPath = '', content = '', completionText = '') {
+  const haystack = [
+    taskObjectiveText,
+    declaredPath,
+    content.slice(0, 2048),
+    completionText,
+  ].join('\n').toLowerCase();
+
+  if (/\b(component|tsx|jsx|react|frontend)\b/.test(haystack) || /\.(tsx|jsx)$/i.test(declaredPath)) {
+    return 'component';
+  }
+  if (/\b(markdown|md|brief|summary|report|notes)\b/.test(haystack) || /\.md$/i.test(declaredPath)) {
+    return 'markdown';
+  }
+  if (/\b(json|manifest|config)\b/.test(haystack) || /\.json$/i.test(declaredPath)) {
+    return 'json';
+  }
+  if (/\b(html|website|landing page|site|webpage)\b/.test(haystack) || /\.html?$/i.test(declaredPath)) {
+    return 'html';
+  }
+  return 'text';
+}
+
+function countMatches(patterns, content) {
+  let count = 0;
+  for (const pattern of patterns) {
+    if (pattern.test(content)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function classifyArtifactStructure(family, content, declaredPath = '') {
+  const text = normalizeArtifactTextSample(content);
+  const lower = text.toLowerCase();
+  if (!text) {
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.MISSING, reason: 'artifact_missing' };
+  }
+
+  if (family === 'html') {
+    const validSignals = countMatches([
+      /<!doctype html/i,
+      /<html[\s>]/i,
+      /<body[\s>]/i,
+    ], text);
+    const blockSignals = countMatches([
+      /<header[\s>]/i,
+      /<main[\s>]/i,
+      /<section[\s>]/i,
+      /<article[\s>]/i,
+      /<footer[\s>]/i,
+      /<nav[\s>]/i,
+      /<button[\s>]/i,
+      /<form[\s>]/i,
+      /<h1[\s>]/i,
+      /<h2[\s>]/i,
+    ], text);
+    if (validSignals >= 2 && blockSignals >= 2) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'html_document_structured' };
+    }
+    if (validSignals >= 1 || blockSignals >= 2) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'html_document_partial' };
+    }
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'html_document_invalid' };
+  }
+
+  if (family === 'markdown') {
+    const headingSignals = countMatches([
+      /^#\s+/m,
+      /^##\s+/m,
+      /^###\s+/m,
+    ], text);
+    const listSignals = countMatches([
+      /^-\s+/m,
+      /^\*\s+/m,
+      /^\d+\.\s+/m,
+    ], text);
+    if (headingSignals >= 1 && listSignals >= 1 && lower.length >= 120) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'markdown_document_structured' };
+    }
+    if (headingSignals >= 1 || listSignals >= 1 || lower.length >= 80) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'markdown_document_partial' };
+    }
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'markdown_document_invalid' };
+  }
+
+  if (family === 'component') {
+    const exportSignals = countMatches([
+      /export\s+default/i,
+      /export\s+\{/i,
+      /function\s+[A-Z][A-Za-z0-9_]*/i,
+      /const\s+[A-Z][A-Za-z0-9_]*\s*=\s*\(/i,
+    ], text);
+    const jsxSignals = countMatches([
+      /<([A-Z][A-Za-z0-9_]*|div|section|main|article|header|footer|button|span|p|h1|h2|h3)\b/i,
+      /return\s*\(/i,
+    ], text);
+    if (exportSignals >= 1 && jsxSignals >= 2) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'component_structured' };
+    }
+    if (exportSignals >= 1 || jsxSignals >= 1) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'component_partial' };
+    }
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'component_invalid' };
+  }
+
+  if (family === 'json') {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && (Array.isArray(parsed) ? parsed.length > 0 : Object.keys(parsed).length > 0)) {
+        return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'json_structured' };
+      }
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'json_empty' };
+    } catch (error) {
+      return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'json_invalid' };
+    }
+  }
+
+  if (lower.length >= 240 && (/\n#{1,3}\s+/m.test(text) || /\n[-*]\s+/m.test(text) || /\n\d+\.\s+/m.test(text))) {
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'text_structured' };
+  }
+  if (lower.length >= 100) {
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'text_partial' };
+  }
+  return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'text_invalid' };
+}
+
+function classifyArtifactAlignment(family, objectiveText = '', content = '', completionText = '', structure = null) {
+  const objectiveTokens = tokenizeTaskObjective(objectiveText);
+  const haystack = normalizeArtifactTextSample([objectiveText, content, completionText].join('\n')).toLowerCase();
+  const keywordHits = objectiveTokens.filter((token) => haystack.includes(token)).length;
+  const familyExpectationMatches = {
+    html: /\b(html|website|landing page|site|webpage)\b/i.test(objectiveText),
+    markdown: /\b(markdown|brief|summary|report|notes)\b/i.test(objectiveText),
+    component: /\b(component|frontend|react|tsx|jsx|section)\b/i.test(objectiveText),
+    json: /\b(json|manifest|config)\b/i.test(objectiveText),
+    text: /\b(summary|inspection|report|notes)\b/i.test(objectiveText),
+  };
+
+  const familyMatches = Boolean(familyExpectationMatches[family]) || family === 'text';
+
+  if (!content) {
+    return { state: TASK_ARTIFACT_ALIGNMENT_STATES.MISSING, reason: 'artifact_missing' };
+  }
+
+  if (structure && structure.state === TASK_ARTIFACT_STRUCTURE_STATES.INVALID) {
+    return { state: TASK_ARTIFACT_ALIGNMENT_STATES.MISMATCH, reason: 'structure_invalid' };
+  }
+
+  if (familyMatches && keywordHits >= 2) {
+    return { state: TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED, reason: 'objective_keywords_present' };
+  }
+
+  if (familyMatches || keywordHits >= 1) {
+    return { state: TASK_ARTIFACT_ALIGNMENT_STATES.PARTIAL, reason: 'objective_partially_represented' };
+  }
+
+  return { state: TASK_ARTIFACT_ALIGNMENT_STATES.MISMATCH, reason: 'objective_mismatch' };
+}
+
+function scoreTaskArtifactConfidence(artifactExists, verificationState, structureState, alignmentState) {
+  let score = 0;
+  if (artifactExists) {
+    score += 20;
+  }
+  if (verificationState === ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    score += 25;
+  } else if (verificationState === ARTIFACT_VERIFICATION_STATES.REJECTED) {
+    score += 0;
+  } else if (verificationState === ARTIFACT_VERIFICATION_STATES.PENDING) {
+    score += 10;
+  }
+
+  if (structureState === TASK_ARTIFACT_STRUCTURE_STATES.VALID) {
+    score += 25;
+  } else if (structureState === TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL) {
+    score += 12;
+  }
+
+  if (alignmentState === TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED) {
+    score += 30;
+  } else if (alignmentState === TASK_ARTIFACT_ALIGNMENT_STATES.PARTIAL) {
+    score += 15;
+  }
+
+  return Math.max(0, Math.min(100, score));
+}
+
+function bandTaskArtifactConfidence(score) {
+  if (score >= 80) {
+    return TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH;
+  }
+  if (score >= 45) {
+    return TASK_ARTIFACT_CONFIDENCE_BANDS.MEDIUM;
+  }
+  return TASK_ARTIFACT_CONFIDENCE_BANDS.LOW;
+}
+
+function normalizeFailureDetail(detail = '') {
+  if (!detail) {
+    return '';
+  }
+  if (typeof detail === 'string') {
+    return detail.slice(0, 2048);
+  }
+  try {
+    return JSON.stringify(detail).slice(0, 2048);
+  } catch (error) {
+    return String(detail).slice(0, 2048);
+  }
+}
+
+function classifyToolFailureObservation(observation = {}) {
+  const status = String(observation.status || '').toLowerCase();
+  const errorCode = String(observation.errorCode || observation.reasonCode || '').toLowerCase();
+  const reasonCode = String(observation.reasonCode || observation.errorCode || '').toLowerCase();
+  const recoveryReason = String(observation.recoveryReason || '').toLowerCase();
+  const executionState = String(observation.executionState || '').toLowerCase();
+  const taskState = String(observation.taskState || '').toLowerCase();
+  const artifactReason = String(observation.artifactReason || '').toLowerCase();
+  const budgetReason = String(observation.budgetRejectionReason || observation.budgetReason || '').toLowerCase();
+  const artifactVerificationState = String(observation.artifactVerificationState || '').toLowerCase();
+  const artifactExists = Boolean(observation.artifactExists);
+  const meaningfulOutputStarted = Boolean(observation.meaningfulOutputStarted);
+  const requiresHumanInput = Boolean(observation.requiresHumanInput);
+  const blockedForInput = Boolean(observation.blockedForInput);
+
+  if (blockedForInput || taskState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED) {
+    if (recoveryReason.includes('recovery') || reasonCode.includes('recovery')) {
+      return {
+        category: TOOL_FAILURE_CATEGORIES.RECOVERY_BLOCKED,
+        scope: TOOL_FAILURE_SCOPES.TASK,
+        stage: taskState || 'blocked_human_input_required',
+      };
+    }
+    return {
+      category: TOOL_FAILURE_CATEGORIES.BLOCKED_FOR_INPUT,
+      scope: TOOL_FAILURE_SCOPES.TASK,
+      stage: taskState || 'blocked_human_input_required',
+    };
+  }
+
+  if (requiresHumanInput) {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.USER_CONFIRMATION_WAITING,
+      scope: TOOL_FAILURE_SCOPES.TASK,
+      stage: taskState || executionState || 'human_input_wait',
+    };
+  }
+
+  if (budgetReason === 'context_window_exceeded' || budgetReason === 'reserved_output_exceeded' || reasonCode === 'downstream_context_overflow' || reasonCode === 'context_window_exceeded' || errorCode === 'context_window_exceeded' || errorCode === 'reserved_output_exceeded' || errorCode === 'downstream_context_overflow' || errorCode === 'pressure_over_limit') {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.CONTEXT_COLLAPSED,
+      scope: TOOL_FAILURE_SCOPES.CONTEXT,
+      stage: executionState || 'budget_gate',
+    };
+  }
+
+  if (artifactReason === 'artifact_claim_without_evidence' || artifactReason === 'status_claim_unverified') {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.STATUS_CLAIM_UNVERIFIED,
+      scope: TOOL_FAILURE_SCOPES.ARTIFACT,
+      stage: 'artifact_verification',
+    };
+  }
+
+  if (['terminal_payload_missing', 'empty_terminal_response'].includes(reasonCode)) {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.TERMINAL_PAYLOAD_MISSING,
+      scope: TOOL_FAILURE_SCOPES.EXECUTION,
+      stage: executionState || taskState || 'execution_finalization',
+    };
+  }
+
+  if ([
+    'artifact_path_not_found',
+    'artifact_workspace_missing',
+    'artifact_workspace_roots_unconfigured',
+    'artifact_path_outside_workspace',
+    'artifact_path_ambiguous_workspace',
+    'artifact_not_nonempty_file',
+    'artifact_delivery_not_confirmed',
+    'artifact_missing',
+  ].includes(artifactReason)) {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.ARTIFACT_MISSING,
+      scope: TOOL_FAILURE_SCOPES.ARTIFACT,
+      stage: 'artifact_verification',
+    };
+  }
+
+  if ([
+    'artifact_verification_failed',
+    'artifact_claim_without_evidence',
+    'artifact_rejected',
+    'artifact_invalid',
+    'artifact_output_invalid',
+    'artifact_claim_rejected',
+  ].includes(artifactReason) || artifactVerificationState === ARTIFACT_VERIFICATION_STATES.REJECTED) {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.TOOL_OUTPUT_INVALID,
+      scope: TOOL_FAILURE_SCOPES.ARTIFACT,
+      stage: 'artifact_verification',
+    };
+  }
+
+  if ([
+    'client_disconnect',
+    'ambiguous_live_interruption',
+    'ambiguous_stream_interruption',
+    'upstream_timeout',
+    'stream_proxy_failed',
+  ].includes(reasonCode) || status === 'interrupted' || executionState === EXECUTION_STATES.RECOVERY_REQUIRED) {
+    if (!meaningfulOutputStarted) {
+      return {
+        category: TOOL_FAILURE_CATEGORIES.TOOL_NOT_INVOKED,
+        scope: TOOL_FAILURE_SCOPES.TOOL,
+        stage: executionState || 'execution_finalization',
+      };
+    }
+    return {
+      category: TOOL_FAILURE_CATEGORIES.EXECUTION_INTERRUPTED,
+      scope: TOOL_FAILURE_SCOPES.EXECUTION,
+      stage: executionState || 'execution_finalization',
+    };
+  }
+
+  if ([
+    'provider_not_configured',
+    'upstream_unreachable',
+    'upstream_error',
+    'upstream_invalid_response',
+    'stream_proxy_failed',
+    'upstream_timeout',
+    'rate_limit_exceeded',
+  ].includes(errorCode)) {
+    if (!meaningfulOutputStarted) {
+      return {
+        category: TOOL_FAILURE_CATEGORIES.TOOL_NOT_INVOKED,
+        scope: TOOL_FAILURE_SCOPES.TOOL,
+        stage: executionState || 'upstream_call',
+      };
+    }
+    return {
+      category: TOOL_FAILURE_CATEGORIES.TOOL_INVOCATION_FAILED,
+      scope: TOOL_FAILURE_SCOPES.TOOL,
+      stage: executionState || 'upstream_call',
+    };
+  }
+
+  if (artifactExists && (
+    observation.confidenceBand === TASK_ARTIFACT_CONFIDENCE_BANDS.MEDIUM
+    || observation.confidenceBand === TASK_ARTIFACT_CONFIDENCE_BANDS.LOW
+    || observation.structureState === TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL
+    || observation.alignmentState === TASK_ARTIFACT_ALIGNMENT_STATES.PARTIAL
+    || observation.alignmentState === TASK_ARTIFACT_ALIGNMENT_STATES.MISMATCH
+  )) {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.ARTIFACT_PARTIAL,
+      scope: TOOL_FAILURE_SCOPES.ARTIFACT,
+      stage: 'artifact_assessment',
+    };
+  }
+
+  if (!artifactExists && (reasonCode === 'artifact_missing' || reasonCode === 'artifact_confidence_updated')) {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.ARTIFACT_MISSING,
+      scope: TOOL_FAILURE_SCOPES.ARTIFACT,
+      stage: 'artifact_assessment',
+    };
+  }
+
+  if (!meaningfulOutputStarted && status === 'failed') {
+    return {
+      category: TOOL_FAILURE_CATEGORIES.TOOL_NOT_INVOKED,
+      scope: TOOL_FAILURE_SCOPES.TOOL,
+      stage: executionState || 'execution_finalization',
+    };
+  }
+
+  return {
+    category: TOOL_FAILURE_CATEGORIES.TOOL_OUTPUT_INVALID,
+    scope: TOOL_FAILURE_SCOPES.TOOL,
+    stage: executionState || taskState || 'unknown',
+  };
+}
+
+async function appendToolFailureFactTx(db, fact = {}) {
+  const timestamp = fact.created_at || fact.timestamp || getTimestamp();
+  const failureFactId = fact.failure_fact_id || createToolFailureFactId();
+  const insert = db.prepare(`
+    INSERT INTO tool_failure_facts (
+      failure_fact_id, subject_type, subject_id, task_id, execution_id, failure_category, failure_scope,
+      failure_stage, source, reason_code, detail, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    failureFactId,
+    fact.subject_type,
+    fact.subject_id,
+    fact.task_id || null,
+    fact.execution_id || null,
+    fact.failure_category,
+    fact.failure_scope,
+    fact.failure_stage || '',
+    fact.source || 'runtime',
+    fact.reason_code || '',
+    normalizeFailureDetail(fact.detail || ''),
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+  return getStoredToolFailureFactBySubjectId(db, fact.subject_type, fact.subject_id);
+}
+
+async function appendToolFailureFact(fact = {}) {
+  return withBillingWrite(async (db) => appendToolFailureFactTx(db, fact));
+}
+
+async function recordToolFailureObservationTx(db, options = {}) {
+  const subjectType = String(options.subjectType || 'execution');
+  const subjectId = String(options.subjectId || options.executionId || options.taskId || '');
+  if (!subjectId) {
+    return null;
+  }
+
+  const observation = classifyToolFailureObservation(options);
+  const detail = options.detail || options.notes || options.reasonCode || options.errorCode || '';
+  return appendToolFailureFactTx(db, {
+    subject_type: subjectType,
+    subject_id: subjectId,
+    task_id: options.taskId || null,
+    execution_id: options.executionId || null,
+    failure_category: observation.category,
+    failure_scope: observation.scope,
+    failure_stage: observation.stage,
+    source: options.source || 'runtime',
+    reason_code: options.reasonCode || options.errorCode || '',
+    detail,
+    timestamp: options.timestamp || getTimestamp(),
+  });
+}
+
+async function recordToolFailureObservation(options = {}) {
+  return withBillingWrite(async (db) => recordToolFailureObservationTx(db, options));
+}
+
+async function syncTaskArtifactAssessmentTx(db, executionId, options = {}) {
+  const execution = await getStoredExecutionById(db, executionId);
+  if (!execution || !execution.task_id) {
+    return null;
+  }
+
+  const task = await getStoredTaskById(db, execution.task_id);
+  const artifact = await getStoredExecutionArtifactByExecutionId(db, executionId);
+  if (!task || !artifact) {
+    return null;
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  let artifactExists = 0;
+  let artifactContent = '';
+  let structureState = TASK_ARTIFACT_STRUCTURE_STATES.MISSING;
+  let alignmentState = TASK_ARTIFACT_ALIGNMENT_STATES.MISSING;
+  let artifactFamily = 'unknown';
+  let reasonCode = options.reasonCode || 'artifact_confidence_updated';
+  const notes = {
+    artifact_id: artifact.artifact_id || '',
+    declared_path: artifact.declared_path || '',
+    canonical_path: artifact.canonical_path || '',
+    objective_text: task.objective_text || '',
+    verification_state: artifact.verification_state || '',
+    evidence_reason: '',
+    structure_reason: '',
+    alignment_reason: '',
+    keyword_hits: 0,
+  };
+
+  try {
+    if (artifact.declared_path && fs.existsSync(artifact.declared_path)) {
+      const stats = fs.statSync(artifact.declared_path);
+      if (stats.isFile() && Number(stats.size || 0) > 0) {
+        artifactExists = 1;
+        artifactContent = normalizeArtifactTextSample(fs.readFileSync(artifact.declared_path, 'utf8'));
+        notes.evidence_reason = 'artifact_exists';
+      } else {
+        notes.evidence_reason = 'artifact_not_nonempty_file';
+      }
+    } else {
+      notes.evidence_reason = 'artifact_path_not_found';
+    }
+  } catch (error) {
+    notes.evidence_reason = error?.code || error?.message || 'artifact_read_failed';
+  }
+
+  artifactFamily = inferArtifactFamily(task.objective_text || '', artifact.declared_path || '', artifactContent, options.completionText || '');
+  const structure = classifyArtifactStructure(artifactFamily, artifactContent, artifact.declared_path || '');
+  structureState = structure.state;
+  notes.structure_reason = structure.reason;
+
+  const alignment = classifyArtifactAlignment(artifactFamily, task.objective_text || '', artifactContent, options.completionText || '', structure);
+  alignmentState = alignment.state;
+  notes.alignment_reason = alignment.reason;
+  notes.keyword_hits = tokenizeTaskObjective(task.objective_text || '').filter((token) => artifactContent.toLowerCase().includes(token)).length;
+
+  if (!artifactExists) {
+    reasonCode = reasonCode || 'artifact_missing';
+  } else if (artifact.verification_state === ARTIFACT_VERIFICATION_STATES.REJECTED) {
+    reasonCode = reasonCode || 'artifact_rejected';
+  } else if (artifact.verification_state === ARTIFACT_VERIFICATION_STATES.VERIFIED && structureState === TASK_ARTIFACT_STRUCTURE_STATES.VALID && alignmentState === TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED) {
+    reasonCode = reasonCode || 'artifact_verified_and_aligned';
+  } else if (structureState === TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL || alignmentState === TASK_ARTIFACT_ALIGNMENT_STATES.PARTIAL) {
+    reasonCode = reasonCode || 'artifact_partial_confidence';
+  } else {
+    reasonCode = reasonCode || 'artifact_confidence_updated';
+  }
+
+  const confidenceScore = scoreTaskArtifactConfidence(
+    artifactExists,
+    artifact.verification_state || ARTIFACT_VERIFICATION_STATES.PENDING,
+    structureState,
+    alignmentState,
+  );
+  const confidenceBand = bandTaskArtifactConfidence(confidenceScore);
+
+  const insert = db.prepare(`
+    INSERT INTO task_artifact_assessments (
+      assessment_id, task_id, session_id, execution_id, artifact_id, artifact_exists, artifact_verification_state,
+      artifact_family, structure_state, alignment_state, confidence_score, confidence_band, reason_code, notes,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      session_id = excluded.session_id,
+      execution_id = excluded.execution_id,
+      artifact_id = excluded.artifact_id,
+      artifact_exists = excluded.artifact_exists,
+      artifact_verification_state = excluded.artifact_verification_state,
+      artifact_family = excluded.artifact_family,
+      structure_state = excluded.structure_state,
+      alignment_state = excluded.alignment_state,
+      confidence_score = excluded.confidence_score,
+      confidence_band = excluded.confidence_band,
+      reason_code = excluded.reason_code,
+      notes = excluded.notes,
+      updated_at = excluded.updated_at
+  `);
+  insert.run([
+    createTaskArtifactAssessmentId(),
+    task.task_id,
+    task.session_id,
+    executionId,
+    artifact.artifact_id || null,
+    artifactExists,
+    artifact.verification_state || ARTIFACT_VERIFICATION_STATES.PENDING,
+    artifactFamily,
+    structureState,
+    alignmentState,
+    confidenceScore,
+    confidenceBand,
+    reasonCode,
+    JSON.stringify(notes),
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+
+  if (confidenceBand !== TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH) {
+    void recordToolFailureObservationTx(db, {
+      subjectType: 'task',
+      subjectId: task.task_id,
+      taskId: task.task_id,
+      executionId,
+      taskState: task.current_state,
+      reasonCode: reasonCode || 'artifact_confidence_updated',
+      artifactReason: reasonCode || '',
+      artifactVerificationState: artifact.verification_state || '',
+      artifactExists: Boolean(artifactExists),
+      confidenceBand,
+      structureState,
+      alignmentState,
+      notes: JSON.stringify(notes),
+      source: 'runtime',
+    });
+  }
+
+  return getStoredTaskArtifactAssessmentByTaskId(db, task.task_id);
 }
 
 function classifyProviderClass(descriptor) {
@@ -2943,12 +7889,13 @@ async function createExecutionRecord(options = {}) {
         const existing = hydrateExecutionRow(existingRow);
         const updateExisting = db.prepare(`
           UPDATE executions
-          SET updated_at = ?, last_request_id = ?
+          SET updated_at = ?, last_request_id = ?, task_id = COALESCE(task_id, ?)
           WHERE execution_id = ?
         `);
         updateExisting.run([
           options.timestamp || getTimestamp(),
           options.requestId || existing.last_request_id || '',
+          options.taskId || null,
           existing.execution_id,
         ]);
         updateExisting.free();
@@ -2957,6 +7904,7 @@ async function createExecutionRecord(options = {}) {
             ...existing,
             updated_at: options.timestamp || getTimestamp(),
             last_request_id: options.requestId || existing.last_request_id || '',
+            task_id: existing.task_id || options.taskId || null,
           },
           reused: true,
         };
@@ -2967,12 +7915,13 @@ async function createExecutionRecord(options = {}) {
     const timestamp = options.timestamp || getTimestamp();
     const insert = db.prepare(`
       INSERT INTO executions (
-        execution_id, session_id, current_state, created_at, updated_at, last_request_id, idempotency_key, workspace_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        execution_id, session_id, task_id, current_state, created_at, updated_at, last_request_id, idempotency_key, workspace_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     insert.run([
       executionId,
       sessionId,
+      options.taskId || null,
       EXECUTION_STATES.CREATED,
       timestamp,
       timestamp,
@@ -2997,6 +7946,7 @@ async function createExecutionRecord(options = {}) {
       execution: {
         execution_id: executionId,
         session_id: sessionId,
+        task_id: options.taskId || null,
         current_state: EXECUTION_STATES.CREATED,
         created_at: timestamp,
         updated_at: timestamp,
@@ -3049,6 +7999,39 @@ async function transitionExecution(executionId, nextState, options = {}) {
       request_id: options.requestId || null,
       notes: options.notes || null,
     });
+
+    syncTaskStateForExecutionTx(db, { ...current, task_id: current.task_id || null }, nextState, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'state_transition',
+      notes: options.notes || null,
+      recoveryReason: options.recoveryReason,
+      recoveryNotes: options.recoveryNotes,
+      timestamp,
+    });
+
+    if ([EXECUTION_STATES.FAILED, EXECUTION_STATES.RECOVERY_REQUIRED].includes(nextState)) {
+      void recordToolFailureObservationTx(db, {
+        subjectType: 'execution',
+        subjectId: executionId,
+        taskId: current.task_id || null,
+        executionId,
+        executionState: nextState,
+        reasonCode: options.reasonCode || 'state_transition',
+        recoveryReason: options.recoveryReason || null,
+        notes: options.notes || options.recoveryNotes || null,
+        source: options.actorSource || 'runtime',
+        meaningfulOutputStarted: Boolean(options.meaningfulOutputStarted),
+        artifactReason: options.artifactReason || '',
+        budgetRejectionReason: options.budgetRejectionReason || '',
+        artifactVerificationState: options.artifactVerificationState || '',
+        artifactExists: options.artifactExists,
+        confidenceBand: options.confidenceBand || '',
+        structureState: options.structureState || '',
+        alignmentState: options.alignmentState || '',
+        status: nextState === EXECUTION_STATES.RECOVERY_REQUIRED ? 'interrupted' : 'failed',
+      });
+    }
 
     return {
       ...current,
@@ -3370,6 +8353,37 @@ async function markExecutionRecoveryRequired(executionId, options = {}) {
       notes: options.recoveryNotes || options.notes || null,
     });
 
+    syncTaskStateForExecutionTx(db, { ...current, task_id: current.task_id || null }, EXECUTION_STATES.RECOVERY_REQUIRED, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'execution_recovery_required',
+      notes: options.recoveryNotes || options.notes || null,
+      recoveryReason: options.recoveryReason || options.reasonCode || 'task_recovery_required',
+      recoveryNotes: options.recoveryNotes || options.notes || null,
+      timestamp,
+    });
+
+    void recordToolFailureObservationTx(db, {
+      subjectType: 'execution',
+      subjectId: executionId,
+      taskId: current.task_id || null,
+      executionId,
+      executionState: EXECUTION_STATES.RECOVERY_REQUIRED,
+      reasonCode: options.reasonCode || 'execution_recovery_required',
+      recoveryReason: options.recoveryReason || options.reasonCode || 'task_recovery_required',
+      notes: options.recoveryNotes || options.notes || null,
+      source: options.actorSource || 'runtime',
+      meaningfulOutputStarted: Boolean(options.meaningfulOutputStarted),
+      artifactReason: options.artifactReason || '',
+      budgetRejectionReason: options.budgetRejectionReason || '',
+      artifactVerificationState: options.artifactVerificationState || '',
+      artifactExists: options.artifactExists,
+      confidenceBand: options.confidenceBand || '',
+      structureState: options.structureState || '',
+      alignmentState: options.alignmentState || '',
+      status: 'interrupted',
+    });
+
     appendExecutionLeaseEventTx(db, current, 'execution_lease_released', {
       timestamp,
       actorSource: options.actorSource || 'runtime',
@@ -3525,6 +8539,39 @@ async function transitionExecutionWithLease(executionId, nextState, options = {}
       request_id: options.requestId || null,
       notes: options.notes || null,
     });
+
+    syncTaskStateForExecutionTx(db, { ...current, task_id: current.task_id || null }, nextState, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'state_transition',
+      notes: options.notes || null,
+      recoveryReason: options.recoveryReason,
+      recoveryNotes: options.recoveryNotes,
+      timestamp,
+    });
+
+    if ([EXECUTION_STATES.FAILED, EXECUTION_STATES.RECOVERY_REQUIRED].includes(nextState)) {
+      void recordToolFailureObservationTx(db, {
+        subjectType: 'execution',
+        subjectId: executionId,
+        taskId: current.task_id || null,
+        executionId,
+        executionState: nextState,
+        reasonCode: options.reasonCode || 'state_transition',
+        recoveryReason: options.recoveryReason || null,
+        notes: options.notes || options.recoveryNotes || null,
+        source: options.actorSource || 'runtime',
+        meaningfulOutputStarted: Boolean(options.meaningfulOutputStarted),
+        artifactReason: options.artifactReason || '',
+        budgetRejectionReason: options.budgetRejectionReason || '',
+        artifactVerificationState: options.artifactVerificationState || '',
+        artifactExists: options.artifactExists,
+        confidenceBand: options.confidenceBand || '',
+        structureState: options.structureState || '',
+        alignmentState: options.alignmentState || '',
+        status: nextState === EXECUTION_STATES.RECOVERY_REQUIRED ? 'interrupted' : 'failed',
+      });
+    }
 
     if (clearLease && current.lease_id) {
       appendExecutionLeaseEventTx(db, current, 'execution_lease_released', {
@@ -3986,13 +9033,53 @@ async function getAdminRequests(filters = {}) {
 async function getAdminLiveKeys() {
   const db = await ensureBillingDb();
   const stmt = db.prepare(`
-    SELECT id, key, user_id, created_at, last_session_id, budget_limit
-    FROM live_keys
-    ORDER BY created_at DESC
+    SELECT
+      lk.id,
+      lk.key,
+      lk.user_id,
+      lk.created_at,
+      lk.last_session_id,
+      lk.budget_limit,
+      ldt.channel AS delivery_channel,
+      ldt.chat_id AS delivery_chat_id,
+      ldt.thread_id AS delivery_thread_id,
+      ldt.created_at AS delivery_created_at,
+      ldt.updated_at AS delivery_updated_at,
+      sdt.channel AS session_delivery_channel,
+      sdt.chat_id AS session_delivery_chat_id,
+      sdt.thread_id AS session_delivery_thread_id,
+      sdt.created_at AS session_delivery_created_at,
+      sdt.updated_at AS session_delivery_updated_at
+    FROM live_keys lk
+    LEFT JOIN live_key_delivery_targets ldt ON ldt.live_key_id = lk.id
+    LEFT JOIN session_delivery_targets sdt ON sdt.session_id = lk.last_session_id
+    ORDER BY lk.created_at DESC
   `);
   const rows = [];
   while (stmt.step()) {
     const row = stmt.getAsObject();
+    const deliveryTarget = row.delivery_chat_id || row.delivery_thread_id || row.delivery_channel
+      ? {
+          channel: String(row.delivery_channel || 'telegram'),
+          chat_id: String(row.delivery_chat_id || ''),
+          thread_id: row.delivery_thread_id === null || row.delivery_thread_id === undefined || row.delivery_thread_id === ''
+            ? null
+            : String(row.delivery_thread_id),
+          created_at: row.delivery_created_at ? String(row.delivery_created_at) : null,
+          updated_at: row.delivery_updated_at ? String(row.delivery_updated_at) : null,
+        }
+      : null;
+    const sessionDeliveryTarget = row.session_delivery_chat_id || row.session_delivery_thread_id || row.session_delivery_channel
+      ? {
+          channel: String(row.session_delivery_channel || 'telegram'),
+          chat_id: String(row.session_delivery_chat_id || ''),
+          thread_id: row.session_delivery_thread_id === null || row.session_delivery_thread_id === undefined || row.session_delivery_thread_id === ''
+            ? null
+            : String(row.session_delivery_thread_id),
+          created_at: row.session_delivery_created_at ? String(row.session_delivery_created_at) : null,
+          updated_at: row.session_delivery_updated_at ? String(row.session_delivery_updated_at) : null,
+        }
+      : null;
     rows.push({
       id: String(row.id || ''),
       key: String(row.key || ''),
@@ -4002,6 +9089,8 @@ async function getAdminLiveKeys() {
       budget_limit: row.budget_limit === null || row.budget_limit === undefined || row.budget_limit === ''
         ? null
         : Number(row.budget_limit),
+      delivery_target: deliveryTarget,
+      current_session_delivery_target: sessionDeliveryTarget,
     });
   }
   stmt.free();
@@ -4320,10 +9409,17 @@ function buildOpenClawConfigPayload(req, liveKey) {
       base_url: getSessionBaseUrl(req),
       api_key: liveKey.key,
     },
+    task_notifications: {
+      pull_path: '/v1/task-notifications/pull',
+      delivery_target_bind_path: '/v1/session/delivery-target',
+      delivered_path_template: '/v1/task-notifications/{id}/delivered',
+    },
     instructions: [
       'Set base_url in OpenClaw',
       'Paste API key',
       'Use model: managed',
+      'Bind the Telegram delivery target before polling task notifications',
+      'Poll /v1/task-notifications/pull for truthful task updates',
     ],
   };
 }
@@ -4699,6 +9795,131 @@ function normalizeResponsesResponseFromChat(payload, modelAlias) {
   };
 }
 
+function normalizeResponsesIncompleteResponseFromChat(payload, modelAlias, incompleteDetails = {}) {
+  return {
+    id: payload.id || `resp_${crypto.randomUUID()}`,
+    object: 'response',
+    created: Number.isFinite(payload.created) ? payload.created : Math.floor(Date.now() / 1000),
+    model: modelAlias,
+    status: 'incomplete',
+    incomplete_details: {
+      reason: 'terminal_payload_missing',
+      message: 'Managed response completed without a usable terminal payload',
+      ...incompleteDetails,
+    },
+    output: [],
+    usage: payload.usage,
+  };
+}
+
+function normalizeResponsesFallbackResponseFromChat(payload, modelAlias, fallbackText = '') {
+  return {
+    id: payload.id || `resp_${crypto.randomUUID()}`,
+    object: 'response',
+    created: Number.isFinite(payload.created) ? payload.created : Math.floor(Date.now() / 1000),
+    model: modelAlias,
+    output: [
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'output_text',
+            text: stringifyTextContent(fallbackText || ''),
+          },
+        ],
+      },
+    ],
+    usage: payload.usage,
+  };
+}
+
+function extractManagedRequestPromptText(reqBody = {}) {
+  const body = reqBody && typeof reqBody === 'object' ? reqBody : {};
+  const parts = [];
+
+  if (Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (!message || typeof message !== 'object') {
+        continue;
+      }
+      const role = String(message.role || '').toLowerCase();
+      const text = stringifyTextContent(message.content ?? message.text ?? message.value ?? '');
+      if (role === 'user' && text) {
+        parts.push(text);
+      }
+    }
+  }
+
+  if (parts.length === 0 && body.input !== undefined) {
+    const inputText = stringifyTextContent(body.input);
+    if (inputText) {
+      parts.push(inputText);
+    }
+  }
+
+  if (parts.length === 0 && body.instructions !== undefined) {
+    const instructionText = stringifyTextContent(body.instructions);
+    if (instructionText) {
+      parts.push(instructionText);
+    }
+  }
+
+  if (parts.length === 0 && Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (!message || typeof message !== 'object') {
+        continue;
+      }
+      const text = stringifyTextContent(message.content ?? message.text ?? message.value ?? '');
+      if (text) {
+        parts.push(text);
+      }
+    }
+  }
+
+  return parts.join('\n').trim();
+}
+
+function extractManagedArtifactFilename(promptText = '') {
+  const text = String(promptText || '');
+  const namedMatch = text.match(/\b(?:named|name|called)\s+([A-Za-z0-9._-]+\.(?:md|markdown|txt|json|csv|yaml|yml|html|js|ts|py))\b/i);
+  if (namedMatch) {
+    return namedMatch[1];
+  }
+
+  const directMatch = text.match(/\b([A-Za-z0-9._-]+\.(?:md|markdown|txt|json|csv|yaml|yml|html|js|ts|py))\b/i);
+  if (directMatch) {
+    return directMatch[1];
+  }
+
+  return '';
+}
+
+function shouldBuildManagedArtifactFallbackText(promptText = '') {
+  const normalized = String(promptText || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const createWords = /\b(create|write|generate|save|make|draft)\b/.test(normalized);
+  const artifactWords = /\b(file|markdown|document|artifact|note)\b/.test(normalized);
+  return Boolean(createWords && artifactWords);
+}
+
+function buildManagedTerminalFallbackText(reqBody = {}, options = {}) {
+  const promptText = extractManagedRequestPromptText(reqBody);
+  if (!shouldBuildManagedArtifactFallbackText(promptText)) {
+    return '';
+  }
+
+  const requestedFilename = extractManagedArtifactFilename(promptText);
+  const fallbackFilename = requestedFilename || 'requested-file.md';
+  const fallbackTitle = fallbackFilename.replace(/\.(md|markdown)$/i, '') || 'requested-file';
+  const introText = String(options.introText || '').trim() || `I couldn't verify creation of ${fallbackFilename}, but here is a markdown draft you can save manually:`;
+
+  return `${introText}\n\n\`\`\`md\n# ${fallbackTitle}\n\nI couldn't verify the file creation from this run.\n\`\`\``;
+}
+
 function getArtifactContractInput(reqBody = {}) {
   const body = reqBody && typeof reqBody === 'object' ? reqBody : {};
   return body?.metadata?.blockfork_artifact_contract || body?.blockfork_artifact_contract || null;
@@ -4834,6 +10055,34 @@ async function createExecutionArtifactRecord(options = {}) {
         executionId,
       ]);
       update.free();
+      syncTaskStateForArtifactTx(db, executionId, options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING, {
+        requestId: options.requestId || null,
+        actorSource: options.actorSource || 'runtime',
+        reasonCode: options.reasonCode || 'artifact_record_updated',
+        timestamp,
+      });
+      const updatedExecution = await getStoredExecutionById(db, executionId);
+      if (updatedExecution?.task_id && String(options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING) === ARTIFACT_VERIFICATION_STATES.PENDING) {
+        appendTaskProgressEventTx(db, {
+          task_id: updatedExecution.task_id,
+          execution_id: executionId,
+          previous_state: '',
+          new_state: TASK_STATES.ARTIFACT_CREATED,
+          progress_category: TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFICATION_STARTED,
+          decision: 'notify_user',
+          message_text: 'The artifact is in place and verification is starting.',
+          requires_user_input: 0,
+          source: options.actorSource || 'runtime',
+          reason_code: options.reasonCode || 'artifact_record_updated',
+          created_at: timestamp,
+        });
+      }
+      await syncTaskArtifactAssessmentTx(db, executionId, {
+        requestId: options.requestId || null,
+        actorSource: options.actorSource || 'runtime',
+        reasonCode: options.reasonCode || 'artifact_record_updated',
+        timestamp,
+      });
       return {
         ...current,
         declared_path: options.declaredPath,
@@ -4867,6 +10116,34 @@ async function createExecutionArtifactRecord(options = {}) {
       timestamp,
     ]);
     insert.free();
+    syncTaskStateForArtifactTx(db, executionId, options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'artifact_record_created',
+      timestamp,
+    });
+    const createdExecution = await getStoredExecutionById(db, executionId);
+    if (createdExecution?.task_id && String(options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING) === ARTIFACT_VERIFICATION_STATES.PENDING) {
+      appendTaskProgressEventTx(db, {
+        task_id: createdExecution.task_id,
+        execution_id: executionId,
+        previous_state: '',
+        new_state: TASK_STATES.ARTIFACT_CREATED,
+        progress_category: TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFICATION_STARTED,
+        decision: 'notify_user',
+        message_text: 'The artifact is in place and verification is starting.',
+        requires_user_input: 0,
+        source: options.actorSource || 'runtime',
+        reason_code: options.reasonCode || 'artifact_record_created',
+        created_at: timestamp,
+      });
+    }
+    await syncTaskArtifactAssessmentTx(db, executionId, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'artifact_record_created',
+      timestamp,
+    });
     return {
       artifact_id: artifactId,
       execution_id: executionId,
@@ -4913,6 +10190,19 @@ async function updateExecutionArtifactVerification(executionId, verificationStat
       executionId,
     ]);
     update.free();
+    syncTaskStateForArtifactTx(db, executionId, verificationState, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'artifact_verification_updated',
+      timestamp,
+    });
+    await syncTaskArtifactAssessmentTx(db, executionId, {
+      requestId: options.requestId || null,
+      actorSource: options.actorSource || 'runtime',
+      reasonCode: options.reasonCode || 'artifact_verification_updated',
+      completionText: options.completionText || '',
+      timestamp,
+    });
 
     return {
       ...current,
@@ -5038,6 +10328,7 @@ async function validateArtifactHonestyOrError(reqBody, completionText, options =
     if (options.executionId) {
       await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.REJECTED, {
         reasonCode: evidenceCheck.reason,
+        completionText,
       });
     }
     return {
@@ -5058,6 +10349,7 @@ async function validateArtifactHonestyOrError(reqBody, completionText, options =
     if (options.executionId) {
       await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.REJECTED, {
         reasonCode: 'artifact_claim_without_evidence',
+        completionText,
       });
     }
     return {
@@ -5077,6 +10369,7 @@ async function validateArtifactHonestyOrError(reqBody, completionText, options =
       deliveryConfirmed: evidenceCheck.delivery_confirmed,
       canonicalPath: evidenceCheck.canonical_path,
       declaredPath: evidenceCheck.declared_path,
+      completionText,
     });
   }
 
@@ -5095,6 +10388,69 @@ function buildResponseStreamObject(session, modelAlias, responseId, createdAt) {
     model: modelAlias,
     output: [],
     session_id: session.session_id,
+  };
+}
+
+function buildResponseCompletedStreamObject(session, modelAlias, responseId, createdAt, outputText, itemId = null) {
+  const messageItemId = itemId || `msg_${crypto.randomUUID()}`;
+  return {
+    ...buildResponseStreamObject(session, modelAlias, responseId, createdAt),
+    status: 'completed',
+    output: [
+      {
+        id: messageItemId,
+        status: 'completed',
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'output_text',
+            text: stringifyTextContent(outputText || ''),
+            annotations: [],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildResponseIncompleteStreamObject(session, modelAlias, responseId, createdAt, incompleteDetails = {}) {
+  return {
+    ...buildResponseStreamObject(session, modelAlias, responseId, createdAt),
+    status: 'incomplete',
+    incomplete_details: {
+      reason: 'terminal_payload_missing',
+      message: 'Managed response completed without a usable terminal payload',
+      ...incompleteDetails,
+    },
+  };
+}
+
+function buildManagedTerminalWireOutcome(session, modelAlias, responseId, createdAt, options = {}) {
+  const terminalIntegrityClassification = classifyManagedTerminalCompletionIntegrity(options);
+  if (!terminalIntegrityClassification) {
+    return null;
+  }
+
+  return {
+    classification: terminalIntegrityClassification,
+    eventType: 'response.incomplete',
+    response: buildResponseIncompleteStreamObject(session, modelAlias, responseId, createdAt, {
+      reason: terminalIntegrityClassification.reasonCode,
+      message: terminalIntegrityClassification.reasonDetail,
+    }),
+  };
+}
+
+function buildManagedTerminalFallbackWireOutcome(session, modelAlias, responseId, createdAt, fallbackText, itemId = null) {
+  const normalizedFallbackText = stringifyTextContent(fallbackText || '');
+  if (!normalizedFallbackText) {
+    return null;
+  }
+
+  return {
+    eventType: 'response.completed',
+    response: buildResponseCompletedStreamObject(session, modelAlias, responseId, createdAt, normalizedFallbackText, itemId),
   };
 }
 
@@ -5414,14 +10770,33 @@ async function executeChatFlow(session, body, options = {}) {
   }
 
   const requestId = createRequestId();
+  const taskObjectiveText = summarizeTaskObjectiveFromBody(body);
+  const taskObjectiveFingerprint = fingerprintTaskObjective(session.session_id, taskObjectiveText, String(options.idempotencyKey || ''));
+  const taskResult = await createTaskRecord({
+    sessionId: session.session_id,
+    requestId,
+    idempotencyKey: options.idempotencyKey || '',
+    objectiveText: taskObjectiveText,
+    objectiveFingerprint: taskObjectiveFingerprint,
+    actorSource: 'runtime',
+    reasonCode: 'task_received',
+  });
+  const task = taskResult.task;
   const executionResult = await createExecutionRecord({
     sessionId: session.session_id,
     requestId,
     idempotencyKey: options.idempotencyKey || '',
+    taskId: task.task_id,
     actorSource: 'runtime',
     reasonCode: 'request_admitted',
   });
   const execution = executionResult.execution;
+  await transitionTask(task.task_id, TASK_STATES.ACKNOWLEDGED, {
+    requestId,
+    executionId: execution.execution_id,
+    actorSource: 'runtime',
+    reasonCode: 'task_acknowledged',
+  });
   await transitionExecution(execution.execution_id, EXECUTION_STATES.QUEUED, {
     requestId,
     actorSource: 'runtime',
@@ -5616,6 +10991,7 @@ async function executeChatFlow(session, body, options = {}) {
       requestId,
       actorSource: 'runtime',
       reasonCode: budgetFit.rejectionReason,
+      budgetRejectionReason: budgetFit.rejectionReason,
       leaseId: executionLease.lease_id,
       leaseHolder: executionLease.lease_holder,
       leaseEpoch: executionLease.lease_epoch,
@@ -6414,7 +11790,23 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
     }
 
     state.billingFinalized = true;
-    let classification = classifyExecutionInterruption({
+    const verifiedArtifactAssessment = billing.execution_id
+      ? await getVerifiedTaskArtifactAssessmentForExecutionId(billing.execution_id)
+      : null;
+    const terminalIntegrityClassification = classifyManagedTerminalCompletionIntegrity({
+      status,
+      outputTextLength: state.text.length,
+      verifiedArtifactExists: Boolean(verifiedArtifactAssessment),
+    });
+    if (terminalIntegrityClassification && billing.execution_id) {
+      details = {
+        ...details,
+        errorCode: terminalIntegrityClassification.reasonCode,
+        notes: terminalIntegrityClassification.reasonDetail,
+      };
+    }
+
+    let classification = terminalIntegrityClassification || classifyExecutionInterruption({
       status,
       errorCode: details.errorCode || '',
       meaningfulOutputStarted: state.meaningfulOutputStarted,
@@ -6920,7 +12312,23 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
     }
 
     state.billingFinalized = true;
-    let classification = classifyExecutionInterruption({
+    const verifiedArtifactAssessment = billing.execution_id
+      ? await getVerifiedTaskArtifactAssessmentForExecutionId(billing.execution_id)
+      : null;
+    const terminalIntegrityClassification = classifyManagedTerminalCompletionIntegrity({
+      status,
+      outputTextLength: state.text.length,
+      verifiedArtifactExists: Boolean(verifiedArtifactAssessment),
+    });
+    if (terminalIntegrityClassification && billing.execution_id) {
+      details = {
+        ...details,
+        errorCode: terminalIntegrityClassification.reasonCode,
+        notes: terminalIntegrityClassification.reasonDetail,
+      };
+    }
+
+    let classification = terminalIntegrityClassification || classifyExecutionInterruption({
       status,
       errorCode: details.errorCode || '',
       meaningfulOutputStarted: state.meaningfulOutputStarted,
@@ -7233,7 +12641,7 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
     }
   });
 
-  upstream.body.on('end', () => {
+  upstream.body.on('end', async () => {
     clearTimeout(state.idleTimer);
 
     if (state.buffer) {
@@ -7264,6 +12672,108 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
 
     writeHeadersIfNeeded();
     sendCreatedIfNeeded();
+    let verifiedArtifactAssessment = null;
+    try {
+      verifiedArtifactAssessment = billing?.execution_id
+        ? await getVerifiedTaskArtifactAssessmentForExecutionId(billing.execution_id)
+        : null;
+    } catch (error) {
+      verifiedArtifactAssessment = null;
+    }
+    const terminalWireOutcome = buildManagedTerminalWireOutcome(session, responseAlias, state.responseId, state.createdAt, {
+      status: 'success',
+      outputTextLength: state.text.length,
+      verifiedArtifactExists: Boolean(verifiedArtifactAssessment),
+    });
+    const fallbackTerminalText = buildManagedTerminalFallbackText(retryOptions.originalBody || req.body || {});
+
+    if (terminalWireOutcome) {
+      if (fallbackTerminalText) {
+        incrementUsage(session, state.pendingTotalTokens);
+        state.completed = true;
+        sendOutputItemAddedIfNeeded();
+        sendContentPartAddedIfNeeded();
+        emit('response.output_text.done', {
+          item_id: state.itemId,
+          output_index: state.outputIndex,
+          content_index: state.contentIndex,
+          text: fallbackTerminalText,
+        });
+
+        emit('response.content_part.done', {
+          item_id: state.itemId,
+          output_index: state.outputIndex,
+          content_index: state.contentIndex,
+          part: {
+            type: 'output_text',
+            text: fallbackTerminalText,
+            annotations: [],
+          },
+        });
+
+        emit('response.output_item.done', {
+          output_index: state.outputIndex,
+          item: {
+            id: state.itemId,
+            status: 'completed',
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: fallbackTerminalText,
+                annotations: [],
+              },
+            ],
+          },
+        });
+
+        emit('response.completed', {
+          response: buildResponseCompletedStreamObject(session, responseAlias, state.responseId, state.createdAt, fallbackTerminalText, state.itemId),
+        });
+        void finalizeRequest('success', {
+          inputTokens: state.pendingInputTokens,
+          outputTokens: Math.max(0, state.pendingTotalTokens - state.pendingInputTokens),
+        });
+        logStreamDiagnostics(upstreamContext, {
+          stage: 'completed_fallback_terminal',
+          completed: true,
+          time_to_first_token_ms: state.firstTokenAt ? state.firstTokenAt - upstreamContext.started_at_ms : null,
+          partial_completion_state: {
+            pending_total_tokens: state.pendingTotalTokens,
+            buffered_bytes: Buffer.byteLength(state.buffer, 'utf8'),
+            output_text_length: fallbackTerminalText.length,
+            terminal_wire_event: 'response.completed',
+            fallback_reason: 'artifact_or_file_fallback',
+          },
+        });
+        res.end();
+        return;
+      }
+      incrementUsage(session, state.pendingTotalTokens);
+      state.completed = true;
+      emit(terminalWireOutcome.eventType, {
+        response: terminalWireOutcome.response,
+      });
+      void finalizeRequest('success', {
+        inputTokens: state.pendingInputTokens,
+        outputTokens: Math.max(0, state.pendingTotalTokens - state.pendingInputTokens),
+      });
+      logStreamDiagnostics(upstreamContext, {
+        stage: 'completed_incomplete_terminal',
+        completed: false,
+        partial_completion_state: {
+          pending_total_tokens: state.pendingTotalTokens,
+          buffered_bytes: Buffer.byteLength(state.buffer, 'utf8'),
+          output_text_length: state.text.length,
+          terminal_wire_event: terminalWireOutcome.eventType,
+          incomplete_reason: terminalWireOutcome.response.incomplete_details?.reason || 'terminal_payload_missing',
+        },
+      });
+      res.end();
+      return;
+    }
+
     sendOutputItemAddedIfNeeded();
     sendContentPartAddedIfNeeded();
 
@@ -7664,6 +13174,122 @@ async function handleResponsesCompatibility(req, res) {
   incrementUsage(req.session, payload?.usage?.total_tokens);
   const chatPayload = normalizeChatCompletionResponse(payload, PUBLIC_MODEL_ALIAS);
   const assistantText = stringifyTextContent(chatPayload?.choices?.[0]?.message?.content ?? '');
+  let verifiedArtifactAssessment = null;
+  try {
+    verifiedArtifactAssessment = billing?.execution_id
+      ? await getVerifiedTaskArtifactAssessmentForExecutionId(billing.execution_id)
+      : null;
+  } catch (error) {
+    verifiedArtifactAssessment = null;
+  }
+  const terminalIntegrityClassification = classifyManagedTerminalCompletionIntegrity({
+    status: 'success',
+    outputTextLength: assistantText.length,
+    verifiedArtifactExists: Boolean(verifiedArtifactAssessment),
+  });
+  const fallbackTerminalText = buildManagedTerminalFallbackText(translated.body || req.body || {});
+  if (terminalIntegrityClassification) {
+    if (fallbackTerminalText) {
+      if (billing?.reserved) {
+        await finalizeBillingRequest({
+          request_id: billing.request_id,
+          timestamp: getTimestamp(),
+          route: billing.route,
+          session_id: req.session.session_id,
+          execution_id: billing.execution_id || null,
+          primary_model: billing.primary_model || '',
+          model_used: billing.model_used,
+          input_tokens: usage.inputTokens || billing.input_tokens || 0,
+          output_tokens: usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0)),
+          estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor,
+            usage.inputTokens || billing.input_tokens || 0,
+            usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0))
+          ),
+          status: terminalIntegrityClassification.billingStatus,
+          fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+          failure_reason: billing.failure_reason || '',
+          endpoint: billing.endpoint || '',
+          error_code: terminalIntegrityClassification.reasonCode,
+          status_code: 200,
+          response_body: '',
+          reserved_cost_usd: billing.reserved_cost_usd,
+        });
+      }
+      if (billing?.execution_id) {
+        await markExecutionRecoveryRequired(billing.execution_id, {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+          reasonCode: terminalIntegrityClassification.reasonCode,
+          recoveryReason: terminalIntegrityClassification.recoveryReason,
+          recoveryNotes: terminalIntegrityClassification.reasonDetail,
+          leaseId: billing.execution_lease_id,
+          leaseHolder: billing.execution_lease_holder,
+          leaseEpoch: billing.execution_lease_epoch,
+        });
+      }
+      logRoutingDecision('response_served_fallback_terminal', {
+        route: 'responses',
+        served_by: served_by || 'primary',
+        session_id: req.session.session_id,
+        model_used: billing?.model_used || descriptor?.upstreamId || '',
+        fallback_output_text_length: fallbackTerminalText.length,
+        reason_code: terminalIntegrityClassification.reasonCode,
+      });
+      return res.status(200).json(
+        normalizeResponsesFallbackResponseFromChat(chatPayload, PUBLIC_MODEL_ALIAS, fallbackTerminalText)
+      );
+    }
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: usage.inputTokens || billing.input_tokens || 0,
+        output_tokens: usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0)),
+        estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor,
+          usage.inputTokens || billing.input_tokens || 0,
+          usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0))
+        ),
+        status: terminalIntegrityClassification.billingStatus,
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: billing.failure_reason || '',
+        endpoint: billing.endpoint || '',
+        error_code: terminalIntegrityClassification.reasonCode,
+        status_code: 200,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await markExecutionRecoveryRequired(billing.execution_id, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        reasonCode: terminalIntegrityClassification.reasonCode,
+        recoveryReason: terminalIntegrityClassification.recoveryReason,
+        recoveryNotes: terminalIntegrityClassification.reasonDetail,
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      });
+    }
+    logRoutingDecision('response_served_incomplete_terminal', {
+      route: 'responses',
+      served_by: served_by || 'primary',
+      session_id: req.session.session_id,
+      model_used: billing?.model_used || descriptor?.upstreamId || '',
+      reason_code: terminalIntegrityClassification.reasonCode,
+    });
+    return res.status(200).json(
+      normalizeResponsesIncompleteResponseFromChat(chatPayload, PUBLIC_MODEL_ALIAS, {
+        reason: terminalIntegrityClassification.reasonCode,
+        message: terminalIntegrityClassification.reasonDetail,
+      })
+    );
+  }
   const artifactError = await validateArtifactHonestyOrError(req.body, assistantText, {
     executionId: billing?.execution_id || '',
     requestId: billing?.request_id || '',
@@ -7835,6 +13461,108 @@ app.get('/admin/api/live-keys', requireAdminSecret, async (req, res) => {
   }
 });
 
+app.put('/admin/api/live-keys/:id/delivery-target', requireAdminSecret, async (req, res) => {
+  try {
+    const liveKeyId = String(req.params.id || '').trim();
+    const deliveryTarget = normalizeSessionDeliveryTargetInput(req.body || {});
+    const timestamp = getTimestamp();
+
+    const stored = await withBillingWrite(async (db) => {
+      const liveKey = await getStoredLiveKeyById(db, liveKeyId);
+      if (!liveKey) {
+        return null;
+      }
+
+      const liveKeyTarget = await upsertLiveKeyDeliveryTargetTx(db, liveKeyId, deliveryTarget, {
+        timestamp,
+      });
+
+      let sessionTarget = null;
+      if (String(liveKey.last_session_id || '')) {
+        sessionTarget = await upsertSessionDeliveryTargetTx(db, String(liveKey.last_session_id), deliveryTarget, {
+          timestamp,
+        });
+      }
+
+      return {
+        live_key_id: liveKeyId,
+        session_id: liveKey.last_session_id || null,
+        delivery_target: liveKeyTarget,
+        current_session_delivery_target: sessionTarget,
+      };
+    });
+
+    if (!stored) {
+      return sendError(res, 404, 'Live key not found', 'invalid_request_error', 'live_key_not_found');
+    }
+
+    return res.json({ data: stored });
+  } catch (error) {
+    console.error('Failed to bind live key delivery target', error);
+    return sendError(res, 400, error.message || 'Invalid delivery target', 'invalid_request_error', 'invalid_delivery_target');
+  }
+});
+
+app.get('/admin/api/openclaw-relays', requireAdminSecret, async (req, res) => {
+  try {
+    const relays = await listOpenClawRelayConfigs();
+    return res.json({
+      data: relays,
+      count: relays.length,
+    });
+  } catch (error) {
+    console.error('Failed to load OpenClaw relay configs', error);
+    return sendError(res, 500, 'Failed to load OpenClaw relay configs', 'runtime_error', 'openclaw_relay_load_failed');
+  }
+});
+
+app.get('/admin/api/openclaw-relays/:label', requireAdminSecret, async (req, res) => {
+  try {
+    const relayLabel = normalizeOpenClawRelayLabel(req.params.label);
+    const relay = await getOpenClawRelayConfigByLabel(relayLabel);
+    if (!relay) {
+      return sendError(res, 404, 'Relay config not found', 'invalid_request_error', 'openclaw_relay_not_found');
+    }
+    return res.json({ data: relay });
+  } catch (error) {
+    console.error('Failed to load OpenClaw relay config', error);
+    return sendError(res, 400, error.message || 'Invalid relay label', 'invalid_request_error', 'invalid_openclaw_relay_label');
+  }
+});
+
+app.put('/admin/api/openclaw-relays/:label', requireAdminSecret, async (req, res) => {
+  try {
+    const body = {
+      ...(req.body || {}),
+      relay_label: req.params.label,
+    };
+    const relay = await upsertOpenClawRelayConfig(body);
+    return res.json({ data: relay });
+  } catch (error) {
+    console.error('Failed to save OpenClaw relay config', error);
+    return sendError(res, 400, error.message || 'Invalid relay config', 'invalid_request_error', 'invalid_openclaw_relay_config');
+  }
+});
+
+app.post('/admin/api/openclaw-relays/:label/doctor', requireAdminSecret, async (req, res) => {
+  try {
+    const relayLabel = normalizeOpenClawRelayLabel(req.params.label);
+    const relay = await getOpenClawRelayConfigByLabel(relayLabel);
+    const payload = relay || normalizeOpenClawRelayConfigInput({
+      relay_label: relayLabel,
+      ...(req.body || {}),
+    });
+    const report = await runOpenClawRelayDoctor(payload, {
+      probe: Boolean(req.body?.probe),
+      timeoutMs: req.body?.timeout_ms,
+    });
+    return res.json({ data: report });
+  } catch (error) {
+    console.error('Failed to run OpenClaw relay doctor', error);
+    return sendError(res, 400, error.message || 'Invalid relay config', 'invalid_request_error', 'openclaw_relay_doctor_failed');
+  }
+});
+
 app.get('/admin/api/requests', requireAdminSecret, async (req, res) => {
   const requests = await getAdminRequests({
     sessionId: typeof req.query.session_id === 'string' ? req.query.session_id : '',
@@ -7849,6 +13577,66 @@ app.get('/admin/api/requests', requireAdminSecret, async (req, res) => {
     data: requests,
     count: requests.length,
   });
+});
+
+app.get('/admin/api/task-notifications', requireAdminSecret, async (req, res) => {
+  try {
+    const db = await ensureBillingDb();
+    const sessionId = typeof req.query.session_id === 'string' ? req.query.session_id.trim() : '';
+    const taskId = typeof req.query.task_id === 'string' ? req.query.task_id.trim() : '';
+    const deliveryState = typeof req.query.delivery_state === 'string' ? req.query.delivery_state.trim() : '';
+    const limit = Number.isFinite(Number(req.query.limit)) ? Math.max(1, Number(req.query.limit)) : 50;
+
+    const stmt = db.prepare(`
+      SELECT *
+      FROM task_notifications
+      WHERE (? = '' OR session_id = ?)
+        AND (? = '' OR task_id = ?)
+        AND (? = '' OR delivery_state = ?)
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `);
+    stmt.bind([sessionId, sessionId, taskId, taskId, deliveryState, deliveryState, limit]);
+    const data = [];
+    while (stmt.step()) {
+      data.push(renderTaskNotificationViewTx(db, stmt.getAsObject()));
+    }
+    stmt.free();
+
+    return res.json({
+      data,
+      count: data.length,
+    });
+  } catch (error) {
+    console.error('Failed to load task notifications', error);
+    return sendError(res, 500, 'Failed to load task notifications', 'runtime_error', 'task_notifications_load_failed');
+  }
+});
+
+app.get('/admin/api/task-notifications/:id', requireAdminSecret, async (req, res) => {
+  try {
+    const notification = await renderTaskNotificationView(String(req.params.id || '').trim());
+    if (!notification) {
+      return sendError(res, 404, 'Notification not found', 'invalid_request_error', 'notification_not_found');
+    }
+    return res.json({ data: notification });
+  } catch (error) {
+    console.error('Failed to load task notification', error);
+    return sendError(res, 500, 'Failed to load task notification', 'runtime_error', 'task_notification_load_failed');
+  }
+});
+
+app.get('/admin/api/task-notifications/:id/attempts', requireAdminSecret, async (req, res) => {
+  try {
+    const attempts = await getNotificationDeliveryAttemptsByNotificationId(String(req.params.id || '').trim(), { limit: 50 });
+    return res.json({
+      data: attempts,
+      count: attempts.length,
+    });
+  } catch (error) {
+    console.error('Failed to load task notification delivery attempts', error);
+    return sendError(res, 500, 'Failed to load task notification delivery attempts', 'runtime_error', 'task_notification_attempts_load_failed');
+  }
 });
 
 app.get('/session/:id/openclaw-config.json', legacySessionAuth, async (req, res) => {
@@ -7946,6 +13734,102 @@ app.get('/session/:id/v1/preflight', legacySessionAuth, async (req, res) => {
   res.json(preflight);
 });
 
+app.post('/v1/task-notifications/pull', canonicalSessionAuth, async (req, res) => {
+  try {
+    const limit = Number.isFinite(Number(req.body?.limit)) ? Math.max(1, Number(req.body.limit)) : 10;
+    const notifications = await pullTaskNotificationsForSession(req.session.session_id, {
+      limit,
+      timestamp: getTimestamp(),
+    });
+
+    return res.json({
+      data: notifications,
+      count: notifications.length,
+      session_id: req.session.session_id,
+    });
+  } catch (error) {
+    console.error('Failed to pull task notifications', error);
+    return sendError(res, 500, 'Failed to pull task notifications', 'runtime_error', 'task_notifications_pull_failed');
+  }
+});
+
+app.put('/v1/session/delivery-target', canonicalSessionAuth, async (req, res) => {
+  try {
+    const deliveryTarget = normalizeSessionDeliveryTargetInput(req.body || {});
+    const timestamp = getTimestamp();
+    const bearerToken = parseBearerToken(req.headers.authorization);
+    const isLiveKeyAuth = isLiveKeyToken(bearerToken);
+    const liveKeyId = isLiveKeyAuth ? String(req.session.linked_live_key_id || '') : '';
+    const stored = await withBillingWrite(async (db) => {
+      const sessionStored = await upsertSessionDeliveryTargetTx(db, req.session.session_id, deliveryTarget, {
+        timestamp,
+      });
+
+      if (isLiveKeyAuth) {
+        if (!liveKeyId) {
+          throw new Error('Live-key session is missing linked live key');
+        }
+
+        await upsertLiveKeyDeliveryTargetTx(db, liveKeyId, deliveryTarget, {
+          timestamp,
+        });
+      }
+
+      return sessionStored;
+    });
+
+    if (!stored) {
+      return sendError(res, 500, 'Failed to bind delivery target', 'runtime_error', 'session_delivery_target_bind_failed');
+    }
+
+    return res.json({
+      data: {
+        session_id: req.session.session_id,
+        delivery_target: {
+          channel: stored.channel || 'telegram',
+          chat_id: stored.chat_id || '',
+          thread_id: stored.thread_id || null,
+        },
+        created_at: stored.created_at || null,
+        updated_at: stored.updated_at || null,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to bind session delivery target', error);
+    return sendError(res, 400, error.message || 'Invalid delivery target', 'invalid_request_error', 'invalid_delivery_target');
+  }
+});
+
+app.post('/v1/task-notifications/:id/delivered', canonicalSessionAuth, async (req, res) => {
+  try {
+    const notificationId = String(req.params.id || '').trim();
+    if (!notificationId) {
+      return sendError(res, 400, 'Notification id is required', 'invalid_request_error', 'invalid_notification_id');
+    }
+
+    const delivered = await withBillingWrite(async (db) => {
+      const current = await getStoredTaskNotificationById(db, notificationId);
+      if (!current || current.session_id !== req.session.session_id) {
+        return null;
+      }
+      const updated = await markStoredTaskNotificationDeliveredTx(db, notificationId, {
+        deliveredMessageId: typeof req.body?.delivered_message_id === 'string' && req.body.delivered_message_id.trim() ? req.body.delivered_message_id.trim() : null,
+        timestamp: getTimestamp(),
+      });
+      return updated ? renderTaskNotificationViewTx(db, updated) : null;
+    });
+
+    if (!delivered) {
+      return sendError(res, 404, 'Notification not found', 'invalid_request_error', 'notification_not_found');
+    }
+
+    return res.json({ data: delivered });
+  } catch (error) {
+    console.error('Failed to mark task notification delivered', error);
+    return sendError(res, 500, 'Failed to mark task notification delivered', 'runtime_error', 'task_notification_delivery_failed');
+  }
+});
+
 app.post('/v1/chat/completions', canonicalSessionAuth, async (req, res) => {
   return handleChatCompletion(req, res);
 });
@@ -7969,6 +13853,8 @@ app.use((req, res) => {
 setInterval(cleanupExpiredSessions, CLEANUP_INTERVAL_MS).unref();
 
 let localWarmupTimer = null;
+let notificationDispatcherTimer = null;
+let notificationDispatcherRunning = false;
 
 function startLocalWarmupLoop() {
   if (!ENABLE_LOCAL_WARMUP || !BLOCKFORK_LOCAL_BASE_URL || !BLOCKFORK_LOCAL_MODEL) {
@@ -8031,11 +13917,58 @@ function startLocalWarmupLoop() {
   });
 }
 
+function startNotificationDispatcherLoop() {
+  if (!NOTIFICATION_DISPATCHER_ENABLED) {
+    return;
+  }
+  if (notificationDispatcherTimer) {
+    return;
+  }
+
+  const runDispatch = async () => {
+    if (notificationDispatcherRunning) {
+      return;
+    }
+    notificationDispatcherRunning = true;
+    try {
+      const result = await dispatchPendingTaskNotifications({
+        limit: NOTIFICATION_DISPATCHER_LIMIT,
+        claimLimit: NOTIFICATION_DISPATCHER_LIMIT,
+        dryRun: BLOCKFORK_OPENCLAW_CLI_DRY_RUN,
+        commandPath: BLOCKFORK_OPENCLAW_CLI_BIN,
+        timeoutMs: BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS,
+      });
+      if (result.claimed_notification_count || result.delivered_notification_count || result.failed_notification_count) {
+        logJson('notification_dispatcher_cycle', result);
+      }
+    } catch (error) {
+      logJson('notification_dispatcher_cycle_failed', {
+        reason: error?.message || String(error),
+      });
+    } finally {
+      notificationDispatcherRunning = false;
+    }
+  };
+
+  notificationDispatcherTimer = setInterval(() => {
+    void runDispatch();
+  }, NOTIFICATION_DISPATCHER_INTERVAL_MS);
+  notificationDispatcherTimer.unref();
+
+  logRoutingDecision('notification_dispatcher_started', {
+    interval_ms: NOTIFICATION_DISPATCHER_INTERVAL_MS,
+    limit: NOTIFICATION_DISPATCHER_LIMIT,
+    dry_run: BLOCKFORK_OPENCLAW_CLI_DRY_RUN,
+    transport: BLOCKFORK_NOTIFICATION_TRANSPORT,
+  });
+}
+
 async function startServer(port = PORT) {
   await ensureBillingDb();
   await preloadLiveKeys();
   await preloadActiveSessions();
   startLocalWarmupLoop();
+  startNotificationDispatcherLoop();
   return app.listen(port, HOST, () => {
     writeRuntimeProfileMarker(port);
     console.log(`BlockFork AI Session Runtime listening on http://${HOST}:${port}`);
@@ -8055,6 +13988,7 @@ module.exports = {
   sessionsByApiKey,
   liveKeysByApiKey,
   liveKeysById,
+  createSessionRecord,
   createLiveKeyRecord,
   createLiveKeySessionRecord,
   mintLiveKeyForUser,
@@ -8081,6 +14015,8 @@ module.exports = {
   attachExecutionWorkspace,
   createExecutionArtifactRecord,
   getExecutionArtifactByExecutionId,
+  getTaskArtifactAssessmentByTaskId,
+  getToolFailureFactBySubjectId,
   updateExecutionArtifactVerification,
   assertArtifactPathWithinWorkspace,
   buildExecutionCapabilityRecord,
@@ -8095,6 +14031,54 @@ module.exports = {
   updateExecutionBudgetOutcome,
   classifyExecutionBudgetFit,
   classifyContextPressure,
+  summarizeTaskObjectiveFromBody,
+  TASK_STATES,
+  TASK_PROGRESS_CATEGORIES,
+  TASK_NOTIFICATION_DELIVERY_STATES,
+  TASK_ARTIFACT_STRUCTURE_STATES,
+  TASK_ARTIFACT_ALIGNMENT_STATES,
+  TASK_ARTIFACT_CONFIDENCE_BANDS,
+  TOOL_FAILURE_CATEGORIES,
+  TOOL_FAILURE_SCOPES,
+  ARTIFACT_VERIFICATION_STATES,
+  createTaskRecord,
+  getTaskById,
+  getTaskByExecutionId,
+  getTaskByRequestId,
+  getTaskCompletionSummaryByTaskId,
+  getTaskProgressEventsByTaskId,
+  getVerifiedTaskArtifactAssessmentForExecutionId,
+  getTaskNotificationById,
+  getTaskNotificationsByTaskId,
+  getNotificationDeliveryAttemptByNotificationId,
+  getNotificationDeliveryAttemptsByNotificationId,
+  claimTaskNotificationById,
+  listDispatchableNotificationSessions,
+  ensureBillingDb,
+  normalizeOpenClawRelayConfigInput,
+  getOpenClawRelayConfigByLabel,
+  listOpenClawRelayConfigs,
+  upsertOpenClawRelayConfig,
+  runOpenClawRelayDoctor,
+  buildOpenClawRelaySetupCommands,
+  getStoredSessionDeliveryTargetBySessionId,
+  getStoredLiveKeyDeliveryTargetByLiveKeyId,
+  ensureSessionDeliveryTargetForSessionTx,
+  bindSessionDeliveryTarget,
+  bindLiveKeyDeliveryTarget,
+  pullTaskNotificationsForSession,
+  claimTaskNotificationsForSession,
+  markTaskNotificationDelivered,
+  dispatchTaskNotificationById,
+  dispatchPendingTaskNotifications,
+  runOpenClawCliDryRunAdapter,
+  buildOpenClawCliNotificationDispatchArgs,
+  startNotificationDispatcherLoop,
+  renderTaskNotificationView,
+  appendTaskProgressEvent,
+  recordToolFailureObservation,
+  transitionTask,
+  appendTaskEvent,
   deriveContinuityRecommendation,
   createOrUpdateSessionRecommendation,
   supersedeActiveRecommendation,
@@ -8105,6 +14089,12 @@ module.exports = {
   validateArtifactHonestyOrError,
   markExecutionRecoveryRequired,
   classifyExecutionInterruption,
+  classifyManagedTerminalCompletionIntegrity,
+  buildManagedTerminalWireOutcome,
+  buildManagedTerminalFallbackText,
+  buildManagedTerminalFallbackWireOutcome,
+  normalizeResponsesIncompleteResponseFromChat,
+  normalizeResponsesFallbackResponseFromChat,
   transitionExecution,
   transitionExecutionWithLease,
   assertLegalExecutionTransition,
