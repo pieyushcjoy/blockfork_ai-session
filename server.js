@@ -311,6 +311,9 @@ const TASK_NOTIFICATION_POLICIES = Object.freeze({
   PROGRESS_AND_COMPLETION: 'progress_and_completion',
   FAILURE_ONLY: 'failure_only',
 });
+const ARTIFACT_DELIVERY_NOTIFICATION_KIND = 'artifact_delivery';
+const ARTIFACT_DELIVERY_CONTROL_REASON = 'controlled_artifact_delivery_only';
+const ARTIFACT_DELIVERY_MAX_BYTES = 1024 * 1024;
 const TASK_KINDS = Object.freeze({
   SIMPLE_CHAT: 'simple_chat',
   TEXT_GENERATION: 'text_generation',
@@ -2552,6 +2555,10 @@ async function ensureBillingDb() {
       delivery_state TEXT NOT NULL DEFAULT 'pending',
       title TEXT NOT NULL DEFAULT '',
       body TEXT NOT NULL DEFAULT '',
+      artifact_id TEXT,
+      artifact_path TEXT,
+      media_kind TEXT,
+      relay_label TEXT,
       payload_json TEXT NOT NULL DEFAULT '{}',
       dedupe_key TEXT NOT NULL DEFAULT '',
       claim_count INTEGER NOT NULL DEFAULT 0,
@@ -2570,6 +2577,12 @@ async function ensureBillingDb() {
       notification_id TEXT NOT NULL,
       session_id TEXT NOT NULL,
       task_id TEXT NOT NULL,
+      artifact_id TEXT,
+      artifact_path TEXT,
+      relay_label TEXT,
+      media_kind TEXT,
+      handled_by TEXT NOT NULL DEFAULT '',
+      delivered_file_message_id TEXT,
       transport TEXT NOT NULL DEFAULT 'openclaw_cli',
       channel TEXT NOT NULL DEFAULT 'telegram',
       target TEXT NOT NULL DEFAULT '',
@@ -2905,6 +2918,10 @@ async function ensureBillingDb() {
     ['delivery_state', "TEXT NOT NULL DEFAULT 'pending'"],
     ['title', "TEXT NOT NULL DEFAULT ''"],
     ['body', "TEXT NOT NULL DEFAULT ''"],
+    ['artifact_id', 'TEXT'],
+    ['artifact_path', 'TEXT'],
+    ['media_kind', 'TEXT'],
+    ['relay_label', 'TEXT'],
     ['task_kind', "TEXT NOT NULL DEFAULT 'text_generation'"],
     ['notification_policy', "TEXT NOT NULL DEFAULT 'silent'"],
     ['proactive_eligible', 'INTEGER NOT NULL DEFAULT 0'],
@@ -2940,6 +2957,12 @@ async function ensureBillingDb() {
     ['notification_id', "TEXT NOT NULL DEFAULT ''"],
     ['session_id', "TEXT NOT NULL DEFAULT ''"],
     ['task_id', "TEXT NOT NULL DEFAULT ''"],
+    ['artifact_id', 'TEXT'],
+    ['artifact_path', 'TEXT'],
+    ['relay_label', 'TEXT'],
+    ['media_kind', 'TEXT'],
+    ['handled_by', "TEXT NOT NULL DEFAULT ''"],
+    ['delivered_file_message_id', 'TEXT'],
     ['transport', "TEXT NOT NULL DEFAULT 'openclaw_cli'"],
     ['channel', "TEXT NOT NULL DEFAULT 'telegram'"],
     ['target', "TEXT NOT NULL DEFAULT ''"],
@@ -3047,9 +3070,11 @@ async function ensureBillingDb() {
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_session_state_created ON task_notifications(session_id, delivery_state, created_at)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_session_state_next_attempt_created ON task_notifications(session_id, delivery_state, next_attempt_at, created_at)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_task_created ON task_notifications(task_id, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_artifact_id ON task_notifications(artifact_id)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_notifications_source ON task_notifications(source_type, source_id)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_notification_delivery_attempts_notification_created ON notification_delivery_attempts(notification_id, created_at)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_notification_delivery_attempts_session_created ON notification_delivery_attempts(session_id, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_notification_delivery_attempts_artifact_id ON notification_delivery_attempts(artifact_id)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_events_session_created ON session_continuity_events(session_id, created_at)');
   billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_session_lineage_child_session ON session_lineage(child_session_id)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_session_continuity_recommendations_session_status_created ON session_continuity_recommendations(session_id, status, created_at)');
@@ -3367,6 +3392,10 @@ function hydrateTaskNotificationRow(row) {
     delivery_state: String(row.delivery_state || 'pending'),
     title: String(row.title || ''),
     body: String(row.body || ''),
+    artifact_id: row.artifact_id || null,
+    artifact_path: row.artifact_path || null,
+    media_kind: row.media_kind || null,
+    relay_label: row.relay_label || null,
     task_kind: String(row.task_kind || 'text_generation'),
     notification_policy: String(row.notification_policy || 'silent'),
     proactive_eligible: Number(row.proactive_eligible || 0),
@@ -3560,6 +3589,17 @@ async function getStoredWorkspaceByRoot(db, canonicalRoot) {
 async function getStoredExecutionArtifactByExecutionId(db, executionId) {
   const stmt = db.prepare('SELECT * FROM execution_artifacts WHERE execution_id = ? LIMIT 1');
   stmt.bind([executionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateExecutionArtifactRow(row);
+}
+
+async function getStoredExecutionArtifactByArtifactId(db, artifactId) {
+  const stmt = db.prepare('SELECT * FROM execution_artifacts WHERE artifact_id = ? LIMIT 1');
+  stmt.bind([artifactId]);
   let row = null;
   if (stmt.step()) {
     row = stmt.getAsObject();
@@ -4469,6 +4509,12 @@ function hydrateNotificationDeliveryAttemptRow(row) {
     notification_id: String(row.notification_id || ''),
     session_id: String(row.session_id || ''),
     task_id: String(row.task_id || ''),
+    artifact_id: row.artifact_id || null,
+    artifact_path: row.artifact_path || null,
+    relay_label: row.relay_label || null,
+    media_kind: row.media_kind || null,
+    handled_by: String(row.handled_by || ''),
+    delivered_file_message_id: row.delivered_file_message_id || null,
     transport: String(row.transport || 'openclaw_cli'),
     channel: String(row.channel || 'telegram'),
     target: String(row.target || ''),
@@ -4530,16 +4576,23 @@ async function recordStoredNotificationDeliveryAttemptTx(db, attempt) {
   const timestamp = attempt.created_at || getTimestamp();
   const insert = db.prepare(`
     INSERT INTO notification_delivery_attempts (
-      attempt_id, notification_id, session_id, task_id, transport, channel, target, thread_id, dry_run,
+      attempt_id, notification_id, session_id, task_id, artifact_id, artifact_path, relay_label, media_kind,
+      handled_by, delivered_file_message_id, transport, channel, target, thread_id, dry_run,
       command_path, command_argv_json, started_at, finished_at, exit_code, stdout_text, stderr_text,
       stdout_json, success, retryable, error_code, error_message, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   insert.run([
     attempt.attempt_id || createTaskNotificationDeliveryAttemptId(),
     attempt.notification_id || '',
     attempt.session_id || '',
     attempt.task_id || '',
+    attempt.artifact_id || null,
+    attempt.artifact_path || null,
+    attempt.relay_label || null,
+    attempt.media_kind || null,
+    attempt.handled_by || '',
+    attempt.delivered_file_message_id || null,
     attempt.transport || BLOCKFORK_NOTIFICATION_TRANSPORT,
     attempt.channel || 'telegram',
     attempt.target || '',
@@ -4624,12 +4677,13 @@ async function listDispatchableNotificationSessionsTx(db, options = {}) {
     FROM task_notifications
     WHERE delivery_state = ?
       AND proactive_eligible = 1
+      AND notification_kind != ?
       AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?)
     GROUP BY session_id
     ORDER BY oldest_created_at ASC, session_id ASC
     LIMIT ?
   `);
-  stmt.bind([TASK_NOTIFICATION_DELIVERY_STATES.PENDING, now, limit]);
+  stmt.bind([TASK_NOTIFICATION_DELIVERY_STATES.PENDING, ARTIFACT_DELIVERY_NOTIFICATION_KIND, now, limit]);
   const rows = [];
   while (stmt.step()) {
     const row = stmt.getAsObject();
@@ -4667,6 +4721,41 @@ function buildOpenClawCliNotificationDispatchArgs(notificationView, options = {}
   }
 
   args.push('--message', String(notificationView.outbound_text || ''));
+
+  if (options.dryRun !== false) {
+    args.push('--dry-run');
+  }
+
+  args.push('--json');
+  return args;
+}
+
+function buildOpenClawCliArtifactDeliveryArgs(deliveryView, options = {}) {
+  const deliveryTarget = deliveryView?.delivery_target || null;
+  const artifactPath = String(options.artifactPath || deliveryView?.artifact_delivery?.artifact_path || deliveryView?.payload?.artifact_path || '').trim();
+  if (!deliveryTarget || !deliveryTarget.chat_id) {
+    throw new Error('delivery_target is required for OpenClaw CLI artifact delivery');
+  }
+  if (!artifactPath) {
+    throw new Error('artifact_path is required for OpenClaw CLI artifact delivery');
+  }
+
+  const args = [
+    'message',
+    'send',
+    '--channel',
+    'telegram',
+    '--target',
+    String(deliveryTarget.chat_id),
+  ];
+
+  if (deliveryTarget.thread_id !== null && deliveryTarget.thread_id !== undefined && String(deliveryTarget.thread_id).trim()) {
+    args.push('--thread-id', String(deliveryTarget.thread_id));
+  }
+
+  args.push('--message', String(deliveryView?.outbound_text || `Created artifact: ${path.basename(artifactPath)}`));
+  args.push('--media', artifactPath);
+  args.push('--force-document');
 
   if (options.dryRun !== false) {
     args.push('--dry-run');
@@ -4897,6 +4986,317 @@ async function runOpenClawCliDryRunAdapter(notificationView, options = {}) {
         retryable: false,
         error_code: 'contract_violation',
         error_message: 'OpenClaw CLI dry-run response did not confirm dryRun=true',
+        stdout_text: result.stdout,
+        stderr_text: result.stderr,
+        stdout_json: parsed,
+        command_path: commandPath,
+        command_args: commandArgs,
+        started_at: result.started_at,
+        finished_at: result.finished_at,
+        exit_code: result.exit_code,
+      };
+    }
+
+    return {
+      ok: true,
+      retryable: false,
+      error_code: '',
+      error_message: '',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (payloadDryRun) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response unexpectedly reported dryRun=true',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (payloadHandledBy !== 'plugin') {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response did not confirm handledBy=plugin',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (expectedMediaPath && payloadMediaUrl && payloadMediaUrl !== expectedMediaPath) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response media path did not match the artifact path',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (!payload || typeof payload !== 'object' || payload.payload?.ok !== true) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response did not confirm payload.ok=true',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (!payloadMessageId) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI real-send response did not include a messageId',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  return {
+    ok: true,
+    retryable: false,
+    error_code: '',
+    error_message: '',
+    stdout_text: result.stdout,
+    stderr_text: result.stderr,
+    stdout_json: parsed,
+    command_path: commandPath,
+    command_args: commandArgs,
+    started_at: result.started_at,
+    finished_at: result.finished_at,
+    exit_code: result.exit_code,
+  };
+}
+
+function normalizeOpenClawCliMediaUrlFromPayload(payload = {}) {
+  const mediaUrl = String(payload?.payload?.mediaUrl || payload?.mediaUrl || '').trim();
+  if (mediaUrl) {
+    return mediaUrl;
+  }
+  const mediaUrls = payload?.payload?.mediaUrls || payload?.mediaUrls || [];
+  if (Array.isArray(mediaUrls) && mediaUrls.length) {
+    return String(mediaUrls[0] || '').trim();
+  }
+  return '';
+}
+
+function normalizeOpenClawCliDeliveredMessageIdFromPayload(payload = {}) {
+  const directMessageId = String(payload?.payload?.messageId || payload?.messageId || '').trim();
+  if (directMessageId) {
+    return directMessageId;
+  }
+  const directFileMessageId = String(payload?.payload?.fileMessageId || payload?.fileMessageId || '').trim();
+  if (directFileMessageId) {
+    return directFileMessageId;
+  }
+  return '';
+}
+
+async function runOpenClawCliArtifactDeliveryAdapter(deliveryView, options = {}) {
+  const dryRun = options.dryRun !== undefined ? Boolean(options.dryRun) : BLOCKFORK_OPENCLAW_CLI_DRY_RUN;
+  const commandPath = String(options.commandPath || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw').trim() || 'openclaw';
+  const commandArgs = buildOpenClawCliArtifactDeliveryArgs(deliveryView, {
+    dryRun,
+    artifactPath: options.artifactPath || deliveryView?.artifact_delivery?.artifact_path || deliveryView?.payload?.artifact_path || '',
+  });
+  const startedAt = options.startedAt || getTimestamp();
+  const result = await runCommandWithTimeout(commandPath, commandArgs, {
+    timeoutMs: options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS,
+    env: options.env || process.env,
+    startedAt,
+  });
+
+  let parsed = null;
+  if (result.stdout && result.stdout.trim()) {
+    try {
+      parsed = JSON.parse(result.stdout);
+    } catch (error) {
+      parsed = null;
+      if (result.ok) {
+        return {
+          ok: false,
+          retryable: true,
+          error_code: 'invalid_json',
+          error_message: 'OpenClaw CLI returned non-JSON output',
+          stdout_text: result.stdout,
+          stderr_text: result.stderr,
+          stdout_json: null,
+          command_path: commandPath,
+          command_args: commandArgs,
+          started_at: result.started_at,
+          finished_at: result.finished_at,
+          exit_code: result.exit_code,
+        };
+      }
+    }
+  }
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      retryable: true,
+      error_code: result.timed_out ? 'timeout' : 'non_zero_exit',
+      error_message: result.timed_out ? 'OpenClaw CLI timed out' : 'OpenClaw CLI returned a non-zero exit code',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  const payload = parsed || {};
+  const payloadAction = String(payload.action || payload.payload?.action || '').trim().toLowerCase();
+  const payloadChannel = String(payload.channel || payload.payload?.channel || '').trim().toLowerCase();
+  const payloadDryRun = payload && typeof payload === 'object' && (payload.dryRun === true || payload.payload?.dryRun === true);
+  const payloadHandledBy = String(payload.handledBy || payload.payload?.handledBy || '').trim().toLowerCase();
+  const payloadChatId = normalizeOpenClawCliTelegramTargetFromPayload(payload);
+  const payloadMessageId = normalizeOpenClawCliDeliveredMessageIdFromPayload(payload);
+  const payloadMediaUrl = normalizeOpenClawCliMediaUrlFromPayload(payload);
+  const expectedChatId = String(deliveryView?.delivery_target?.chat_id || '').trim();
+  const expectedMediaPath = String(options.artifactPath || deliveryView?.artifact_delivery?.artifact_path || deliveryView?.payload?.artifact_path || '').trim();
+
+  if (payloadAction !== 'send') {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response did not confirm send action',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (payloadChannel !== 'telegram') {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response did not confirm telegram channel',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (expectedChatId && !payloadChatId) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response did not include a target chat id',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (expectedChatId && payloadChatId && payloadChatId !== expectedChatId) {
+    return {
+      ok: false,
+      retryable: false,
+      error_code: 'contract_violation',
+      error_message: 'OpenClaw CLI response target did not match expected chat id',
+      stdout_text: result.stdout,
+      stderr_text: result.stderr,
+      stdout_json: parsed,
+      command_path: commandPath,
+      command_args: commandArgs,
+      started_at: result.started_at,
+      finished_at: result.finished_at,
+      exit_code: result.exit_code,
+    };
+  }
+
+  if (dryRun) {
+    if (!payloadDryRun) {
+      return {
+        ok: false,
+        retryable: false,
+        error_code: 'contract_violation',
+        error_message: 'OpenClaw CLI dry-run response did not confirm dryRun=true',
+        stdout_text: result.stdout,
+        stderr_text: result.stderr,
+        stdout_json: parsed,
+        command_path: commandPath,
+        command_args: commandArgs,
+        started_at: result.started_at,
+        finished_at: result.finished_at,
+        exit_code: result.exit_code,
+      };
+    }
+
+    if (expectedMediaPath && payloadMediaUrl !== expectedMediaPath) {
+      return {
+        ok: false,
+        retryable: false,
+        error_code: 'contract_violation',
+        error_message: 'OpenClaw CLI dry-run response did not include the expected media path',
         stdout_text: result.stdout,
         stderr_text: result.stderr,
         stdout_json: parsed,
@@ -5344,6 +5744,340 @@ async function dispatchTaskNotificationById(notificationId, options = {}) {
   };
 }
 
+async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
+  const exactDeliveryId = String(deliveryId || '').trim();
+  if (!exactDeliveryId && !String(options.artifactId || '').trim()) {
+    throw new Error('artifact delivery id or artifactId is required');
+  }
+
+  const relayLabel = String(options.relayLabel || '').trim();
+  if (!relayLabel) {
+    throw new Error('relayLabel is required');
+  }
+
+  const dryRun = options.dryRun !== undefined ? Boolean(options.dryRun) : BLOCKFORK_OPENCLAW_CLI_DRY_RUN;
+  if (!dryRun && Number(options.maxRealSends || 0) !== 1) {
+    throw new Error('Real-send artifact delivery requires maxRealSends=1');
+  }
+
+  const transport = String(options.transport || BLOCKFORK_NOTIFICATION_TRANSPORT || 'openclaw_cli');
+  if (transport !== 'openclaw_cli') {
+    throw new Error(`Unsupported notification transport: ${transport}`);
+  }
+
+  const commandPathOverride = String(options.commandPath || '').trim();
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS));
+  const dispatchTimestamp = options.timestamp || getTimestamp();
+  const allowDelivered = Boolean(options.allowDelivered);
+
+  if (!exactDeliveryId) {
+    const ensured = await ensureArtifactDeliveryNotificationForExecution(String(options.artifactId || '').trim(), {
+      relayLabel,
+      timestamp: dispatchTimestamp,
+    });
+    if (!ensured || !ensured.ok) {
+      return {
+        transport,
+        dry_run: dryRun,
+        command_path: commandPathOverride || '',
+        notification_id: null,
+        artifact_id: String(options.artifactId || '').trim() || null,
+        relay_label: relayLabel,
+        status: 'blocked',
+        reason_code: ensured?.reason || 'artifact_delivery_not_ready',
+        reason_message: 'Artifact delivery notification is not ready',
+        delivery_target: null,
+        attempt: null,
+        notification: null,
+      };
+    }
+  }
+
+  const preflight = await withBillingWrite(async (db) => {
+    let notification = null;
+    let artifact = null;
+    let execution = null;
+    let task = null;
+
+    if (exactDeliveryId) {
+      notification = await getStoredTaskNotificationById(db, exactDeliveryId);
+      if (!notification) {
+        return {
+          ok: false,
+          status: 'not_found',
+          reason_code: 'not_found',
+          reason_message: 'Artifact delivery notification not found',
+          notification: null,
+          delivery_target: null,
+        };
+      }
+      artifact = notification.artifact_id ? await getStoredExecutionArtifactByArtifactId(db, notification.artifact_id) : null;
+      if (artifact) {
+        execution = await getStoredExecutionById(db, artifact.execution_id);
+        task = execution?.task_id ? await getStoredTaskById(db, execution.task_id) : null;
+      }
+    } else {
+      artifact = await getStoredExecutionArtifactByArtifactId(db, String(options.artifactId || '').trim());
+      if (!artifact) {
+        return {
+          ok: false,
+          status: 'not_found',
+          reason_code: 'not_found',
+          reason_message: 'Artifact not found',
+          notification: null,
+          delivery_target: null,
+        };
+      }
+      execution = await getStoredExecutionById(db, artifact.execution_id);
+      task = execution?.task_id ? await getStoredTaskById(db, execution.task_id) : null;
+      if (!execution || !task) {
+        return {
+          ok: false,
+          status: 'blocked',
+          reason_code: 'artifact_execution_missing',
+          reason_message: 'Artifact execution not found',
+          notification: null,
+          delivery_target: null,
+        };
+      }
+      notification = await getStoredTaskNotificationByArtifactIdTx(db, artifact.artifact_id);
+    }
+
+    if (!notification || !artifact) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'artifact_delivery_not_ready',
+        reason_message: 'Artifact delivery notification is not ready',
+        notification: notification || null,
+        delivery_target: null,
+      };
+    }
+
+    const eligibility = await assessArtifactDeliveryEligibility(execution.execution_id, {
+      allowDelivered,
+    });
+    if (!eligibility.ok) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: eligibility.reason || 'artifact_delivery_not_ready',
+        reason_message: 'Artifact is not eligible for delivery',
+        notification,
+        delivery_target: null,
+      };
+    }
+
+    const relay = await getOpenClawRelayConfigByLabel(relayLabel);
+    if (!relay) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'relay_config_not_found',
+        reason_message: 'OpenClaw relay config not found',
+        notification,
+        delivery_target: null,
+      };
+    }
+
+    const staticReport = assessOpenClawRelayStaticChecks(relay);
+    if (staticReport.blockers.length) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'relay_not_ready',
+        reason_message: staticReport.blockers.map((item) => item.detail).join('; ') || 'OpenClaw relay is not ready',
+        notification,
+        delivery_target: null,
+      };
+    }
+
+    const deliveryTarget = await ensureSessionDeliveryTargetForSessionTx(db, notification.session_id, {
+      timestamp: dispatchTimestamp,
+    });
+    if (!deliveryTarget || !deliveryTarget.chat_id) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'no_delivery_target',
+        reason_message: 'Artifact delivery has no Telegram delivery target',
+        notification,
+        delivery_target: null,
+      };
+    }
+
+    const artifactDeliveryView = renderTaskNotificationViewTx(db, notification);
+    if (!artifactDeliveryView) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'render_failed',
+        reason_message: 'Artifact delivery notification could not be rendered',
+        notification,
+        delivery_target: {
+          channel: deliveryTarget.channel || 'telegram',
+          chat_id: deliveryTarget.chat_id || '',
+          thread_id: deliveryTarget.thread_id || null,
+        },
+      };
+    }
+
+    const commandPath = commandPathOverride || relay.cli_bin || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw';
+    return {
+      ok: true,
+      status: 'ready',
+      notification: artifactDeliveryView,
+      artifact,
+      execution,
+      task,
+      delivery_target: {
+        channel: deliveryTarget.channel || 'telegram',
+        chat_id: deliveryTarget.chat_id || '',
+        thread_id: deliveryTarget.thread_id || null,
+      },
+      relay,
+      command_path: commandPath,
+    };
+  });
+
+  if (!preflight.ok) {
+    return {
+      transport,
+      dry_run: dryRun,
+      command_path: commandPathOverride || '',
+      notification_id: exactDeliveryId || null,
+      artifact_id: options.artifactId || null,
+      relay_label: relayLabel,
+      status: preflight.status,
+      reason_code: preflight.reason_code,
+      reason_message: preflight.reason_message,
+      delivery_target: preflight.delivery_target || null,
+      attempt: null,
+      notification: preflight.notification || null,
+    };
+  }
+
+  const env = {
+    ...process.env,
+    ...parseOpenClawRelayEnvFile(preflight.relay.env_file),
+  };
+  if (preflight.relay.config_path) {
+    env.OPENCLAW_CONFIG_PATH = preflight.relay.config_path;
+  }
+  if (preflight.relay.state_dir) {
+    env.OPENCLAW_STATE_DIR = preflight.relay.state_dir;
+  }
+  env.BLOCKFORK_NOTIFICATION_TRANSPORT = 'openclaw_cli';
+  env.BLOCKFORK_OPENCLAW_CLI_BIN = preflight.command_path;
+  env.BLOCKFORK_OPENCLAW_CLI_DRY_RUN = dryRun ? '1' : '0';
+
+  const attemptStartedAt = getTimestamp();
+  const adapterResult = await runOpenClawCliArtifactDeliveryAdapter(preflight.notification, {
+    commandPath: preflight.command_path,
+    dryRun,
+    timeoutMs,
+    env,
+    startedAt: attemptStartedAt,
+    artifactPath: preflight.artifact.canonical_path,
+  });
+
+  const attemptRecord = {
+    notification_id: preflight.notification.notification_id,
+    session_id: preflight.notification.session_id,
+    task_id: preflight.notification.task_id,
+    artifact_id: preflight.artifact.artifact_id,
+    artifact_path: preflight.artifact.canonical_path,
+    relay_label: relayLabel,
+    media_kind: preflight.notification.media_kind || preflight.artifact.artifact_type || 'document',
+    handled_by: adapterResult.stdout_json && typeof adapterResult.stdout_json === 'object'
+      ? String(adapterResult.stdout_json.handledBy || adapterResult.stdout_json.payload?.handledBy || '')
+      : '',
+    delivered_file_message_id: adapterResult.stdout_json && typeof adapterResult.stdout_json === 'object'
+      ? String(adapterResult.stdout_json.payload?.messageId || adapterResult.stdout_json.messageId || adapterResult.stdout_json.payload?.fileMessageId || adapterResult.stdout_json.fileMessageId || '')
+      : '',
+    transport,
+    channel: preflight.delivery_target?.channel || 'telegram',
+    target: preflight.delivery_target?.chat_id || '',
+    thread_id: preflight.delivery_target?.thread_id || null,
+    dry_run: dryRun,
+    command_path: preflight.command_path,
+    command_argv: buildOpenClawCliArtifactDeliveryArgs(preflight.notification, {
+      dryRun,
+      artifactPath: preflight.artifact.canonical_path,
+    }),
+    started_at: adapterResult.started_at || attemptStartedAt,
+    finished_at: adapterResult.finished_at || getTimestamp(),
+    exit_code: adapterResult.exit_code === null || adapterResult.exit_code === undefined ? -1 : Number(adapterResult.exit_code),
+    stdout_text: adapterResult.stdout_text || '',
+    stderr_text: adapterResult.stderr_text || '',
+    stdout_json: adapterResult.stdout_json,
+    success: Boolean(adapterResult.ok),
+    retryable: Boolean(adapterResult.retryable),
+    error_code: adapterResult.error_code || '',
+    error_message: adapterResult.error_message || '',
+    created_at: adapterResult.finished_at || getTimestamp(),
+    updated_at: adapterResult.finished_at || getTimestamp(),
+  };
+
+  const finalNotification = await withBillingWrite(async (db) => {
+    await recordStoredNotificationDeliveryAttemptTx(db, attemptRecord);
+    if (adapterResult.ok) {
+      await updateExecutionArtifactDeliveryStatusTx(db, preflight.execution.execution_id, {
+        deliveryRequested: true,
+        deliveryConfirmed: true,
+        reasonCode: 'artifact_delivery_confirmed',
+        timestamp: adapterResult.finished_at || getTimestamp(),
+      });
+      return markStoredTaskNotificationDispatchOutcomeTx(db, preflight.notification.notification_id, {
+        success: true,
+        deliveredMessageId: adapterResult.stdout_json && typeof adapterResult.stdout_json === 'object'
+          ? String(
+            adapterResult.stdout_json.payload?.messageId
+            || adapterResult.stdout_json.messageId
+            || adapterResult.stdout_json.payload?.fileMessageId
+            || adapterResult.stdout_json.fileMessageId
+            || ''
+          )
+          : null,
+        timestamp: adapterResult.finished_at || getTimestamp(),
+      });
+    }
+
+    const nextAttemptAt = getNotificationDispatchRetryTimestamp(adapterResult.finished_at || getTimestamp(), computeNotificationDispatchBackoffMs(preflight.notification.attempt_count || 0));
+    await updateExecutionArtifactDeliveryStatusTx(db, preflight.execution.execution_id, {
+      deliveryRequested: true,
+      deliveryConfirmed: false,
+      reasonCode: 'artifact_delivery_failed',
+      timestamp: adapterResult.finished_at || getTimestamp(),
+    });
+    return markStoredTaskNotificationDispatchOutcomeTx(db, preflight.notification.notification_id, {
+      success: false,
+      retryable: Boolean(adapterResult.retryable),
+      lastError: adapterResult.error_message || adapterResult.error_code || 'dispatch_failed',
+      nextAttemptAt,
+      timestamp: adapterResult.finished_at || getTimestamp(),
+    });
+  });
+
+  return {
+    transport,
+    dry_run: dryRun,
+    command_path: preflight.command_path,
+    notification_id: preflight.notification.notification_id,
+    artifact_id: preflight.artifact.artifact_id,
+    session_id: preflight.notification.session_id,
+    task_id: preflight.notification.task_id,
+    status: adapterResult.ok ? 'delivered' : (adapterResult.retryable ? 'retryable' : 'failed'),
+    reason_code: adapterResult.error_code || '',
+    reason_message: adapterResult.error_message || '',
+    relay_label: relayLabel,
+    delivery_target: preflight.delivery_target,
+    attempt: attemptRecord,
+    notification: finalNotification,
+    adapter_result: adapterResult,
+  };
+}
+
 function buildTaskNotificationOutboundText(notification, task, summary, assessment, failureFact) {
   const finalState = String(task?.current_state || notification?.payload?.task_state || notification?.payload?.new_state || '');
   const body = String(notification?.body || '').trim();
@@ -5429,6 +6163,12 @@ function renderTaskNotificationViewTx(db, notificationRow) {
   const outboundText = buildTaskNotificationOutboundText(notification, task, taskSummary, assessment, failureFact);
   const payload = {
     ...(notification.payload || {}),
+    artifact_delivery: notification.artifact_id || notification.payload?.artifact_id ? {
+      artifact_id: String(notification.artifact_id || notification.payload?.artifact_id || ''),
+      artifact_path: String(notification.artifact_path || notification.payload?.artifact_path || ''),
+      relay_label: String(notification.relay_label || notification.payload?.relay_label || ''),
+      media_kind: String(notification.media_kind || notification.payload?.media_kind || ''),
+    } : null,
     task_state: String(task?.current_state || notification.payload?.task_state || ''),
     summary_text: String(taskSummary?.summary_text || ''),
     what_completed: taskSummary?.what_completed || [],
@@ -5477,6 +6217,12 @@ function renderTaskNotificationViewTx(db, notificationRow) {
       dry_run: Boolean(latestAttempt.dry_run),
       target: latestAttempt.target || '',
       thread_id: latestAttempt.thread_id || null,
+      artifact_id: latestAttempt.artifact_id || null,
+      artifact_path: latestAttempt.artifact_path || null,
+      relay_label: latestAttempt.relay_label || null,
+      media_kind: latestAttempt.media_kind || null,
+      handled_by: latestAttempt.handled_by || '',
+      delivered_file_message_id: latestAttempt.delivered_file_message_id || null,
       command_path: latestAttempt.command_path || '',
       command_argv: Array.isArray(latestAttempt.command_argv) ? latestAttempt.command_argv : [],
       exit_code: Number(latestAttempt.exit_code || 0),
@@ -5701,10 +6447,11 @@ function appendTaskNotificationTx(db, notification) {
   const insert = db.prepare(`
     INSERT INTO task_notifications (
       notification_id, task_id, session_id, execution_id, source_type, source_id, notification_kind,
-      delivery_channel, delivery_state, title, body, task_kind, notification_policy, proactive_eligible,
-      eligibility_reason, delivery_suppressed_reason, classified_at, payload_json, dedupe_key, claim_count,
-      claimed_at, delivered_at, delivered_message_id, last_error, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      delivery_channel, delivery_state, title, body, artifact_id, artifact_path, media_kind, relay_label,
+      task_kind, notification_policy, proactive_eligible, eligibility_reason, delivery_suppressed_reason,
+      classified_at, payload_json, dedupe_key, claim_count, claimed_at, delivered_at, delivered_message_id,
+      last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(dedupe_key) DO UPDATE SET
       task_id = excluded.task_id,
       session_id = excluded.session_id,
@@ -5715,6 +6462,10 @@ function appendTaskNotificationTx(db, notification) {
       delivery_channel = excluded.delivery_channel,
       title = excluded.title,
       body = excluded.body,
+      artifact_id = excluded.artifact_id,
+      artifact_path = excluded.artifact_path,
+      media_kind = excluded.media_kind,
+      relay_label = excluded.relay_label,
       task_kind = excluded.task_kind,
       notification_policy = excluded.notification_policy,
       proactive_eligible = excluded.proactive_eligible,
@@ -5736,6 +6487,10 @@ function appendTaskNotificationTx(db, notification) {
     snapshot.delivery_state || TASK_NOTIFICATION_DELIVERY_STATES.PENDING,
     snapshot.title || '',
     snapshot.body || '',
+    snapshot.artifact_id || null,
+    snapshot.artifact_path || null,
+    snapshot.media_kind || null,
+    snapshot.relay_label || null,
     snapshot.task_kind || TASK_KINDS.TEXT_GENERATION,
     snapshot.notification_policy || TASK_NOTIFICATION_POLICIES.SILENT,
     Number(snapshot.proactive_eligible || 0),
@@ -10267,6 +11022,12 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
   }
 
   const assessment = await getTaskArtifactAssessmentByTaskId(task.task_id);
+  if (assessment && String(assessment.confidence_band || '') === TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH) {
+    void ensureArtifactDeliveryNotificationForExecution(executionId, {
+      relayLabel: String(options.relayLabel || ''),
+      timestamp: options.timestamp || getTimestamp(),
+    }).catch(() => null);
+  }
   return {
     required: true,
     ok: true,
@@ -10445,6 +11206,11 @@ async function attachExecutionWorkspace(executionId, workspaceId, options = {}) 
 async function getExecutionArtifactByExecutionId(executionId) {
   const db = await ensureBillingDb();
   return getStoredExecutionArtifactByExecutionId(db, executionId);
+}
+
+async function getExecutionArtifactByArtifactId(artifactId) {
+  const db = await ensureBillingDb();
+  return getStoredExecutionArtifactByArtifactId(db, artifactId);
 }
 
 async function createExecutionArtifactRecord(options = {}) {
@@ -10686,6 +11452,260 @@ async function updateExecutionArtifactVerification(executionId, verificationStat
       canonical_path: options.canonicalPath || current.canonical_path,
       declared_path: options.declaredPath || current.declared_path,
       updated_at: timestamp,
+    };
+  });
+}
+
+async function updateExecutionArtifactDeliveryStatusTx(db, executionId, options = {}) {
+  const current = await getStoredExecutionArtifactByExecutionId(db, executionId);
+  if (!current) {
+    throw new Error(`Artifact record not found for execution: ${executionId}`);
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  const update = db.prepare(`
+    UPDATE execution_artifacts
+    SET delivery_requested = ?,
+        delivery_confirmed = ?,
+        reason_code = ?,
+        updated_at = ?
+    WHERE execution_id = ?
+  `);
+  update.run([
+    Number(Boolean(options.deliveryRequested ?? current.delivery_requested)),
+    Number(Boolean(options.deliveryConfirmed ?? current.delivery_confirmed)),
+    options.reasonCode || current.reason_code || '',
+    timestamp,
+    executionId,
+  ]);
+  update.free();
+
+  return getStoredExecutionArtifactByExecutionId(db, executionId);
+}
+
+async function updateExecutionArtifactDeliveryStatus(executionId, options = {}) {
+  return withBillingWrite(async (db) => updateExecutionArtifactDeliveryStatusTx(db, executionId, options));
+}
+
+function buildArtifactDeliveryTitle(filename = '') {
+  const normalized = String(filename || '').trim();
+  return normalized ? `Artifact ready: ${normalized}` : 'Artifact ready for delivery';
+}
+
+function buildArtifactDeliveryBody(filename = '', artifactType = '') {
+  const normalizedFilename = String(filename || '').trim();
+  const normalizedType = String(artifactType || '').trim();
+  if (normalizedFilename) {
+    return `Created artifact: ${normalizedFilename}`;
+  }
+  if (normalizedType) {
+    return `Created ${normalizedType} artifact`;
+  }
+  return 'Created verified artifact';
+}
+
+function artifactDeliveryMediaKindFromArtifact(artifact = {}) {
+  const filename = String(artifact?.artifact_filename || artifact?.declared_path || '').trim();
+  const type = String(artifact?.artifact_type || '').trim();
+  if (type && type !== 'text') {
+    return type;
+  }
+  if (/\.(md|markdown)$/i.test(filename)) {
+    return 'markdown';
+  }
+  return type || 'document';
+}
+
+async function getStoredTaskNotificationByArtifactIdTx(db, artifactId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM task_notifications
+    WHERE artifact_id = ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT 1
+  `);
+  stmt.bind([artifactId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateTaskNotificationRow(row);
+}
+
+async function getTaskNotificationByArtifactId(artifactId) {
+  const db = await ensureBillingDb();
+  return getStoredTaskNotificationByArtifactIdTx(db, String(artifactId || ''));
+}
+
+async function assessArtifactDeliveryEligibility(executionId, options = {}) {
+  const execution = await getExecutionById(executionId);
+  if (!execution) {
+    return { required: true, ok: false, reason: 'artifact_execution_missing' };
+  }
+
+  const task = await getTaskByExecutionId(executionId);
+  if (!task) {
+    return { required: true, ok: false, reason: 'artifact_execution_missing' };
+  }
+
+  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+    return { required: false, ok: true, skipped: true };
+  }
+
+  const artifact = await getExecutionArtifactByExecutionId(executionId);
+  if (!artifact) {
+    return { required: true, ok: false, reason: 'artifact_missing' };
+  }
+
+  if (String(artifact.verification_state || '') !== ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    return { required: true, ok: false, reason: 'artifact_not_verified', artifact, task, execution };
+  }
+
+  let assessment = null;
+  const canonicalPath = String(artifact.canonical_path || '').trim();
+  if (!canonicalPath) {
+    return { required: true, ok: false, reason: 'artifact_path_missing', artifact, task, execution };
+  }
+
+  const workspaceCheck = await assertArtifactPathWithinWorkspace(canonicalPath, execution.workspace_id);
+  if (!workspaceCheck.ok) {
+    return { required: true, ok: false, reason: workspaceCheck.reason || 'artifact_path_outside_workspace', artifact, task, execution };
+  }
+
+  if (!fs.existsSync(canonicalPath)) {
+    return { required: true, ok: false, reason: 'artifact_path_not_found', artifact, task, execution };
+  }
+
+  const stats = fs.statSync(canonicalPath);
+  if (!stats.isFile() || Number(stats.size || 0) <= 0) {
+    return { required: true, ok: false, reason: 'artifact_not_nonempty_file', artifact, task, execution };
+  }
+
+  if (Number(stats.size || 0) > ARTIFACT_DELIVERY_MAX_BYTES) {
+    return { required: true, ok: false, reason: 'artifact_file_too_large', artifact, task, execution };
+  }
+
+  assessment = await getTaskArtifactAssessmentByTaskId(task.task_id);
+  if (!assessment || !assessment.artifact_exists) {
+    return { required: true, ok: false, reason: 'artifact_assessment_missing', artifact, task, execution };
+  }
+
+  if (
+    Number(assessment.confidence_score || 0) < 80
+    || String(assessment.confidence_band || '') !== TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH
+    || String(assessment.structure_state || '') !== TASK_ARTIFACT_STRUCTURE_STATES.VALID
+    || String(assessment.alignment_state || '') !== TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED
+  ) {
+    return { required: true, ok: false, reason: 'artifact_low_confidence', artifact, task, execution, assessment };
+  }
+
+  if (String(artifact.delivery_confirmed || 0) === '1' && !options.allowDelivered) {
+    return { required: true, ok: false, reason: 'artifact_already_delivered', artifact, task, execution, assessment };
+  }
+
+  return {
+    required: true,
+    ok: true,
+    execution,
+    task,
+    artifact,
+    assessment,
+    file_path: canonicalPath,
+    file_size: Number(stats.size || 0),
+    media_kind: artifactDeliveryMediaKindFromArtifact(artifact),
+  };
+}
+
+async function ensureArtifactDeliveryNotificationForExecution(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const eligibility = await assessArtifactDeliveryEligibility(executionId, options);
+    if (!eligibility.ok) {
+      return eligibility;
+    }
+
+    const timestamp = options.timestamp || getTimestamp();
+    const artifact = eligibility.artifact;
+    const task = eligibility.task;
+    const assessment = eligibility.assessment;
+    const existing = await getStoredTaskNotificationByArtifactIdTx(db, artifact.artifact_id);
+    const dedupeKey = `artifact_delivery:${artifact.artifact_id}`;
+    const payload = {
+      artifact_id: artifact.artifact_id || '',
+      artifact_path: artifact.canonical_path || '',
+      artifact_filename: artifact.artifact_filename || '',
+      artifact_type: artifact.artifact_type || 'document',
+      content_hash: artifact.content_hash || '',
+      byte_size: Number(artifact.byte_size || 0),
+      execution_id: executionId,
+      task_id: task.task_id,
+      session_id: task.session_id,
+      workspace_id: artifact.workspace_id || '',
+      verification_state: artifact.verification_state || '',
+      assessment_id: assessment?.assessment_id || '',
+      confidence_score: Number(assessment?.confidence_score || 0),
+      confidence_band: assessment?.confidence_band || '',
+      structure_state: assessment?.structure_state || '',
+      alignment_state: assessment?.alignment_state || '',
+      relay_label: String(options.relayLabel || ''),
+      media_kind: eligibility.media_kind,
+      delivery_requested: true,
+      delivery_confirmed: Boolean(artifact.delivery_confirmed),
+    };
+
+    appendTaskNotificationTx(db, {
+      notification_id: existing?.notification_id || createTaskNotificationId(),
+      task_id: task.task_id,
+      session_id: task.session_id,
+      execution_id: executionId,
+      source_type: 'artifact_delivery',
+      source_id: artifact.artifact_id,
+      notification_kind: ARTIFACT_DELIVERY_NOTIFICATION_KIND,
+      delivery_channel: 'openclaw_tg',
+      delivery_state: existing?.delivery_state || TASK_NOTIFICATION_DELIVERY_STATES.PENDING,
+      title: buildArtifactDeliveryTitle(artifact.artifact_filename || ''),
+      body: buildArtifactDeliveryBody(artifact.artifact_filename || '', artifact.artifact_type || ''),
+      artifact_id: artifact.artifact_id,
+      artifact_path: artifact.canonical_path,
+      media_kind: eligibility.media_kind,
+      relay_label: String(options.relayLabel || ''),
+      task_kind: TASK_KINDS.ARTIFACT_TASK,
+      notification_policy: TASK_NOTIFICATION_POLICIES.COMPLETION_ONLY,
+      proactive_eligible: 0,
+      eligibility_reason: 'verified artifact ready for controlled delivery',
+      delivery_suppressed_reason: ARTIFACT_DELIVERY_CONTROL_REASON,
+      classified_at: timestamp,
+      payload,
+      dedupe_key: dedupeKey,
+      claim_count: existing?.claim_count || 0,
+      claimed_at: existing?.claimed_at || null,
+      delivered_at: existing?.delivered_at || null,
+      delivered_message_id: existing?.delivered_message_id || null,
+      last_error: existing?.last_error || '',
+      next_attempt_at: existing?.next_attempt_at || null,
+      attempt_count: existing?.attempt_count || 0,
+      created_at: existing?.created_at || timestamp,
+      updated_at: timestamp,
+    });
+
+    await updateExecutionArtifactDeliveryStatusTx(db, executionId, {
+      deliveryRequested: true,
+      deliveryConfirmed: Boolean(artifact.delivery_confirmed),
+      reasonCode: 'artifact_delivery_requested',
+      timestamp,
+    });
+
+    return {
+      ok: true,
+      required: true,
+      execution: eligibility.execution,
+      task: eligibility.task,
+      artifact: eligibility.artifact,
+      assessment: eligibility.assessment,
+      file_path: eligibility.file_path,
+      file_size: eligibility.file_size,
+      media_kind: eligibility.media_kind,
+      notification: await getStoredTaskNotificationByArtifactIdTx(db, artifact.artifact_id),
     };
   });
 }
@@ -14783,10 +15803,16 @@ module.exports = {
   attachExecutionWorkspace,
   createExecutionArtifactRecord,
   getExecutionArtifactByExecutionId,
+  getExecutionArtifactByArtifactId,
   getTaskArtifactAssessmentByTaskId,
+  getTaskNotificationByArtifactId,
   getToolFailureFactBySubjectId,
   materializeVerifiedArtifactForExecution,
   updateExecutionArtifactVerification,
+  updateExecutionArtifactDeliveryStatus,
+  assessArtifactDeliveryEligibility,
+  ensureArtifactDeliveryNotificationForExecution,
+  dispatchArtifactDeliveryById,
   assertArtifactPathWithinWorkspace,
   buildExecutionCapabilityRecord,
   persistExecutionCapabilityRecord,
@@ -14842,6 +15868,8 @@ module.exports = {
   dispatchPendingTaskNotifications,
   runOpenClawCliDryRunAdapter,
   buildOpenClawCliNotificationDispatchArgs,
+  buildOpenClawCliArtifactDeliveryArgs,
+  runOpenClawCliArtifactDeliveryAdapter,
   startNotificationDispatcherLoop,
   renderTaskNotificationView,
   appendTaskProgressEvent,

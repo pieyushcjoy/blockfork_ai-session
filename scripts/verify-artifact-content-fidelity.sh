@@ -228,8 +228,15 @@ async function runHappyPath() {
 
   const notifications = await getTaskNotificationsByTaskId(task.task_id);
   assert(Array.isArray(notifications) && notifications.length > 0, 'Expected lifecycle notifications for happy path');
-  assert(notifications.every((notification) => Number(notification.proactive_eligible || 0) === 1), 'Artifact notifications should be proactive eligible');
-  assert(notifications.every((notification) => String(notification.notification_policy || '') === 'progress_and_completion'), 'Artifact notifications should use progress_and_completion');
+  const lifecycleNotifications = notifications.filter((notification) => String(notification.notification_kind || '') !== 'artifact_delivery');
+  const artifactDeliveryNotifications = notifications.filter((notification) => String(notification.notification_kind || '') === 'artifact_delivery');
+  assert(lifecycleNotifications.length > 0, 'Expected artifact lifecycle notifications for happy path');
+  assert(lifecycleNotifications.every((notification) => Number(notification.proactive_eligible || 0) === 1), 'Artifact lifecycle notifications should be proactive eligible');
+  assert(lifecycleNotifications.every((notification) => String(notification.notification_policy || '') === 'progress_and_completion'), 'Artifact lifecycle notifications should use progress_and_completion');
+  if (artifactDeliveryNotifications.length > 0) {
+    assert(artifactDeliveryNotifications.every((notification) => Number(notification.proactive_eligible || 0) === 0), 'Artifact delivery notifications should be controlled only');
+    assert(artifactDeliveryNotifications.every((notification) => String(notification.notification_policy || '') === 'completion_only'), 'Artifact delivery notifications should use completion_only');
+  }
 
   return {
     task_id: task.task_id,
