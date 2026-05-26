@@ -595,7 +595,7 @@ async function createRecoveryTask(runtime, db, label, objectiveText) {
     'markdown_file',
     'Create a markdown file named relay-acceptance-note.md',
     path.join('markdown', 'relay-acceptance-note.md'),
-    '# relay-acceptance-note\n\nThis is a verifier-created markdown artifact.\n',
+    '# Relay Acceptance Note\n\n- Consistency helps teams keep momentum when progress feels slow.\n- It reduces chaos by turning difficult work into repeatable steps.\n- It builds trust because everyone can see steady effort over time.\n- It makes setbacks easier to recover from without losing direction.\n- It compounds small improvements into meaningful long-term results.\n',
     'Created the markdown artifact and verified the result.',
   );
   cases.markdown_file = {
@@ -685,7 +685,7 @@ async function createRecoveryTask(runtime, db, label, objectiveText) {
     'broad_eligible',
     'Create a markdown file named broad-notify.md',
     path.join('markdown', 'broad-notify.md'),
-    '# broad-notify\n\nThis artifact is used to verify dispatcher gating.\n',
+    '# Broad Notify\n\n- Consistency helps teams keep momentum when progress feels slow.\n- It reduces chaos by turning difficult work into repeatable steps.\n- It builds trust because everyone can see steady effort over time.\n- It makes setbacks easier to recover from without losing direction.\n- It compounds small improvements into meaningful long-term results.\n',
     'Created the markdown artifact and verified the result.',
   );
   const broadSilentBefore = await getTaskNotificationsByTaskId(broadSilent.task.task_id);

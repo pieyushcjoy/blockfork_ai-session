@@ -23,16 +23,21 @@ cat > "$TMP_DIR/workspace/html/index.html" <<'HTML'
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Progress Reporting Check</title>
+    <title>Premium Landing Page</title>
   </head>
   <body>
     <header>
-      <h1>BlockFork Progress Reporting</h1>
+      <h1>Launch faster with BlockFork</h1>
     </header>
     <main>
       <section>
-        <h2>Milestones</h2>
-        <p>Task accepted, plan locked, tool work started, artifact created, and verification complete.</p>
+        <h2>Features</h2>
+        <p>Durable task truth and artifact confidence for real workflows.</p>
+        <button>Get Started</button>
+      </section>
+      <section>
+        <h2>Why it works</h2>
+        <p>Each artifact is verified, scored, and tracked across task attempts.</p>
       </section>
     </main>
   </body>

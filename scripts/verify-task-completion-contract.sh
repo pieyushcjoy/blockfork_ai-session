@@ -23,16 +23,21 @@ cat > "$TMP_DIR/workspace/html/index.html" <<'HTML'
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Truthful Completion Contract</title>
+    <title>Premium Landing Page</title>
   </head>
   <body>
     <header>
-      <h1>BlockFork Completion Contract</h1>
+      <h1>Launch faster with BlockFork</h1>
     </header>
     <main>
       <section>
-        <h2>Verified</h2>
-        <p>This landing page was created and verified successfully.</p>
+        <h2>Features</h2>
+        <p>Durable task truth and artifact confidence for real workflows.</p>
+        <button>Get Started</button>
+      </section>
+      <section>
+        <h2>Why it works</h2>
+        <p>Each artifact is verified, scored, and tracked across task attempts.</p>
       </section>
     </main>
   </body>

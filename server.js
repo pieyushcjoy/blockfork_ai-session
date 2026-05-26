@@ -2623,6 +2623,10 @@ async function ensureBillingDb() {
       canonical_path TEXT NOT NULL,
       verification_state TEXT NOT NULL,
       reason_code TEXT NOT NULL DEFAULT '',
+      artifact_filename TEXT NOT NULL DEFAULT '',
+      artifact_type TEXT NOT NULL DEFAULT 'text',
+      content_hash TEXT NOT NULL DEFAULT '',
+      byte_size INTEGER NOT NULL DEFAULT 0,
       delivery_requested INTEGER NOT NULL DEFAULT 0,
       delivery_confirmed INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -3076,6 +3080,25 @@ async function ensureBillingDb() {
     }
   }
 
+  const executionArtifactColumnsStmt = billingDb.prepare('PRAGMA table_info(execution_artifacts)');
+  const executionArtifactColumns = new Set();
+  while (executionArtifactColumnsStmt.step()) {
+    executionArtifactColumns.add(String(executionArtifactColumnsStmt.getAsObject().name || ''));
+  }
+  executionArtifactColumnsStmt.free();
+
+  const executionArtifactAlterations = [
+    ['artifact_filename', "TEXT NOT NULL DEFAULT ''"],
+    ['artifact_type', "TEXT NOT NULL DEFAULT 'text'"],
+    ['content_hash', "TEXT NOT NULL DEFAULT ''"],
+    ['byte_size', 'INTEGER NOT NULL DEFAULT 0'],
+  ];
+  for (const [columnName, columnType] of executionArtifactAlterations) {
+    if (!executionArtifactColumns.has(columnName)) {
+      billingDb.run(`ALTER TABLE execution_artifacts ADD COLUMN ${columnName} ${columnType}`);
+    }
+  }
+
   const executionCapabilityColumnsStmt = billingDb.prepare('PRAGMA table_info(execution_capabilities)');
   const executionCapabilityColumns = new Set();
   while (executionCapabilityColumnsStmt.step()) {
@@ -3413,6 +3436,10 @@ function hydrateExecutionArtifactRow(row) {
     canonical_path: String(row.canonical_path || ''),
     verification_state: String(row.verification_state || ''),
     reason_code: String(row.reason_code || ''),
+    artifact_filename: String(row.artifact_filename || ''),
+    artifact_type: String(row.artifact_type || 'text'),
+    content_hash: String(row.content_hash || ''),
+    byte_size: Number(row.byte_size || 0),
     delivery_requested: Number(row.delivery_requested || 0),
     delivery_confirmed: Number(row.delivery_confirmed || 0),
     created_at: row.created_at || '',
@@ -4113,6 +4140,14 @@ async function getVerifiedTaskArtifactAssessmentForExecutionId(executionId) {
   }
 
   if (assessment.artifact_verification_state !== ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    return null;
+  }
+
+  if (
+    assessment.confidence_band !== TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH
+    || assessment.structure_state !== TASK_ARTIFACT_STRUCTURE_STATES.VALID
+    || assessment.alignment_state !== TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED
+  ) {
     return null;
   }
 
@@ -6362,9 +6397,9 @@ function taskStateFromArtifactVerification(verificationState, currentState) {
   }
   if (verificationState === ARTIFACT_VERIFICATION_STATES.REJECTED) {
     if (currentState === TASK_STATES.ARTIFACT_CREATED || currentState === TASK_STATES.ARTIFACT_VERIFIED) {
-      return TASK_STATES.PARTIALLY_COMPLETED;
+      return TASK_STATES.RECOVERY_REQUIRED;
     }
-    return TASK_STATES.FAILED;
+    return TASK_STATES.RECOVERY_REQUIRED;
   }
   if (verificationState === ARTIFACT_VERIFICATION_STATES.PENDING) {
     return TASK_STATES.ARTIFACT_CREATED;
@@ -6703,7 +6738,7 @@ function classifyArtifactStructure(family, content, declaredPath = '') {
 
 function classifyArtifactAlignment(family, objectiveText = '', content = '', completionText = '', structure = null) {
   const objectiveTokens = tokenizeTaskObjective(objectiveText);
-  const haystack = normalizeArtifactTextSample([objectiveText, content, completionText].join('\n')).toLowerCase();
+  const haystack = normalizeArtifactTextSample([content, completionText].join('\n')).toLowerCase();
   const keywordHits = objectiveTokens.filter((token) => haystack.includes(token)).length;
   const familyExpectationMatches = {
     html: /\b(html|website|landing page|site|webpage)\b/i.test(objectiveText),
@@ -6857,6 +6892,7 @@ function classifyToolFailureObservation(observation = {}) {
     'artifact_not_nonempty_file',
     'artifact_delivery_not_confirmed',
     'artifact_missing',
+    'artifact_semantic_verification_failed',
   ].includes(artifactReason)) {
     return {
       category: TOOL_FAILURE_CATEGORIES.ARTIFACT_MISSING,
@@ -7044,6 +7080,10 @@ async function syncTaskArtifactAssessmentTx(db, executionId, options = {}) {
     artifact_id: artifact.artifact_id || '',
     declared_path: artifact.declared_path || '',
     canonical_path: artifact.canonical_path || '',
+    artifact_filename: artifact.artifact_filename || '',
+    artifact_type: artifact.artifact_type || 'text',
+    content_hash: artifact.content_hash || '',
+    byte_size: Number(artifact.byte_size || 0),
     objective_text: task.objective_text || '',
     verification_state: artifact.verification_state || '',
     evidence_reason: '',
@@ -9895,6 +9935,397 @@ function extractManagedArtifactFilename(promptText = '') {
   return '';
 }
 
+function extractManagedArtifactBulletCount(promptText = '') {
+  const text = String(promptText || '');
+  const bulletMatch = text.match(/\b(\d{1,2})\s*[- ]?bullet(?:s)?\b/i)
+    || text.match(/\b(?:bullet(?:s)?\s*(?:count|count of|of)?\s*[:=]?\s*)(\d{1,2})\b/i);
+  const count = Number(bulletMatch?.[1] || 0);
+  if (Number.isFinite(count) && count > 0 && count <= 12) {
+    return count;
+  }
+  return 5;
+}
+
+function humanizeManagedArtifactTitle(filename = '') {
+  const stem = path.parse(String(filename || '')).name || '';
+  const normalized = stem.replace(/[._-]+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+  return normalized.replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function extractManagedArtifactTopic(promptText = '') {
+  const text = String(promptText || '');
+  const whyMatch = text.match(/\bwhy\s+(.+?)\s+matters\b/i);
+  if (whyMatch?.[1]) {
+    return whyMatch[1].trim().replace(/[.?!,;:]+$/g, '');
+  }
+
+  const summaryMatch = text.match(/\bsummary\s+of\s+(.+?)(?:[.?!]|$)/i);
+  if (summaryMatch?.[1]) {
+    return summaryMatch[1].trim().replace(/[.?!,;:]+$/g, '');
+  }
+
+  const aboutMatch = text.match(/\babout\s+(.+?)(?:[.?!]|$)/i);
+  if (aboutMatch?.[1]) {
+    return aboutMatch[1].trim().replace(/[.?!,;:]+$/g, '');
+  }
+
+  return '';
+}
+
+function looksLikeManagedArtifactContent(content = '', filename = '') {
+  const text = normalizeArtifactTextSample(content).trim();
+  if (!text) {
+    return false;
+  }
+
+  const lower = text.toLowerCase();
+  if (/\bi'?ve got the request\b/i.test(lower) || /\bi'?ll write up that summary\b/i.test(lower) || /\bgot the request\b/i.test(lower)) {
+    return false;
+  }
+
+  const headingSignals = countMatches([
+    /^#\s+/m,
+    /^##\s+/m,
+    /^###\s+/m,
+  ], text);
+  const listSignals = countMatches([
+    /^-\s+/m,
+    /^\*\s+/m,
+    /^\d+\.\s+/m,
+  ], text);
+  const filenameStem = String(path.parse(String(filename || '')).name || '').replace(/[._-]+/g, ' ').trim().toLowerCase();
+  const filenameSignal = Boolean(filenameStem) && lower.includes(filenameStem);
+
+  if (headingSignals >= 1 && listSignals >= 1 && text.length >= 100) {
+    return true;
+  }
+  if (filenameSignal && headingSignals >= 1 && listSignals >= 1 && text.length >= 80) {
+    return true;
+  }
+
+  return false;
+}
+
+function buildManagedMarkdownArtifactDraft(promptText = '', filename = '') {
+  const title = humanizeManagedArtifactTitle(filename) || 'Project Summary';
+  const topic = extractManagedArtifactTopic(promptText);
+  const bulletCount = extractManagedArtifactBulletCount(promptText);
+  const topicSubject = topic
+    ? topic.replace(/\s+/g, ' ').trim()
+    : 'consistency';
+  const subjectLine = topicSubject.charAt(0).toUpperCase() + topicSubject.slice(1);
+  const baseBullets = [
+    `${subjectLine} helps teams keep momentum when progress feels slow.`,
+    'It reduces chaos by turning difficult work into repeatable steps.',
+    'It builds trust because everyone can see steady effort over time.',
+    'It makes setbacks easier to recover from without losing direction.',
+    'It compounds small improvements into meaningful long-term results.',
+    'It keeps decision-making calmer and more repeatable under pressure.',
+    'It helps small wins add up into visible progress.',
+    'It makes the next step clearer when the work gets messy.',
+  ];
+  const bullets = baseBullets.slice(0, Math.max(1, bulletCount));
+  while (bullets.length < bulletCount) {
+    bullets.push('It keeps the work steady and easier to trust over time.');
+  }
+
+  return `# ${title}\n\n${bullets.map((line) => `- ${line}`).join('\n')}`;
+}
+
+function buildManagedArtifactDraftText(promptText = '', completionText = '', options = {}) {
+  const filename = String(options.filename || extractManagedArtifactFilename(promptText) || '').trim();
+  const assistantText = String(options.assistantText || completionText || '').trim();
+  if (looksLikeManagedArtifactContent(assistantText, filename)) {
+    return assistantText;
+  }
+
+  const promptLower = String(promptText || '').toLowerCase();
+  const wantsMarkdown = /\.md(markdown)?$/i.test(filename)
+    || /\bmarkdown\b/.test(promptLower)
+    || /\b(summary|report|notes)\b/.test(promptLower);
+
+  if (wantsMarkdown) {
+    return buildManagedMarkdownArtifactDraft(promptText, filename);
+  }
+
+  return assistantText;
+}
+
+function sanitizeManagedArtifactFilename(filename = '') {
+  const candidate = String(filename || '').trim();
+  if (!candidate) {
+    return { ok: false, reason: 'artifact_filename_missing' };
+  }
+  if (path.isAbsolute(candidate)) {
+    return { ok: false, reason: 'artifact_invalid' };
+  }
+  if (candidate === '.' || candidate === '..') {
+    return { ok: false, reason: 'artifact_invalid' };
+  }
+  if (candidate.includes('/') || candidate.includes('\\')) {
+    return { ok: false, reason: 'artifact_invalid' };
+  }
+  if (path.basename(candidate) !== candidate) {
+    return { ok: false, reason: 'artifact_invalid' };
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(candidate)) {
+    return { ok: false, reason: 'artifact_invalid' };
+  }
+  return { ok: true, filename: candidate };
+}
+
+function getSingleManagedArtifactWorkspaceRoot() {
+  const roots = getAllowedWorkspaceRoots();
+  if (!roots.length) {
+    return { ok: false, reason: 'artifact_workspace_roots_unconfigured' };
+  }
+  if (roots.length !== 1) {
+    return { ok: false, reason: 'artifact_path_ambiguous_workspace' };
+  }
+  return { ok: true, root: roots[0] };
+}
+
+function buildManagedArtifactOutputPath(canonicalRoot, executionId, filename) {
+  return path.join(canonicalRoot, 'artifacts', String(executionId || ''), filename);
+}
+
+function writeTextFileAtomically(filePath, contents) {
+  const normalizedPath = path.resolve(filePath);
+  const directory = path.dirname(normalizedPath);
+  const tempPath = path.join(directory, `.tmp-${crypto.randomUUID()}`);
+  const payload = String(contents || '');
+  let fd = null;
+  try {
+    fs.mkdirSync(directory, { recursive: true });
+    fd = fs.openSync(tempPath, 'wx', 0o600);
+    fs.writeFileSync(fd, payload, { encoding: 'utf8' });
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tempPath, normalizedPath);
+    return { ok: true, path: normalizedPath, tempPath };
+  } catch (error) {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch (_) {}
+    }
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+      }
+    } catch (_) {}
+    return {
+      ok: false,
+      reason: error?.code || error?.message || 'artifact_output_invalid',
+      path: normalizedPath,
+      tempPath,
+    };
+  }
+}
+
+async function materializeVerifiedArtifactForExecution(executionId, completionText, options = {}) {
+  const execution = await getExecutionById(executionId);
+  if (!execution) {
+    return { required: true, ok: false, reason: 'artifact_execution_missing' };
+  }
+
+  const task = await getTaskByExecutionId(executionId);
+  if (!task) {
+    return { required: true, ok: false, reason: 'artifact_execution_missing' };
+  }
+
+  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+    return { required: false, ok: true, skipped: true };
+  }
+
+  const promptText = String(task.objective_text || '');
+  const rawFilename = String(options.filename || extractManagedArtifactFilename(task.objective_text || '') || 'requested-file.md').trim();
+  const sanitizedFilename = sanitizeManagedArtifactFilename(rawFilename);
+  if (!sanitizedFilename.ok) {
+    return {
+      required: true,
+      ok: false,
+      reason: sanitizedFilename.reason,
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  const explicitArtifactContent = Object.prototype.hasOwnProperty.call(options, 'artifactContent')
+    ? String(options.artifactContent ?? '').trimEnd()
+    : null;
+  const draftedArtifactContent = buildManagedArtifactDraftText(promptText, completionText, {
+    filename: sanitizedFilename.filename,
+    assistantText: completionText,
+  });
+  const content = String(
+    explicitArtifactContent !== null
+      ? explicitArtifactContent
+      : draftedArtifactContent
+  ).trimEnd();
+  if (!content) {
+    return {
+      required: true,
+      ok: false,
+      reason: 'artifact_output_invalid',
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  const rootSelection = getSingleManagedArtifactWorkspaceRoot();
+  if (!rootSelection.ok) {
+    return {
+      required: true,
+      ok: false,
+      reason: rootSelection.reason,
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  const workspace = await findOrCreateWorkspaceBinding(rootSelection.root.canonical_root, rootSelection.root.root_source, options);
+  await attachExecutionWorkspace(executionId, workspace.workspace_id, {
+    requestId: options.requestId || execution.last_request_id || '',
+    actorSource: options.actorSource || 'runtime',
+    reasonCode: 'execution_workspace_bound',
+  });
+
+  const artifactDir = path.join(workspace.canonical_root, 'artifacts', String(executionId || ''));
+  fs.mkdirSync(artifactDir, { recursive: true });
+  const finalPath = buildManagedArtifactOutputPath(workspace.canonical_root, executionId, sanitizedFilename.filename);
+  const canonicalResolution = resolveCanonicalArtifactPath(finalPath);
+  if (!canonicalResolution.ok) {
+    return {
+      required: true,
+      ok: false,
+      reason: canonicalResolution.reason,
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  const artifactType = inferArtifactFamily(task.objective_text || '', finalPath, content, content);
+  const byteSize = Buffer.byteLength(content, 'utf8');
+  const contentHash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+  const fileWrite = writeTextFileAtomically(canonicalResolution.canonical_path, content);
+  if (!fileWrite.ok) {
+    return {
+      required: true,
+      ok: false,
+      reason: fileWrite.reason || 'artifact_output_invalid',
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  let artifact = null;
+  try {
+    artifact = await createExecutionArtifactRecord({
+      executionId,
+      workspaceId: workspace.workspace_id,
+      declaredPath: canonicalResolution.declared_path,
+      canonicalPath: canonicalResolution.canonical_path,
+      verificationState: ARTIFACT_VERIFICATION_STATES.PENDING,
+      deliveryRequested: false,
+      deliveryConfirmed: false,
+      reasonCode: 'artifact_file_materialized',
+      artifactFilename: sanitizedFilename.filename,
+      artifactType,
+      contentHash,
+      byteSize,
+      requestId: options.requestId || execution.last_request_id || '',
+      actorSource: options.actorSource || 'runtime',
+      timestamp: options.timestamp || getTimestamp(),
+    });
+    artifact = await updateExecutionArtifactVerification(executionId, ARTIFACT_VERIFICATION_STATES.VERIFIED, {
+      reasonCode: 'artifact_file_verified',
+      completionText: content,
+      canonicalPath: canonicalResolution.canonical_path,
+      declaredPath: canonicalResolution.declared_path,
+      deliveryRequested: false,
+      deliveryConfirmed: false,
+      artifactFilename: sanitizedFilename.filename,
+      artifactType,
+      contentHash,
+      byteSize,
+      requestId: options.requestId || execution.last_request_id || '',
+      actorSource: options.actorSource || 'runtime',
+      timestamp: options.timestamp || getTimestamp(),
+    });
+  } catch (error) {
+    try {
+      if (fs.existsSync(canonicalResolution.canonical_path)) {
+        fs.unlinkSync(canonicalResolution.canonical_path);
+      }
+    } catch (_) {}
+    return {
+      required: true,
+      ok: false,
+      reason: error?.code || error?.message || 'artifact_output_invalid',
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  const assessment = await getTaskArtifactAssessmentByTaskId(task.task_id);
+  return {
+    required: true,
+    ok: true,
+    workspace,
+    artifact,
+    assessment,
+    filePath: canonicalResolution.canonical_path,
+    filename: sanitizedFilename.filename,
+    artifactType,
+    contentHash,
+    byteSize,
+  };
+}
+
+function buildManagedArtifactSuccessText(filename = '', artifactType = '') {
+  const normalizedFilename = String(filename || '').trim();
+  const noun = normalizedFilename || (artifactType ? `requested ${artifactType}` : 'requested artifact');
+  return `I created ${noun} with the requested content.`;
+}
+
+async function attemptManagedArtifactMaterializationBeforeTerminalRecovery(executionId, completionText, options = {}) {
+  const execution = await getExecutionById(executionId);
+  if (!execution) {
+    return { required: true, ok: false, reason: 'artifact_execution_missing' };
+  }
+
+  const task = await getTaskByExecutionId(executionId);
+  if (!task) {
+    return { required: true, ok: false, reason: 'artifact_execution_missing' };
+  }
+
+  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+    return { required: false, ok: true, skipped: true };
+  }
+
+  const materialized = await materializeVerifiedArtifactForExecution(executionId, completionText, options);
+  if (!materialized.ok) {
+    return materialized;
+  }
+
+  const assessment = await getVerifiedTaskArtifactAssessmentForExecutionId(executionId);
+  if (!assessment) {
+    return {
+      required: true,
+      ok: false,
+      reason: 'artifact_semantic_verification_failed',
+      fallbackText: materialized.fallbackText || buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+    };
+  }
+
+  return {
+    required: true,
+    ok: true,
+    materialized,
+    assessment,
+    successText: buildManagedArtifactSuccessText(materialized.filename, materialized.artifactType),
+  };
+}
+
 function shouldBuildManagedArtifactFallbackText(promptText = '') {
   const normalized = String(promptText || '').toLowerCase();
   if (!normalized) {
@@ -10026,6 +10457,10 @@ async function createExecutionArtifactRecord(options = {}) {
 
     const current = await getStoredExecutionArtifactByExecutionId(db, executionId);
     const timestamp = options.timestamp || getTimestamp();
+    const artifactFilename = String(options.artifactFilename || '').trim();
+    const artifactType = String(options.artifactType || 'text');
+    const contentHash = String(options.contentHash || '');
+    const byteSize = Number(options.byteSize || 0);
     const deliveryRequested = Number(Boolean(options.deliveryRequested));
     const deliveryConfirmed = Number(Boolean(options.deliveryConfirmed));
 
@@ -10039,6 +10474,10 @@ async function createExecutionArtifactRecord(options = {}) {
             canonical_path = ?,
             verification_state = ?,
             reason_code = ?,
+            artifact_filename = ?,
+            artifact_type = ?,
+            content_hash = ?,
+            byte_size = ?,
             delivery_requested = ?,
             delivery_confirmed = ?,
             updated_at = ?
@@ -10049,6 +10488,10 @@ async function createExecutionArtifactRecord(options = {}) {
         options.canonicalPath,
         options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
         options.reasonCode || '',
+        artifactFilename,
+        artifactType,
+        contentHash,
+        byteSize,
         deliveryRequested,
         deliveryConfirmed,
         timestamp,
@@ -10089,6 +10532,10 @@ async function createExecutionArtifactRecord(options = {}) {
         canonical_path: options.canonicalPath,
         verification_state: options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
         reason_code: options.reasonCode || '',
+        artifact_filename: artifactFilename,
+        artifact_type: artifactType,
+        content_hash: contentHash,
+        byte_size: byteSize,
         delivery_requested: deliveryRequested,
         delivery_confirmed: deliveryConfirmed,
         updated_at: timestamp,
@@ -10099,8 +10546,8 @@ async function createExecutionArtifactRecord(options = {}) {
     const insert = db.prepare(`
       INSERT INTO execution_artifacts (
         artifact_id, execution_id, workspace_id, declared_path, canonical_path, verification_state,
-        reason_code, delivery_requested, delivery_confirmed, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        reason_code, artifact_filename, artifact_type, content_hash, byte_size, delivery_requested, delivery_confirmed, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     insert.run([
       artifactId,
@@ -10110,6 +10557,10 @@ async function createExecutionArtifactRecord(options = {}) {
       options.canonicalPath,
       options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
       options.reasonCode || '',
+      artifactFilename,
+      artifactType,
+      contentHash,
+      byteSize,
       deliveryRequested,
       deliveryConfirmed,
       timestamp,
@@ -10152,6 +10603,10 @@ async function createExecutionArtifactRecord(options = {}) {
       canonical_path: options.canonicalPath,
       verification_state: options.verificationState || ARTIFACT_VERIFICATION_STATES.PENDING,
       reason_code: options.reasonCode || '',
+      artifact_filename: artifactFilename,
+      artifact_type: artifactType,
+      content_hash: contentHash,
+      byte_size: byteSize,
       delivery_requested: deliveryRequested,
       delivery_confirmed: deliveryConfirmed,
       created_at: timestamp,
@@ -10168,10 +10623,20 @@ async function updateExecutionArtifactVerification(executionId, verificationStat
     }
 
     const timestamp = options.timestamp || getTimestamp();
+    const artifactFilename = String(options.artifactFilename || current.artifact_filename || '').trim();
+    const artifactType = String(options.artifactType || current.artifact_type || 'text');
+    const contentHash = String(options.contentHash || current.content_hash || '');
+    const byteSize = Number.isFinite(Number(options.byteSize))
+      ? Number(options.byteSize)
+      : Number(current.byte_size || 0);
     const update = db.prepare(`
       UPDATE execution_artifacts
       SET verification_state = ?,
           reason_code = ?,
+          artifact_filename = ?,
+          artifact_type = ?,
+          content_hash = ?,
+          byte_size = ?,
           delivery_requested = ?,
           delivery_confirmed = ?,
           canonical_path = ?,
@@ -10182,6 +10647,10 @@ async function updateExecutionArtifactVerification(executionId, verificationStat
     update.run([
       verificationState,
       options.reasonCode || '',
+      artifactFilename,
+      artifactType,
+      contentHash,
+      byteSize,
       Number(Boolean(options.deliveryRequested ?? current.delivery_requested)),
       Number(Boolean(options.deliveryConfirmed ?? current.delivery_confirmed)),
       options.canonicalPath || current.canonical_path,
@@ -10208,6 +10677,10 @@ async function updateExecutionArtifactVerification(executionId, verificationStat
       ...current,
       verification_state: verificationState,
       reason_code: options.reasonCode || '',
+      artifact_filename: artifactFilename,
+      artifact_type: artifactType,
+      content_hash: contentHash,
+      byte_size: byteSize,
       delivery_requested: Number(Boolean(options.deliveryRequested ?? current.delivery_requested)),
       delivery_confirmed: Number(Boolean(options.deliveryConfirmed ?? current.delivery_confirmed)),
       canonical_path: options.canonicalPath || current.canonical_path,
@@ -10362,6 +10835,15 @@ async function validateArtifactHonestyOrError(reqBody, completionText, options =
     };
   }
 
+  let verifiedArtifactText = String(completionText || '');
+  if (evidenceCheck.canonical_path) {
+    try {
+      if (fs.existsSync(evidenceCheck.canonical_path)) {
+        verifiedArtifactText = normalizeArtifactTextSample(fs.readFileSync(evidenceCheck.canonical_path, 'utf8'));
+      }
+    } catch (_) {}
+  }
+
   if (options.executionId) {
     await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.VERIFIED, {
       reasonCode: '',
@@ -10369,8 +10851,28 @@ async function validateArtifactHonestyOrError(reqBody, completionText, options =
       deliveryConfirmed: evidenceCheck.delivery_confirmed,
       canonicalPath: evidenceCheck.canonical_path,
       declaredPath: evidenceCheck.declared_path,
-      completionText,
+      completionText: verifiedArtifactText,
     });
+
+    const verifiedAssessment = await getVerifiedTaskArtifactAssessmentForExecutionId(options.executionId);
+    if (!verifiedAssessment) {
+      await updateExecutionArtifactVerification(options.executionId, ARTIFACT_VERIFICATION_STATES.REJECTED, {
+        reasonCode: 'artifact_semantic_verification_failed',
+        deliveryRequested: evidenceCheck.delivery_requested,
+        deliveryConfirmed: evidenceCheck.delivery_confirmed,
+        canonicalPath: evidenceCheck.canonical_path,
+        declaredPath: evidenceCheck.declared_path,
+        completionText: verifiedArtifactText,
+      });
+      return {
+        statusCode: 422,
+        message: 'Artifact verification failed: artifact_semantic_verification_failed',
+        type: 'invalid_request_error',
+        code: 'artifact_semantic_verification_failed',
+        reason: 'artifact_semantic_verification_failed',
+        requiresRecovery: Boolean(options.meaningfulOutputStarted),
+      };
+    }
   }
 
   return null;
@@ -11593,6 +12095,123 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
 
   const normalized = normalizeChatCompletionResponse(payload, responseAlias);
   const assistantText = stringifyTextContent(normalized?.choices?.[0]?.message?.content ?? '');
+  const managedArtifactVerificationOutcome = billing?.execution_id
+    ? await materializeVerifiedArtifactForExecution(billing.execution_id, assistantText, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+    })
+    : null;
+  if (managedArtifactVerificationOutcome?.required && !managedArtifactVerificationOutcome.ok) {
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0,
+        status: 'interrupted',
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        endpoint: billing.endpoint || '',
+        error_code: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        status_code: 200,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await markExecutionRecoveryRequired(billing.execution_id, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        reasonCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        recoveryReason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        recoveryNotes: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      });
+    }
+    const fallbackText = managedArtifactOutcome.fallbackText || buildManagedTerminalFallbackText(req.body || {});
+    normalized.choices = Array.isArray(normalized.choices) && normalized.choices.length > 0
+      ? normalized.choices.map((choice, index) => (index === 0 ? {
+        ...choice,
+        message: {
+          ...(choice?.message || {}),
+          content: fallbackText,
+        },
+      } : choice))
+      : [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: fallbackText,
+        },
+        finish_reason: 'stop',
+      }];
+    incrementUsage(session, extractUsageTokens(payload?.usage)?.totalTokens || 0);
+    logRoutingDecision('local_nonstream_retry_artifact_fallback', {
+      request_id: requestId,
+      model: descriptor.upstreamId,
+      reason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+    });
+    writeChatSseFromNonStreamPayload(res, normalized, responseAlias);
+    return true;
+  }
+  const managedArtifactOutcome = terminalRecoveryArtifactOutcome
+    || (billing?.execution_id
+      ? await materializeVerifiedArtifactForExecution(billing.execution_id, assistantText, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+      })
+      : null);
+  if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: usage.inputTokens || billing.input_tokens || 0,
+        output_tokens: usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0)),
+        estimated_cost_usd: estimateCostForDescriptor(billing.cost_descriptor || descriptor,
+          usage.inputTokens || billing.input_tokens || 0,
+          usage.outputTokens || Math.max(0, usage.totalTokens - (billing.input_tokens || 0))
+        ),
+        status: 'interrupted',
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: managedArtifactVerificationOutcome.reason || 'artifact_output_invalid',
+        endpoint: billing.endpoint || '',
+        error_code: managedArtifactVerificationOutcome.reason || 'artifact_output_invalid',
+        status_code: 200,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await markExecutionRecoveryRequired(billing.execution_id, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+      reasonCode: managedArtifactVerificationOutcome.reason || 'artifact_output_invalid',
+        recoveryReason: managedArtifactVerificationOutcome.reason || 'artifact_output_invalid',
+        recoveryNotes: managedArtifactVerificationOutcome.reason || 'artifact_output_invalid',
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      });
+    }
+    const fallbackText = managedArtifactVerificationOutcome.fallbackText || buildManagedTerminalFallbackText(req.body || {});
+    return res.status(200).json(
+      normalizeResponsesFallbackResponseFromChat(chatPayload, PUBLIC_MODEL_ALIAS, fallbackText)
+    );
+  }
   const artifactError = await validateArtifactHonestyOrError(req.body, assistantText, {
     executionId: billing?.execution_id || '',
     requestId: billing?.request_id || '',
@@ -11811,6 +12430,25 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
       errorCode: details.errorCode || '',
       meaningfulOutputStarted: state.meaningfulOutputStarted,
     });
+    const managedArtifactOutcome = billing.execution_id && state.meaningfulOutputStarted
+      ? await materializeVerifiedArtifactForExecution(billing.execution_id, state.text, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+      })
+      : null;
+    if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
+      classification = {
+        targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+        billingStatus: 'interrupted',
+        reasonCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        recoveryReason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+      };
+      details = {
+        ...details,
+        errorCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        notes: managedArtifactOutcome.reason || 'artifact_output_invalid',
+      };
+    }
     if (billing.execution_id && state.meaningfulOutputStarted) {
       const artifactError = await validateArtifactHonestyOrError(retryOptions.originalBody || req.body, state.text, {
         executionId: billing.execution_id,
@@ -12074,7 +12712,7 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
     res.write(output);
   });
 
-  upstream.body.on('end', () => {
+  upstream.body.on('end', async () => {
     if (state.retryInProgress && !state.wroteHeaders) {
       return;
     }
@@ -12132,6 +12770,20 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
       if (output) {
         writeHeadersIfNeeded();
         res.write(output);
+      }
+    }
+
+    if (billing?.execution_id && !String(state.text || '').trim()) {
+      const terminalRecoveryArtifactOutcome = await attemptManagedArtifactMaterializationBeforeTerminalRecovery(
+        billing.execution_id,
+        state.text,
+        {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+        }
+      );
+      if (terminalRecoveryArtifactOutcome?.ok) {
+        state.text = terminalRecoveryArtifactOutcome.successText || state.text;
       }
     }
 
@@ -12333,6 +12985,25 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       errorCode: details.errorCode || '',
       meaningfulOutputStarted: state.meaningfulOutputStarted,
     });
+    const managedArtifactOutcome = billing.execution_id && state.meaningfulOutputStarted
+      ? await materializeVerifiedArtifactForExecution(billing.execution_id, state.text, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+      })
+      : null;
+    if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
+      classification = {
+        targetState: EXECUTION_STATES.RECOVERY_REQUIRED,
+        billingStatus: 'interrupted',
+        reasonCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        recoveryReason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+      };
+      details = {
+        ...details,
+        errorCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        notes: managedArtifactOutcome.reason || 'artifact_output_invalid',
+      };
+    }
     if (billing.execution_id && state.meaningfulOutputStarted) {
       const artifactError = await validateArtifactHonestyOrError(retryOptions.originalBody || req.body, state.text, {
         executionId: billing.execution_id,
@@ -12670,13 +13341,29 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       }
     }
 
+    let terminalRecoveryArtifactOutcome = null;
+    if (billing?.execution_id && !String(state.text || '').trim()) {
+      terminalRecoveryArtifactOutcome = await attemptManagedArtifactMaterializationBeforeTerminalRecovery(
+        billing.execution_id,
+        state.text,
+        {
+          requestId: billing.request_id,
+          actorSource: 'runtime',
+        }
+      );
+      if (terminalRecoveryArtifactOutcome?.ok) {
+        state.text = terminalRecoveryArtifactOutcome.successText || state.text;
+      }
+    }
+
     writeHeadersIfNeeded();
     sendCreatedIfNeeded();
     let verifiedArtifactAssessment = null;
     try {
-      verifiedArtifactAssessment = billing?.execution_id
+      verifiedArtifactAssessment = terminalRecoveryArtifactOutcome?.assessment
+        || (billing?.execution_id
         ? await getVerifiedTaskArtifactAssessmentForExecutionId(billing.execution_id)
-        : null;
+        : null);
     } catch (error) {
       verifiedArtifactAssessment = null;
     }
@@ -12953,7 +13640,88 @@ async function handleChatCompletion(req, res) {
   }
   const responsePayload = responseResult.payload;
 
-  const assistantText = stringifyTextContent(responsePayload?.choices?.[0]?.message?.content ?? '');
+  let assistantText = stringifyTextContent(responsePayload?.choices?.[0]?.message?.content ?? '');
+  const terminalRecoveryArtifactOutcome = billing?.execution_id && !assistantText.trim()
+    ? await attemptManagedArtifactMaterializationBeforeTerminalRecovery(billing.execution_id, assistantText, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+    })
+    : null;
+  if (terminalRecoveryArtifactOutcome?.ok) {
+    assistantText = terminalRecoveryArtifactOutcome.successText || assistantText;
+    if (Array.isArray(responsePayload?.choices) && responsePayload.choices.length > 0) {
+      responsePayload.choices = responsePayload.choices.map((choice, index) => (index === 0 ? {
+        ...choice,
+        message: {
+          ...(choice?.message || {}),
+          content: assistantText,
+        },
+      } : choice));
+    }
+  }
+  const managedArtifactOutcome = billing?.execution_id
+    ? await materializeVerifiedArtifactForExecution(billing.execution_id, assistantText, {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+    })
+    : null;
+  if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
+    if (billing?.reserved) {
+      await finalizeBillingRequest({
+        request_id: billing.request_id,
+        timestamp: getTimestamp(),
+        route: billing.route,
+        session_id: req.session.session_id,
+        execution_id: billing.execution_id || null,
+        primary_model: billing.primary_model || '',
+        model_used: billing.model_used,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0,
+        status: 'interrupted',
+        fallback_triggered: Number(Boolean(billing.fallback_triggered)),
+        failure_reason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        endpoint: billing.endpoint || '',
+        error_code: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        status_code: 200,
+        response_body: '',
+        reserved_cost_usd: billing.reserved_cost_usd,
+      });
+    }
+    if (billing?.execution_id) {
+      await markExecutionRecoveryRequired(billing.execution_id, {
+        requestId: billing.request_id,
+        actorSource: 'runtime',
+        reasonCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        recoveryReason: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        recoveryNotes: managedArtifactOutcome.reason || 'artifact_output_invalid',
+        leaseId: billing.execution_lease_id,
+        leaseHolder: billing.execution_lease_holder,
+        leaseEpoch: billing.execution_lease_epoch,
+      });
+    }
+    const fallbackText = managedArtifactOutcome.fallbackText || buildManagedTerminalFallbackText(req.body || {});
+    const fallbackPayload = {
+      ...responsePayload,
+      choices: Array.isArray(responsePayload?.choices) && responsePayload.choices.length > 0
+        ? responsePayload.choices.map((choice, index) => (index === 0 ? {
+          ...choice,
+          message: {
+            ...(choice?.message || {}),
+            content: fallbackText,
+          },
+        } : choice))
+        : [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: fallbackText,
+          },
+          finish_reason: 'stop',
+        }],
+    };
+    return res.status(200).json(fallbackPayload);
+  }
   const artifactError = await validateArtifactHonestyOrError(req.body, assistantText, {
     executionId: billing?.execution_id || '',
     requestId: billing?.request_id || '',
@@ -14017,6 +14785,7 @@ module.exports = {
   getExecutionArtifactByExecutionId,
   getTaskArtifactAssessmentByTaskId,
   getToolFailureFactBySubjectId,
+  materializeVerifiedArtifactForExecution,
   updateExecutionArtifactVerification,
   assertArtifactPathWithinWorkspace,
   buildExecutionCapabilityRecord,
@@ -14087,6 +14856,8 @@ module.exports = {
   prepareArtifactBindingForExecution,
   checkArtifactEvidence,
   validateArtifactHonestyOrError,
+  buildManagedArtifactSuccessText,
+  attemptManagedArtifactMaterializationBeforeTerminalRecovery,
   markExecutionRecoveryRequired,
   classifyExecutionInterruption,
   classifyManagedTerminalCompletionIntegrity,

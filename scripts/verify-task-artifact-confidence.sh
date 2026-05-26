@@ -53,6 +53,7 @@ cat > "$TMP_DIR/workspace/md/brief.md" <<'MD'
 - Durable execution truth is complete.
 - Task truth now spans multiple executions.
 - Artifact confidence should distinguish existence from adequacy.
+- This repository brief keeps the verification layers easy to follow.
 
 ## Notes
 
@@ -96,7 +97,19 @@ const {
   getTaskById,
 } = runtime;
 
-async function runCase({ objectiveText, relativePath, completionText, expectedBand, expectedStructure, expectedAlignment, expectedVerification, minimumScore, label }) {
+async function runCase({
+  objectiveText,
+  relativePath,
+  completionText,
+  expectedBand,
+  expectedStructure,
+  expectedAlignment,
+  expectedVerification,
+  minimumScore,
+  label,
+  expectedValidationCode = null,
+  expectedFinalState = null,
+}) {
   const sessionId = `artifact_conf_${label}_${Date.now()}`;
   const requestId = `artifact_conf_req_${label}_${Date.now()}`;
   const task = (await createTaskRecord({
@@ -154,7 +167,12 @@ async function runCase({ objectiveText, relativePath, completionText, expectedBa
     actorSource: 'test',
     meaningfulOutputStarted: true,
   });
-  assert(result === null, `Artifact honesty check unexpectedly failed for ${label}: ${result?.message || 'unknown'}`);
+  if (expectedValidationCode) {
+    assert(result, `Artifact honesty check should have failed for ${label}`);
+    assert(result.code === expectedValidationCode, `Unexpected validation code for ${label}: ${result?.code || 'unknown'}`);
+  } else {
+    assert(result === null, `Artifact honesty check unexpectedly failed for ${label}: ${result?.message || 'unknown'}`);
+  }
 
   const assessment = await getTaskArtifactAssessmentByTaskId(task.task_id);
   assert(assessment, `No artifact assessment persisted for ${label}`);
@@ -166,7 +184,11 @@ async function runCase({ objectiveText, relativePath, completionText, expectedBa
   assert(String(assessment.task_id || '') === task.task_id, `Assessment task mismatch for ${label}`);
 
   const liveTask = await getTaskById(task.task_id);
-  assert(liveTask.current_state === 'artifact_verified' || liveTask.current_state === 'completed', `Task did not advance to artifact_verified for ${label}: ${liveTask.current_state}`);
+  if (expectedFinalState) {
+    assert(liveTask.current_state === expectedFinalState, `Unexpected final state for ${label}: ${liveTask.current_state}`);
+  } else {
+    assert(liveTask.current_state === 'artifact_verified' || liveTask.current_state === 'completed', `Task did not advance to artifact_verified for ${label}: ${liveTask.current_state}`);
+  }
 
   return {
     task_id: task.task_id,
@@ -205,11 +227,13 @@ async function runCase({ objectiveText, relativePath, completionText, expectedBa
     objectiveText: 'Create a landing page from this source page.',
     relativePath: 'plain/landing-page.txt',
     completionText: 'I created a draft file with notes and next steps.',
-    expectedBand: TASK_ARTIFACT_CONFIDENCE_BANDS.MEDIUM,
+    expectedBand: TASK_ARTIFACT_CONFIDENCE_BANDS.LOW,
     expectedStructure: TASK_ARTIFACT_STRUCTURE_STATES.INVALID,
     expectedAlignment: TASK_ARTIFACT_ALIGNMENT_STATES.MISMATCH,
-    expectedVerification: ARTIFACT_VERIFICATION_STATES.VERIFIED,
-    minimumScore: 45,
+    expectedVerification: ARTIFACT_VERIFICATION_STATES.REJECTED,
+    minimumScore: 0,
+    expectedValidationCode: 'artifact_semantic_verification_failed',
+    expectedFinalState: runtime.TASK_STATES.RECOVERY_REQUIRED,
   });
 
   console.log(JSON.stringify({
