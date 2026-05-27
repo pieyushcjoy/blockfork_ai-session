@@ -223,6 +223,9 @@ const TASK_PROGRESS_EVENT_ID_PREFIX = 'tpvt_';
 const TASK_COMPLETION_SUMMARY_ID_PREFIX = 'tcs_';
 const TASK_NOTIFICATION_ID_PREFIX = 'tnot_';
 const TASK_NOTIFICATION_DELIVERY_ATTEMPT_ID_PREFIX = 'tnda_';
+const AGENT_RUN_ID_PREFIX = 'arun_';
+const AGENT_STEP_ID_PREFIX = 'astep_';
+const AGENT_STEP_EVENT_ID_PREFIX = 'asevt_';
 const TOOL_FAILURE_FACT_ID_PREFIX = 'tff_';
 const CONTINUITY_EVENT_ID_PREFIX = 'cevt_';
 const SESSION_LINEAGE_ID_PREFIX = 'lin_';
@@ -299,6 +302,21 @@ const TASK_PROGRESS_CATEGORIES = Object.freeze({
   TASK_COMPLETED: 'task_completed',
   TASK_FAILED: 'task_failed',
 });
+const AGENT_RUN_STATES = Object.freeze({
+  PLANNED: 'planned',
+  IN_PROGRESS: 'in_progress',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  RECOVERY_REQUIRED: 'recovery_required',
+});
+const AGENT_STEP_STATES = Object.freeze({
+  PENDING: 'pending',
+  IN_PROGRESS: 'in_progress',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  RETRYABLE: 'retryable',
+  SKIPPED: 'skipped',
+});
 const TASK_NOTIFICATION_DELIVERY_STATES = Object.freeze({
   PENDING: 'pending',
   CLAIMED: 'claimed',
@@ -319,6 +337,7 @@ const TASK_KINDS = Object.freeze({
   TEXT_GENERATION: 'text_generation',
   STRUCTURED_TEXT: 'structured_text',
   ARTIFACT_TASK: 'artifact_task',
+  AGENT_WORKFLOW_TASK: 'agent_workflow_task',
   CODE_TASK: 'code_task',
   WEBSITE_TASK: 'website_task',
   RESEARCH_TASK: 'research_task',
@@ -452,6 +471,18 @@ function createTaskNotificationId() {
 
 function createTaskNotificationDeliveryAttemptId() {
   return `${TASK_NOTIFICATION_DELIVERY_ATTEMPT_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createAgentRunId() {
+  return `${AGENT_RUN_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createAgentStepId() {
+  return `${AGENT_STEP_ID_PREFIX}${crypto.randomUUID()}`;
+}
+
+function createAgentStepEventId() {
+  return `${AGENT_STEP_EVENT_ID_PREFIX}${crypto.randomUUID()}`;
 }
 
 function createToolFailureFactId() {
@@ -2507,6 +2538,55 @@ async function ensureBillingDb() {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      agent_run_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL UNIQUE,
+      execution_id TEXT NOT NULL UNIQUE,
+      goal_text TEXT NOT NULL DEFAULT '',
+      goal_fingerprint TEXT NOT NULL DEFAULT '',
+      plan_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'planned',
+      current_step_index INTEGER NOT NULL DEFAULT 0,
+      final_outcome TEXT NOT NULL DEFAULT '',
+      final_artifact_id TEXT,
+      final_notification_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_steps (
+      agent_step_id TEXT PRIMARY KEY,
+      agent_run_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      execution_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      role TEXT NOT NULL,
+      step_kind TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      reason_code TEXT NOT NULL DEFAULT '',
+      input_json TEXT NOT NULL DEFAULT '{}',
+      output_json TEXT NOT NULL DEFAULT '{}',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      artifact_id TEXT,
+      notification_id TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_step_events (
+      agent_step_event_id TEXT PRIMARY KEY,
+      agent_run_id TEXT NOT NULL,
+      agent_step_id TEXT,
+      task_id TEXT NOT NULL,
+      execution_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS task_artifact_assessments (
       assessment_id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL UNIQUE,
@@ -3062,6 +3142,10 @@ async function ensureBillingDb() {
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_tasks_session_state_created ON tasks(session_id, current_state, created_at)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_events_task_created ON task_events(task_id, created_at)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_progress_events_task_created ON task_progress_events(task_id, created_at)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_agent_runs_execution ON agent_runs(execution_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_agent_runs_task ON agent_runs(task_id)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_agent_steps_run_index ON agent_steps(agent_run_id, step_index)');
+  billingDb.run('CREATE INDEX IF NOT EXISTS idx_agent_step_events_run_created ON agent_step_events(agent_run_id, created_at)');
   billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_artifact_assessments_task_id ON task_artifact_assessments(task_id)');
   billingDb.run('CREATE INDEX IF NOT EXISTS idx_task_artifact_assessments_session_updated ON task_artifact_assessments(session_id, updated_at)');
   billingDb.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_completion_summaries_task_id ON task_completion_summaries(task_id)');
@@ -3337,6 +3421,73 @@ function hydrateTaskProgressEventRow(row) {
     requires_user_input: Number(row.requires_user_input || 0),
     source: String(row.source || 'runtime'),
     reason_code: String(row.reason_code || ''),
+    created_at: row.created_at || '',
+  };
+}
+
+function hydrateAgentRunRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    agent_run_id: String(row.agent_run_id || ''),
+    task_id: String(row.task_id || ''),
+    execution_id: String(row.execution_id || ''),
+    goal_text: String(row.goal_text || ''),
+    goal_fingerprint: String(row.goal_fingerprint || ''),
+    plan: safeParseJson(row.plan_json, []),
+    status: String(row.status || 'planned'),
+    current_step_index: Number(row.current_step_index || 0),
+    final_outcome: String(row.final_outcome || ''),
+    final_artifact_id: row.final_artifact_id || null,
+    final_notification_id: row.final_notification_id || null,
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateAgentStepRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    agent_step_id: String(row.agent_step_id || ''),
+    agent_run_id: String(row.agent_run_id || ''),
+    task_id: String(row.task_id || ''),
+    execution_id: String(row.execution_id || ''),
+    step_index: Number(row.step_index || 0),
+    role: String(row.role || ''),
+    step_kind: String(row.step_kind || ''),
+    status: String(row.status || 'pending'),
+    reason_code: String(row.reason_code || ''),
+    input: safeParseJson(row.input_json, {}),
+    output: safeParseJson(row.output_json, {}),
+    evidence: safeParseJson(row.evidence_json, {}),
+    artifact_id: row.artifact_id || null,
+    notification_id: row.notification_id || null,
+    retry_count: Number(row.retry_count || 0),
+    started_at: row.started_at || null,
+    completed_at: row.completed_at || null,
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
+}
+
+function hydrateAgentStepEventRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    agent_step_event_id: String(row.agent_step_event_id || ''),
+    agent_run_id: String(row.agent_run_id || ''),
+    agent_step_id: row.agent_step_id || null,
+    task_id: String(row.task_id || ''),
+    execution_id: String(row.execution_id || ''),
+    event_type: String(row.event_type || ''),
+    payload: safeParseJson(row.payload_json, {}),
     created_at: row.created_at || '',
   };
 }
@@ -3705,6 +3856,45 @@ function taskTextContainsAny(normalizedText, needles = []) {
   });
 }
 
+function classifyAgentWorkflowTaskFromObjective(objectiveText = '') {
+  const normalized = normalizeTaskClassificationText(objectiveText);
+  if (!normalized) {
+    return null;
+  }
+
+  const agenticSignals = taskTextContainsAny(normalized, [
+    'agent workflow',
+    'agentic workflow',
+    'agent runtime',
+    'sub-agent',
+    'sub agent',
+    'planner',
+    'verifier',
+  ]);
+  const workflowSignals = taskTextContainsAny(normalized, [
+    'workflow',
+    'step runtime',
+    'step-by-step',
+  ]);
+  const coordinationSignals = taskTextContainsAny(normalized, [
+    'planner',
+    'writer',
+    'verifier',
+    'delivery step',
+    'sub-agent',
+    'sub agent',
+  ]);
+
+  if (agenticSignals || (workflowSignals && coordinationSignals)) {
+    return {
+      task_kind: TASK_KINDS.AGENT_WORKFLOW_TASK,
+      eligibility_reason: 'agentic workflow prompt',
+    };
+  }
+
+  return null;
+}
+
 function classifyTaskKindFromObjective(objectiveText = '') {
   const normalized = normalizeTaskClassificationText(objectiveText);
   const rawLength = String(objectiveText || '').trim().length;
@@ -3715,6 +3905,11 @@ function classifyTaskKindFromObjective(objectiveText = '') {
       task_kind: TASK_KINDS.SIMPLE_CHAT,
       eligibility_reason: 'short greeting or acknowledgement',
     };
+  }
+
+  const agentWorkflowClassification = classifyAgentWorkflowTaskFromObjective(objectiveText);
+  if (agentWorkflowClassification) {
+    return agentWorkflowClassification;
   }
 
   if (taskTextContainsAny(normalized, [
@@ -3966,6 +4161,7 @@ function deriveTaskNotificationProfileFromTask(task, requestLogRow = null, optio
   const isRecoveryState = currentState === TASK_STATES.RECOVERY_REQUIRED || currentState === TASK_STATES.FAILED;
   const isHumanBlocked = currentState === TASK_STATES.BLOCKED_HUMAN_INPUT_REQUIRED;
   const longRunningKinds = new Set([
+    TASK_KINDS.AGENT_WORKFLOW_TASK,
     TASK_KINDS.ARTIFACT_TASK,
     TASK_KINDS.CODE_TASK,
     TASK_KINDS.WEBSITE_TASK,
@@ -4034,6 +4230,14 @@ function deriveTaskNotificationProfileFromTask(task, requestLogRow = null, optio
         classified_at: classifiedAt,
       };
     }
+    case TASK_KINDS.AGENT_WORKFLOW_TASK:
+      return {
+        task_kind: TASK_KINDS.AGENT_WORKFLOW_TASK,
+        notification_policy: TASK_NOTIFICATION_POLICIES.PROGRESS_AND_COMPLETION,
+        notification_eligible: 1,
+        eligibility_reason: baseClassification.eligibility_reason,
+        classified_at: classifiedAt,
+      };
     case TASK_KINDS.SIMPLE_CHAT:
     case TASK_KINDS.TEXT_GENERATION:
     default:
@@ -4056,6 +4260,7 @@ function deriveTaskNotificationDispatchability(task, progressEvent, taskProfile 
   const deliverySuppressedReason = profile.notification_eligible ? '' : profile.eligibility_reason || 'silent_policy';
   const eligibilityReason = profile.eligibility_reason || '';
   const longRunningKinds = new Set([
+    TASK_KINDS.AGENT_WORKFLOW_TASK,
     TASK_KINDS.ARTIFACT_TASK,
     TASK_KINDS.CODE_TASK,
     TASK_KINDS.WEBSITE_TASK,
@@ -5915,7 +6120,8 @@ async function attemptAutomaticArtifactDeliveryForExecution(executionId, options
     return { ok: false, required: true, reason: 'artifact_execution_missing' };
   }
 
-  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+  const taskKind = String(task.task_kind || '');
+  if (![TASK_KINDS.ARTIFACT_TASK, TASK_KINDS.AGENT_WORKFLOW_TASK].includes(taskKind)) {
     return { ok: true, required: false, skipped: true };
   }
 
@@ -9119,6 +9325,475 @@ async function createExecutionRecord(options = {}) {
   });
 }
 
+function buildAgentWorkflowPlan(promptText = '', filename = '') {
+  const normalizedPrompt = normalizeTaskClassificationText(promptText);
+  const artifactFilename = String(filename || extractManagedArtifactFilename(promptText) || 'agent-workflow-proof.md').trim();
+  const title = humanizeManagedArtifactTitle(artifactFilename) || 'Agent Workflow Proof';
+  const agentTheme = taskTextContainsAny(normalizedPrompt, ['website', 'landing page'])
+    ? 'website delivery'
+    : 'coordinated sub-agents';
+
+  return [
+    {
+      step_index: 1,
+      role: 'planner',
+      step_kind: 'plan',
+      title: 'Planner Agent',
+      description: `Lock the sequential workflow for ${agentTheme}.`,
+    },
+    {
+      step_index: 2,
+      role: 'context',
+      step_kind: 'context_bind',
+      title: 'Context Agent',
+      description: 'Bind the active turn and exclude stale history from the run.',
+    },
+    {
+      step_index: 3,
+      role: 'writer',
+      step_kind: 'artifact_write',
+      title: 'Writer Agent',
+      description: `Draft ${artifactFilename} with the requested content and structure.`,
+    },
+    {
+      step_index: 4,
+      role: 'verifier',
+      step_kind: 'artifact_verify',
+      title: 'Verifier Agent',
+      description: 'Validate structure, alignment, and confidence before delivery.',
+    },
+    {
+      step_index: 5,
+      role: 'delivery',
+      step_kind: 'artifact_delivery',
+      title: 'Delivery Agent',
+      description: 'Deliver the verified artifact through the relay if eligible.',
+    },
+  ];
+}
+
+function getAgentRunGoalFingerprint(taskId, executionId, goalText, idempotencyKey = '') {
+  return crypto.createHash('sha256')
+    .update(`${String(taskId || '')}\n${String(executionId || '')}\n${String(idempotencyKey || '')}\n${String(goalText || '')}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
+function getAgentRunByExecutionIdTx(db, executionId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM agent_runs
+    WHERE execution_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([executionId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateAgentRunRow(row);
+}
+
+function getAgentRunByTaskIdTx(db, taskId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM agent_runs
+    WHERE task_id = ?
+    LIMIT 1
+  `);
+  stmt.bind([taskId]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateAgentRunRow(row);
+}
+
+function getAgentStepByRunAndIndexTx(db, agentRunId, stepIndex) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM agent_steps
+    WHERE agent_run_id = ? AND step_index = ?
+    LIMIT 1
+  `);
+  stmt.bind([agentRunId, stepIndex]);
+  let row = null;
+  if (stmt.step()) {
+    row = stmt.getAsObject();
+  }
+  stmt.free();
+  return hydrateAgentStepRow(row);
+}
+
+function getAgentStepsByRunIdTx(db, agentRunId) {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM agent_steps
+    WHERE agent_run_id = ?
+    ORDER BY step_index ASC, created_at ASC
+  `);
+  stmt.bind([agentRunId]);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(hydrateAgentStepRow(stmt.getAsObject()));
+  }
+  stmt.free();
+  return rows;
+}
+
+function createAgentRunRecordTx(db, options = {}) {
+  const taskId = String(options.taskId || '');
+  const executionId = String(options.executionId || '');
+  const goalText = String(options.goalText || '');
+  if (!taskId || !executionId) {
+    throw new Error('Agent run creation requires taskId and executionId');
+  }
+
+  const timestamp = options.timestamp || getTimestamp();
+  const existing = getAgentRunByExecutionIdTx(db, executionId) || getAgentRunByTaskIdTx(db, taskId);
+  if (existing) {
+    return { agentRun: existing, reused: true };
+  }
+
+  const agentRunId = createAgentRunId();
+  const plan = Array.isArray(options.plan) && options.plan.length
+    ? options.plan
+    : buildAgentWorkflowPlan(goalText, options.filename || '');
+  const insert = db.prepare(`
+    INSERT INTO agent_runs (
+      agent_run_id, task_id, execution_id, goal_text, goal_fingerprint, plan_json,
+      status, current_step_index, final_outcome, final_artifact_id, final_notification_id,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    agentRunId,
+    taskId,
+    executionId,
+    goalText,
+    getAgentRunGoalFingerprint(taskId, executionId, goalText, options.idempotencyKey || ''),
+    JSON.stringify(plan),
+    options.status || AGENT_RUN_STATES.PLANNED,
+    Number(options.currentStepIndex || 0),
+    String(options.finalOutcome || ''),
+    options.finalArtifactId || null,
+    options.finalNotificationId || null,
+    timestamp,
+    timestamp,
+  ]);
+  insert.free();
+
+  const agentRun = hydrateAgentRunRow({
+    agent_run_id: agentRunId,
+    task_id: taskId,
+    execution_id: executionId,
+    goal_text: goalText,
+    goal_fingerprint: getAgentRunGoalFingerprint(taskId, executionId, goalText, options.idempotencyKey || ''),
+    plan_json: JSON.stringify(plan),
+    status: options.status || AGENT_RUN_STATES.PLANNED,
+    current_step_index: Number(options.currentStepIndex || 0),
+    final_outcome: String(options.finalOutcome || ''),
+    final_artifact_id: options.finalArtifactId || null,
+    final_notification_id: options.finalNotificationId || null,
+    created_at: timestamp,
+    updated_at: timestamp,
+  });
+
+  const steps = plan.map((step) => {
+    const agentStepId = createAgentStepId();
+    const insertStep = db.prepare(`
+      INSERT INTO agent_steps (
+        agent_step_id, agent_run_id, task_id, execution_id, step_index, role, step_kind,
+        status, reason_code, input_json, output_json, evidence_json, artifact_id, notification_id,
+        retry_count, started_at, completed_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertStep.run([
+      agentStepId,
+      agentRunId,
+      taskId,
+      executionId,
+      Number(step.step_index || 0),
+      String(step.role || ''),
+      String(step.step_kind || ''),
+      AGENT_STEP_STATES.PENDING,
+      '',
+      JSON.stringify({ goal_text: goalText, prompt_text: goalText, step }),
+      '{}',
+      '{}',
+      null,
+      null,
+      0,
+      null,
+      null,
+      timestamp,
+      timestamp,
+    ]);
+    insertStep.free();
+    return hydrateAgentStepRow({
+      agent_step_id: agentStepId,
+      agent_run_id: agentRunId,
+      task_id: taskId,
+      execution_id: executionId,
+      step_index: Number(step.step_index || 0),
+      role: String(step.role || ''),
+      step_kind: String(step.step_kind || ''),
+      status: AGENT_STEP_STATES.PENDING,
+      reason_code: '',
+      input_json: JSON.stringify({ goal_text: goalText, prompt_text: goalText, step }),
+      output_json: '{}',
+      evidence_json: '{}',
+      artifact_id: null,
+      notification_id: null,
+      retry_count: 0,
+      started_at: null,
+      completed_at: null,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
+  });
+
+  return { agentRun, steps, reused: false };
+}
+
+async function createAgentRunRecord(options = {}) {
+  return withBillingWrite(async (db) => createAgentRunRecordTx(db, options));
+}
+
+function updateAgentRunTx(db, agentRunId, updates = {}) {
+  const currentStmt = db.prepare('SELECT * FROM agent_runs WHERE agent_run_id = ? LIMIT 1');
+  currentStmt.bind([agentRunId]);
+  let row = null;
+  if (currentStmt.step()) {
+    row = currentStmt.getAsObject();
+  }
+  currentStmt.free();
+  if (!row) {
+    return null;
+  }
+
+  const current = hydrateAgentRunRow(row);
+  const next = {
+    ...current,
+    status: updates.status || current.status,
+    current_step_index: Number.isFinite(updates.currentStepIndex) ? Number(updates.currentStepIndex) : current.current_step_index,
+    final_outcome: updates.finalOutcome === undefined ? current.final_outcome : String(updates.finalOutcome || ''),
+    final_artifact_id: updates.finalArtifactId === undefined ? current.final_artifact_id : updates.finalArtifactId || null,
+    final_notification_id: updates.finalNotificationId === undefined ? current.final_notification_id : updates.finalNotificationId || null,
+    updated_at: updates.timestamp || getTimestamp(),
+  };
+  const update = db.prepare(`
+    UPDATE agent_runs
+    SET status = ?, current_step_index = ?, final_outcome = ?, final_artifact_id = ?, final_notification_id = ?, updated_at = ?
+    WHERE agent_run_id = ?
+  `);
+  update.run([
+    next.status,
+    Number(next.current_step_index || 0),
+    next.final_outcome,
+    next.final_artifact_id || null,
+    next.final_notification_id || null,
+    next.updated_at,
+    agentRunId,
+  ]);
+  update.free();
+  return next;
+}
+
+async function updateAgentRun(agentRunId, updates = {}) {
+  return withBillingWrite(async (db) => updateAgentRunTx(db, agentRunId, updates));
+}
+
+function updateAgentStepTx(db, agentStepId, updates = {}) {
+  const currentStmt = db.prepare('SELECT * FROM agent_steps WHERE agent_step_id = ? LIMIT 1');
+  currentStmt.bind([agentStepId]);
+  let row = null;
+  if (currentStmt.step()) {
+    row = currentStmt.getAsObject();
+  }
+  currentStmt.free();
+  if (!row) {
+    return null;
+  }
+
+  const current = hydrateAgentStepRow(row);
+  const next = {
+    ...current,
+    status: updates.status || current.status,
+    reason_code: updates.reasonCode === undefined ? current.reason_code : String(updates.reasonCode || ''),
+    input: updates.input === undefined ? current.input : updates.input,
+    output: updates.output === undefined ? current.output : updates.output,
+    evidence: updates.evidence === undefined ? current.evidence : updates.evidence,
+    artifact_id: updates.artifactId === undefined ? current.artifact_id : updates.artifactId || null,
+    notification_id: updates.notificationId === undefined ? current.notification_id : updates.notificationId || null,
+    retry_count: Number.isFinite(updates.retryCount) ? Number(updates.retryCount) : current.retry_count,
+    started_at: updates.startedAt === undefined ? current.started_at : updates.startedAt || null,
+    completed_at: updates.completedAt === undefined ? current.completed_at : updates.completedAt || null,
+    updated_at: updates.timestamp || getTimestamp(),
+  };
+
+  const update = db.prepare(`
+    UPDATE agent_steps
+    SET status = ?, reason_code = ?, input_json = ?, output_json = ?, evidence_json = ?, artifact_id = ?, notification_id = ?,
+        retry_count = ?, started_at = ?, completed_at = ?, updated_at = ?
+    WHERE agent_step_id = ?
+  `);
+  update.run([
+    next.status,
+    next.reason_code,
+    JSON.stringify(next.input || {}),
+    JSON.stringify(next.output || {}),
+    JSON.stringify(next.evidence || {}),
+    next.artifact_id || null,
+    next.notification_id || null,
+    Number(next.retry_count || 0),
+    next.started_at || null,
+    next.completed_at || null,
+    next.updated_at,
+    agentStepId,
+  ]);
+  update.free();
+  return next;
+}
+
+async function updateAgentStep(agentStepId, updates = {}) {
+  return withBillingWrite(async (db) => updateAgentStepTx(db, agentStepId, updates));
+}
+
+function appendAgentStepEventTx(db, event) {
+  const eventId = event.agent_step_event_id || createAgentStepEventId();
+  const timestamp = event.created_at || getTimestamp();
+  const insert = db.prepare(`
+    INSERT INTO agent_step_events (
+      agent_step_event_id, agent_run_id, agent_step_id, task_id, execution_id, event_type, payload_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run([
+    eventId,
+    event.agent_run_id,
+    event.agent_step_id || null,
+    event.task_id,
+    event.execution_id,
+    event.event_type,
+    JSON.stringify(event.payload || {}),
+    timestamp,
+  ]);
+  insert.free();
+  return {
+    agent_step_event_id: eventId,
+    agent_run_id: event.agent_run_id,
+    agent_step_id: event.agent_step_id || null,
+    task_id: event.task_id,
+    execution_id: event.execution_id,
+    event_type: event.event_type,
+    payload: event.payload || {},
+    created_at: timestamp,
+  };
+}
+
+async function appendAgentStepEvent(event) {
+  return withBillingWrite(async (db) => appendAgentStepEventTx(db, event));
+}
+
+async function ensureAgentWorkflowRunForExecution(executionId, options = {}) {
+  return withBillingWrite(async (db) => {
+    const execution = await getStoredExecutionById(db, executionId);
+    if (!execution) {
+      return { required: true, ok: false, reason: 'agent_execution_missing' };
+    }
+
+    const task = execution.task_id ? await getStoredTaskById(db, execution.task_id) : null;
+    if (!task) {
+      return { required: true, ok: false, reason: 'agent_task_missing' };
+    }
+    if (String(task.task_kind || '') !== TASK_KINDS.AGENT_WORKFLOW_TASK) {
+      return { required: false, ok: true, skipped: true, task_kind: task.task_kind || '' };
+    }
+
+    const promptText = extractManagedCurrentTurnText(String(options.promptText || task.objective_text || ''));
+    const existing = getAgentRunByExecutionIdTx(db, executionId) || getAgentRunByTaskIdTx(db, task.task_id);
+    if (existing) {
+      return {
+        required: true,
+        ok: true,
+        reused: true,
+        agentRun: existing,
+        steps: getAgentStepsByRunIdTx(db, existing.agent_run_id),
+      };
+    }
+
+    const plan = buildAgentWorkflowPlan(promptText, options.filename || extractManagedArtifactFilename(promptText) || '');
+    const created = createAgentRunRecordTx(db, {
+      taskId: task.task_id,
+      executionId,
+      goalText: promptText || task.objective_text || '',
+      plan,
+      idempotencyKey: options.idempotencyKey || '',
+      timestamp: options.timestamp || getTimestamp(),
+      status: AGENT_RUN_STATES.PLANNED,
+    });
+    const agentRun = created.agentRun;
+    const steps = created.steps;
+    const plannerStep = steps.find((step) => step.role === 'planner') || null;
+    if (plannerStep) {
+      updateAgentStepTx(db, plannerStep.agent_step_id, {
+        status: AGENT_STEP_STATES.COMPLETED,
+        reasonCode: 'agent_plan_locked',
+        input: plannerStep.input,
+        output: { plan },
+        evidence: { plan },
+        startedAt: plannerStep.started_at || options.timestamp || getTimestamp(),
+        completedAt: options.timestamp || getTimestamp(),
+        timestamp: options.timestamp || getTimestamp(),
+      });
+      appendAgentStepEventTx(db, {
+        agent_run_id: agentRun.agent_run_id,
+        agent_step_id: plannerStep.agent_step_id,
+        task_id: task.task_id,
+        execution_id: executionId,
+        event_type: 'planner_completed',
+        payload: { plan },
+        created_at: options.timestamp || getTimestamp(),
+      });
+      appendTaskProgressEventTx(db, {
+        task_id: task.task_id,
+        execution_id: executionId,
+        previous_state: task.current_state || TASK_STATES.RECEIVED,
+        new_state: TASK_STATES.PLANNED,
+        progress_category: TASK_PROGRESS_CATEGORIES.PLAN_LOCKED,
+        decision: 'notify_user',
+        message_text: 'Planner Agent locked the sequential workflow plan.',
+        requires_user_input: 0,
+        source: options.actorSource || 'runtime',
+        reason_code: 'agent_plan_locked',
+        created_at: options.timestamp || getTimestamp(),
+      });
+    }
+
+    updateAgentRunTx(db, agentRun.agent_run_id, {
+      status: AGENT_RUN_STATES.IN_PROGRESS,
+      currentStepIndex: 1,
+      timestamp: options.timestamp || getTimestamp(),
+    });
+
+    return {
+      required: true,
+      ok: true,
+      reused: false,
+      agentRun: {
+        ...agentRun,
+        status: AGENT_RUN_STATES.IN_PROGRESS,
+        current_step_index: 1,
+      },
+      steps: getAgentStepsByRunIdTx(db, agentRun.agent_run_id),
+      plan,
+    };
+  });
+}
+
+
 async function transitionExecution(executionId, nextState, options = {}) {
   return withBillingWrite(async (db) => {
     const current = await getStoredExecutionById(db, executionId);
@@ -11126,6 +11801,24 @@ function extractManagedArtifactTopic(promptText = '') {
   return '';
 }
 
+function buildManagedAgentWorkflowBriefDraft(promptText = '', filename = '') {
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const promptLower = currentTurnText.toLowerCase();
+  const title = humanizeManagedArtifactTitle(filename) || 'Agent Workflow Proof';
+  const topic = promptLower.includes('website')
+    ? 'website delivery'
+    : 'coordinated sub-agents';
+  const steps = [
+    `The Planner Agent turns the goal into a durable sequential plan for ${topic}.`,
+    'The Context Agent extracts the current turn and keeps stale history from polluting the run.',
+    'The Writer Agent produces the actual markdown artifact for the active turn.',
+    'The Verifier Agent checks structure, alignment, and confidence before anything is delivered.',
+    'The Delivery Agent sends the verified artifact only after the file has proven truthfully complete.',
+  ];
+
+  return `# ${title}\n\n${steps.map((line) => `- ${line}`).join('\n')}`;
+}
+
 function looksLikeManagedArtifactContent(content = '', filename = '') {
   const text = normalizeArtifactTextSample(content).trim();
   if (!text) {
@@ -11191,6 +11884,12 @@ function buildManagedMarkdownArtifactDraft(promptText = '', filename = '') {
       'Treating each step independently makes recovery and retry logic much easier to trust.',
       'The system stays safer when creation, verification, and delivery each have their own proof.',
     ];
+  } else if (
+    taskTextContainsAny(promptLower, ['agent workflow', 'agentic workflow', 'sub-agent', 'sub agent', 'planner', 'verifier', 'delivery step'])
+    && !/\bwebsite\b/.test(promptLower)
+    && !/\blanding page\b/.test(promptLower)
+  ) {
+    return buildManagedAgentWorkflowBriefDraft(currentTurnText, filename);
   } else if (/\bwebsite\b/.test(promptLower) && /\bbuild\b/.test(promptLower) && /\bverify\b/.test(promptLower) && /\bpackage\b/.test(promptLower) && /\bdeliver\b/.test(promptLower)) {
     baseBullets = [
       'Define the website goal and the single deliverable before any files are written.',
@@ -11329,7 +12028,8 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
     return { required: true, ok: false, reason: 'artifact_execution_missing' };
   }
 
-  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+  const taskKind = String(task.task_kind || '');
+  if (![TASK_KINDS.ARTIFACT_TASK, TASK_KINDS.AGENT_WORKFLOW_TASK].includes(taskKind)) {
     return { required: false, ok: true, skipped: true };
   }
 
@@ -11561,6 +12261,312 @@ function buildManagedArtifactResponseText(artifactOutcome = null, assistantText 
   return filename ? buildManagedArtifactSuccessText(filename, artifactOutcome.artifactType || '') : buildManagedArtifactSuccessText('', artifactOutcome.artifactType || '');
 }
 
+async function attemptManagedArtifactWorkflowForExecution(executionId, completionText, options = {}) {
+  const execution = await getExecutionById(executionId);
+  const task = await getTaskByExecutionId(executionId);
+  if (!execution || !task) {
+    return await materializeVerifiedArtifactForExecution(executionId, completionText, options);
+  }
+
+  const promptText = extractManagedRequestPromptText(options.promptText || task.objective_text || '');
+  if (String(task.task_kind || '') !== TASK_KINDS.AGENT_WORKFLOW_TASK) {
+    return materializeVerifiedArtifactForExecution(executionId, completionText, {
+      ...options,
+      promptText,
+    });
+  }
+
+  const runState = await ensureAgentWorkflowRunForExecution(executionId, {
+    ...options,
+    promptText,
+  });
+  if (!runState.ok) {
+    return runState;
+  }
+
+  const agentRun = runState.agentRun || null;
+  const steps = Array.isArray(runState.steps) ? runState.steps : [];
+  const getStep = (role) => steps.find((step) => String(step.role || '') === role) || null;
+  const plannerStep = getStep('planner');
+  const contextStep = getStep('context');
+  const writerStep = getStep('writer');
+  const verifierStep = getStep('verifier');
+  const deliveryStep = getStep('delivery');
+  const timestamp = options.timestamp || getTimestamp();
+
+  if (plannerStep) {
+    await updateAgentStep(plannerStep.agent_step_id, {
+      status: AGENT_STEP_STATES.COMPLETED,
+      reasonCode: 'agent_plan_locked',
+      startedAt: plannerStep.started_at || timestamp,
+      completedAt: timestamp,
+      output: { plan: runState.plan || [] },
+      evidence: { plan: runState.plan || [] },
+      timestamp,
+    });
+    await appendAgentStepEvent({
+      agent_run_id: agentRun.agent_run_id,
+      agent_step_id: plannerStep.agent_step_id,
+      task_id: task.task_id,
+      execution_id: executionId,
+      event_type: 'planner_completed',
+      payload: { plan: runState.plan || [] },
+      created_at: timestamp,
+    });
+    await appendTaskProgressEvent({
+      task_id: task.task_id,
+      execution_id: executionId,
+      previous_state: task.current_state || TASK_STATES.RECEIVED,
+      new_state: TASK_STATES.PLANNED,
+      progress_category: TASK_PROGRESS_CATEGORIES.PLAN_LOCKED,
+      decision: 'notify_user',
+      message_text: 'Planner Agent locked the sequential workflow plan.',
+      requires_user_input: 0,
+      source: options.actorSource || 'runtime',
+      reason_code: 'agent_plan_locked',
+      created_at: timestamp,
+    });
+    await updateAgentRun(agentRun.agent_run_id, {
+      status: AGENT_RUN_STATES.IN_PROGRESS,
+      currentStepIndex: 2,
+      timestamp,
+    });
+  }
+
+  if (contextStep) {
+    await updateAgentStep(contextStep.agent_step_id, {
+      status: AGENT_STEP_STATES.COMPLETED,
+      reasonCode: 'current_turn_bound',
+      startedAt: contextStep.started_at || timestamp,
+      completedAt: timestamp,
+      output: { prompt_text: promptText, current_turn_text: extractManagedCurrentTurnText(promptText) },
+      evidence: { prompt_text: promptText },
+      timestamp,
+    });
+    await appendAgentStepEvent({
+      agent_run_id: agentRun.agent_run_id,
+      agent_step_id: contextStep.agent_step_id,
+      task_id: task.task_id,
+      execution_id: executionId,
+      event_type: 'context_completed',
+      payload: { prompt_text: promptText },
+      created_at: timestamp,
+    });
+    await updateAgentRun(agentRun.agent_run_id, {
+      status: AGENT_RUN_STATES.IN_PROGRESS,
+      currentStepIndex: 3,
+      timestamp,
+    });
+  }
+
+  if (writerStep) {
+    await updateAgentStep(writerStep.agent_step_id, {
+      status: AGENT_STEP_STATES.IN_PROGRESS,
+      reasonCode: 'artifact_writer_started',
+      startedAt: writerStep.started_at || timestamp,
+      retryCount: Number(writerStep.retry_count || 0),
+      timestamp,
+    });
+    await appendAgentStepEvent({
+      agent_run_id: agentRun.agent_run_id,
+      agent_step_id: writerStep.agent_step_id,
+      task_id: task.task_id,
+      execution_id: executionId,
+      event_type: 'writer_started',
+      payload: { prompt_text: promptText },
+      created_at: timestamp,
+    });
+    await appendTaskProgressEvent({
+      task_id: task.task_id,
+      execution_id: executionId,
+      previous_state: task.current_state || TASK_STATES.RECEIVED,
+      new_state: TASK_STATES.TOOL_WORK_STARTED,
+      progress_category: TASK_PROGRESS_CATEGORIES.TOOL_WORK_STARTED,
+      decision: 'notify_user',
+      message_text: 'Writer Agent has started the artifact draft.',
+      requires_user_input: 0,
+      source: options.actorSource || 'runtime',
+      reason_code: 'agent_writer_started',
+      created_at: timestamp,
+    });
+    await updateAgentRun(agentRun.agent_run_id, {
+      status: AGENT_RUN_STATES.IN_PROGRESS,
+      currentStepIndex: 4,
+      timestamp,
+    });
+  }
+
+  const materialized = await materializeVerifiedArtifactForExecution(executionId, completionText, {
+    ...options,
+    promptText,
+  });
+  if (!materialized.ok) {
+    const reason = materialized.reason || 'artifact_output_invalid';
+    if (writerStep) {
+      await updateAgentStep(writerStep.agent_step_id, {
+        status: AGENT_STEP_STATES.FAILED,
+        reasonCode: reason,
+        output: { reason },
+        evidence: { reason },
+        completedAt: timestamp,
+        timestamp,
+      });
+      await appendAgentStepEvent({
+        agent_run_id: agentRun.agent_run_id,
+        agent_step_id: writerStep.agent_step_id,
+        task_id: task.task_id,
+        execution_id: executionId,
+        event_type: 'writer_failed',
+        payload: { reason },
+        created_at: timestamp,
+      });
+    }
+    await updateAgentRun(agentRun.agent_run_id, {
+      status: materialized.reason === 'artifact_multiple_requests_unsupported'
+        ? AGENT_RUN_STATES.RECOVERY_REQUIRED
+        : AGENT_RUN_STATES.FAILED,
+      currentStepIndex: 3,
+      finalOutcome: reason,
+      timestamp,
+    });
+    return {
+      ...materialized,
+      agentRun: hydrateAgentRunRow({
+        ...agentRun,
+        status: materialized.reason === 'artifact_multiple_requests_unsupported'
+          ? AGENT_RUN_STATES.RECOVERY_REQUIRED
+          : AGENT_RUN_STATES.FAILED,
+        current_step_index: 3,
+        final_outcome: reason,
+        updated_at: timestamp,
+      }),
+      agentSteps: await withBillingWrite(async (db) => getAgentStepsByRunIdTx(db, agentRun.agent_run_id)),
+    };
+  }
+
+  if (writerStep) {
+    await updateAgentStep(writerStep.agent_step_id, {
+      status: AGENT_STEP_STATES.COMPLETED,
+      reasonCode: 'artifact_written',
+      startedAt: writerStep.started_at || timestamp,
+      completedAt: timestamp,
+      output: { artifact: materialized.artifact || null },
+      evidence: { artifact: materialized.artifact || null },
+      artifactId: materialized.artifact?.artifact_id || null,
+      timestamp,
+    });
+    await appendAgentStepEvent({
+      agent_run_id: agentRun.agent_run_id,
+      agent_step_id: writerStep.agent_step_id,
+      task_id: task.task_id,
+      execution_id: executionId,
+      event_type: 'writer_completed',
+      payload: { artifact: materialized.artifact || null },
+      created_at: timestamp,
+    });
+  }
+
+  const verifiedAssessment = materialized.assessment || await getVerifiedTaskArtifactAssessmentForExecutionId(executionId);
+  if (verifierStep) {
+    const verifierStatus = verifiedAssessment && String(verifiedAssessment.confidence_band || '') === TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH
+      && String(verifiedAssessment.alignment_state || '') === TASK_ARTIFACT_ALIGNMENT_STATES.ALIGNED
+      ? AGENT_STEP_STATES.COMPLETED
+      : AGENT_STEP_STATES.FAILED;
+    await updateAgentStep(verifierStep.agent_step_id, {
+      status: verifierStatus,
+      reasonCode: verifierStatus === AGENT_STEP_STATES.COMPLETED ? 'artifact_verified' : 'artifact_verification_failed',
+      startedAt: verifierStep.started_at || timestamp,
+      completedAt: timestamp,
+      output: { assessment: verifiedAssessment || null },
+      evidence: { assessment: verifiedAssessment || null },
+      artifactId: materialized.artifact?.artifact_id || null,
+      timestamp,
+    });
+    await appendAgentStepEvent({
+      agent_run_id: agentRun.agent_run_id,
+      agent_step_id: verifierStep.agent_step_id,
+      task_id: task.task_id,
+      execution_id: executionId,
+      event_type: verifierStatus === AGENT_STEP_STATES.COMPLETED ? 'verifier_completed' : 'verifier_failed',
+      payload: { assessment: verifiedAssessment || null },
+      created_at: timestamp,
+    });
+    await appendTaskProgressEvent({
+      task_id: task.task_id,
+      execution_id: executionId,
+      previous_state: TASK_STATES.ARTIFACT_CREATED,
+      new_state: TASK_STATES.ARTIFACT_VERIFIED,
+      progress_category: TASK_PROGRESS_CATEGORIES.ARTIFACT_VERIFIED,
+      decision: 'notify_user',
+      message_text: verifierStatus === AGENT_STEP_STATES.COMPLETED
+        ? 'Verifier Agent confirmed the artifact.'
+        : 'Verifier Agent could not confirm the artifact.',
+      requires_user_input: 0,
+      source: options.actorSource || 'runtime',
+      reason_code: verifierStatus === AGENT_STEP_STATES.COMPLETED ? 'artifact_verified' : 'artifact_verification_failed',
+      created_at: timestamp,
+    });
+    await updateAgentRun(agentRun.agent_run_id, {
+      status: AGENT_RUN_STATES.IN_PROGRESS,
+      currentStepIndex: 5,
+      timestamp,
+    });
+  }
+
+  if (deliveryStep) {
+    const deliveryOutcome = materialized.automaticDelivery || null;
+    const delivered = Boolean(materialized.artifact?.delivery_confirmed)
+      || String(deliveryOutcome?.delivery?.status || deliveryOutcome?.status || '') === 'delivered'
+      || Boolean(deliveryOutcome?.attempt?.success);
+    const deliveryStatus = delivered
+      ? AGENT_STEP_STATES.COMPLETED
+      : (deliveryOutcome && deliveryOutcome.skipped ? AGENT_STEP_STATES.SKIPPED : AGENT_STEP_STATES.RETRYABLE);
+    await updateAgentStep(deliveryStep.agent_step_id, {
+      status: deliveryStatus,
+      reasonCode: delivered ? 'artifact_delivery_confirmed' : (deliveryOutcome?.reason || 'artifact_delivery_pending'),
+      startedAt: deliveryStep.started_at || timestamp,
+      completedAt: delivered || deliveryOutcome ? timestamp : null,
+      output: { delivery: deliveryOutcome || null },
+      evidence: { delivery: deliveryOutcome || null },
+      artifactId: materialized.artifact?.artifact_id || null,
+      notificationId: deliveryOutcome?.notification?.notification_id || null,
+      timestamp,
+    });
+    await appendAgentStepEvent({
+      agent_run_id: agentRun.agent_run_id,
+      agent_step_id: deliveryStep.agent_step_id,
+      task_id: task.task_id,
+      execution_id: executionId,
+      event_type: delivered ? 'delivery_completed' : 'delivery_pending',
+      payload: { delivery: deliveryOutcome || null },
+      created_at: timestamp,
+    });
+  }
+
+  await updateAgentRun(agentRun.agent_run_id, {
+    status: AGENT_RUN_STATES.COMPLETED,
+    currentStepIndex: steps.length,
+    finalOutcome: materialized.automaticDelivery?.delivery?.status || (materialized.artifact?.delivery_confirmed ? 'artifact_delivered' : 'artifact_completed'),
+    finalArtifactId: materialized.artifact?.artifact_id || null,
+    finalNotificationId: materialized.automaticDelivery?.notification?.notification_id || null,
+    timestamp,
+  });
+
+  return {
+    ...materialized,
+    agentRun: hydrateAgentRunRow({
+      ...agentRun,
+      status: AGENT_RUN_STATES.COMPLETED,
+      current_step_index: steps.length,
+      final_outcome: materialized.automaticDelivery?.delivery?.status || (materialized.artifact?.delivery_confirmed ? 'artifact_delivered' : 'artifact_completed'),
+      final_artifact_id: materialized.artifact?.artifact_id || null,
+      final_notification_id: materialized.automaticDelivery?.notification?.notification_id || null,
+      updated_at: timestamp,
+    }),
+    agentSteps: await withBillingWrite(async (db) => getAgentStepsByRunIdTx(db, agentRun.agent_run_id)),
+  };
+}
+
 async function attemptManagedArtifactMaterializationBeforeTerminalRecovery(executionId, completionText, options = {}) {
   const execution = await getExecutionById(executionId);
   if (!execution) {
@@ -11572,11 +12578,12 @@ async function attemptManagedArtifactMaterializationBeforeTerminalRecovery(execu
     return { required: true, ok: false, reason: 'artifact_execution_missing' };
   }
 
-  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+  const taskKind = String(task.task_kind || '');
+  if (![TASK_KINDS.ARTIFACT_TASK, TASK_KINDS.AGENT_WORKFLOW_TASK].includes(taskKind)) {
     return { required: false, ok: true, skipped: true };
   }
 
-  const materialized = await materializeVerifiedArtifactForExecution(executionId, completionText, options);
+  const materialized = await attemptManagedArtifactWorkflowForExecution(executionId, completionText, options);
   if (!materialized.ok) {
     return materialized;
   }
@@ -12062,7 +13069,8 @@ async function assessArtifactDeliveryEligibility(executionId, options = {}) {
     return { required: true, ok: false, reason: 'artifact_execution_missing' };
   }
 
-  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+  const taskKind = String(task.task_kind || '');
+  if (![TASK_KINDS.ARTIFACT_TASK, TASK_KINDS.AGENT_WORKFLOW_TASK].includes(taskKind)) {
     return { required: false, ok: true, skipped: true };
   }
 
@@ -16399,9 +17407,12 @@ module.exports = {
   extractManagedArtifactBulletCount,
   extractManagedArtifactItemCount,
   extractManagedArtifactTopic,
+  buildManagedAgentWorkflowBriefDraft,
   buildManagedMarkdownArtifactDraft,
   buildManagedArtifactDraftText,
   buildManagedArtifactResponseText,
+  AGENT_RUN_STATES,
+  AGENT_STEP_STATES,
   TASK_STATES,
   TASK_PROGRESS_CATEGORIES,
   TASK_NOTIFICATION_DELIVERY_STATES,
