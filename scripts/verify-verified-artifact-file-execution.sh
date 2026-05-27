@@ -143,6 +143,7 @@ async function runHappyPath() {
   const materialized = await materializeVerifiedArtifactForExecution(execution.execution_id, content, {
     requestId: execution.last_request_id,
     actorSource: 'test',
+    autoDeliver: false,
   });
   assert(materialized.ok, `Artifact materialization failed: ${materialized.reason || 'unknown'}`);
   assert(materialized.required === true, 'Artifact materialization should be required for artifact tasks');
@@ -228,6 +229,7 @@ async function runTraversalGuardCase(label, filename, expectedReason) {
     requestId: execution.last_request_id,
     actorSource: 'test',
     filename,
+    autoDeliver: false,
   });
   assert(result.ok === false, `${label} should fail`);
   assert(result.reason === expectedReason, `${label} expected reason ${expectedReason}, got ${result.reason}`);
@@ -259,6 +261,7 @@ async function runSymlinkEscapeCase() {
   const result = await materializeVerifiedArtifactForExecution(execution.execution_id, '# project-summary\n\n- one\n- two\n', {
     requestId: execution.last_request_id,
     actorSource: 'test',
+    autoDeliver: false,
   });
   assert(result.ok === false, 'symlink escape should fail');
   assert(result.reason === 'artifact_path_symlink_escape', `Expected symlink escape, got ${result.reason}`);
@@ -282,6 +285,7 @@ async function runFailureCase() {
     result = await materializeVerifiedArtifactForExecution(execution.execution_id, '# project-summary\n\n- one\n- two\n', {
       requestId: execution.last_request_id,
       actorSource: 'test',
+      autoDeliver: false,
     });
   } finally {
     fs.renameSync = originalRename;

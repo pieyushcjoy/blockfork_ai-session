@@ -161,6 +161,7 @@ async function runHappyPath() {
   const materialized = await materializeVerifiedArtifactForExecution(execution.execution_id, assistantAck, {
     requestId: execution.last_request_id,
     actorSource: 'test',
+    autoDeliver: false,
   });
 
   assert(materialized.ok, `Artifact materialization failed: ${materialized.reason || 'unknown'}`);
@@ -254,6 +255,7 @@ async function runSemanticFailureCase({ label, artifactContent, expectedReason }
     requestId: execution.last_request_id,
     actorSource: 'test',
     artifactContent,
+    autoDeliver: false,
   });
 
   assert(materialized.ok, `Materialization should still write the file for ${label}`);

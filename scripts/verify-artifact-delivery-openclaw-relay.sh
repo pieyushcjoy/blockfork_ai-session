@@ -242,6 +242,7 @@ async function main() {
     filename: 'artifact-delivery.md',
     artifactContent: verifiedContent,
     actorSource: 'test',
+    autoDeliver: false,
     timestamp: new Date().toISOString(),
   });
   assert(happyMaterialized.ok === true, 'Happy path artifact materialization should succeed');
@@ -294,6 +295,7 @@ async function main() {
     filename: 'artifact-receipt.md',
     artifactContent: verifiedContent,
     actorSource: 'test',
+    autoDeliver: false,
     timestamp: new Date().toISOString(),
   });
   assert(realMaterialized.ok === true, 'Real send artifact materialization should succeed');
@@ -338,6 +340,7 @@ async function main() {
     filename: 'artifact-failure.md',
     artifactContent: verifiedContent,
     actorSource: 'test',
+    autoDeliver: false,
     timestamp: new Date().toISOString(),
   });
   assert(failureMaterialized.ok === true, 'Failure-path artifact materialization should succeed');
@@ -499,6 +502,20 @@ async function main() {
   assert(textEligibility.ok === true && textEligibility.skipped === true, 'Text-only prompt should not trigger artifact delivery');
   const textNotifications = await runtime.getTaskNotificationsByTaskId(textOnly.task.task_id);
   assert(textNotifications.every((notification) => notification.notification_kind !== 'artifact_delivery'), 'Text-only prompt should not create artifact delivery notifications');
+  const nonArtifactNotification = (await runtime.getTaskNotificationsByTaskId(happy.task.task_id))
+    .find((notification) => notification.notification_kind !== 'artifact_delivery');
+  assert(nonArtifactNotification, 'Expected a non-artifact notification for exact-dispatch guard test');
+  const textDispatchBlocked = await runtime.dispatchArtifactDeliveryById(nonArtifactNotification.notification_id, {
+    relayLabel: 'cleanbench',
+    dryRun: true,
+    commandPath: cliBin,
+    timeoutMs: 5000,
+    overrideEligibility: true,
+    allowDelivered: false,
+  });
+  assert(textDispatchBlocked.status === 'blocked', 'Text notification should be blocked from artifact delivery');
+  assert(String(textDispatchBlocked.reason_code || '') === 'not_artifact_delivery_notification', `Unexpected text notification dispatch reason: ${textDispatchBlocked.reason_code}`);
+  assert(textDispatchBlocked.attempt === null, 'Blocked text notification should not create a delivery attempt');
 
   const happySummary = await runtime.getTaskCompletionSummaryByTaskId(happy.task.task_id);
   assert(happySummary && happySummary.final_state === 'completed', 'Happy path task should be completed');

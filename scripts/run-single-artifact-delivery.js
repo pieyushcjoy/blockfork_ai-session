@@ -25,6 +25,11 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (token === '--artifact-path') {
+      args.artifactPath = String(argv[i + 1] || '').trim();
+      i += 1;
+      continue;
+    }
     if (token === '--max-real-sends') {
       args.maxRealSends = Number(argv[i + 1] || '0');
       i += 1;
@@ -37,6 +42,7 @@ function parseArgs(argv) {
 const argv = parseArgs(process.argv.slice(2));
 const notificationId = String(argv.notificationId || process.env.NOTIFICATION_ID || '').trim();
 const artifactId = String(argv.artifactId || process.env.ARTIFACT_ID || '').trim();
+const artifactPath = String(argv.artifactPath || process.env.ARTIFACT_PATH || '').trim();
 const relayLabel = String(argv.relayLabel || process.env.BLOCKFORK_ARTIFACT_DELIVERY_RELAY_LABEL || '').trim();
 const transport = String(process.env.BLOCKFORK_NOTIFICATION_TRANSPORT || 'openclaw_cli').trim() || 'openclaw_cli';
 const dryRun = !argv.real;
@@ -67,6 +73,7 @@ const runtime = require(path.join(repoRoot, 'server.js'));
 (async () => {
   const result = await runtime.dispatchArtifactDeliveryById(notificationId || artifactId, {
     artifactId: notificationId ? '' : artifactId,
+    artifactPath,
     relayLabel,
     transport,
     dryRun,

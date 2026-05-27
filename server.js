@@ -3672,7 +3672,7 @@ function summarizeTaskObjectiveFromBody(body = {}) {
     || stringifyTextContent(body?.instructions)
     || stringifyTextContent(body?.prompt)
     || stringifyTextContent(body);
-  const normalized = String(candidate || '').replace(/\s+/g, ' ').trim();
+  const normalized = extractManagedCurrentTurnText(candidate).replace(/\s+/g, ' ').trim();
   if (normalized.length <= 4096) {
     return normalized;
   }
@@ -4166,6 +4166,10 @@ async function getStoredTaskArtifactAssessmentByTaskId(db, taskId) {
 async function getTaskArtifactAssessmentByTaskId(taskId) {
   const db = await ensureBillingDb();
   return getStoredTaskArtifactAssessmentByTaskId(db, taskId);
+}
+
+async function syncTaskArtifactAssessment(executionId, options = {}) {
+  return withBillingWrite(async (db) => syncTaskArtifactAssessmentTx(db, executionId, options));
 }
 
 async function getVerifiedTaskArtifactAssessmentForExecutionId(executionId) {
@@ -5744,6 +5748,276 @@ async function dispatchTaskNotificationById(notificationId, options = {}) {
   };
 }
 
+async function resolvePreferredManagedArtifactDeliveryRelayLabel(options = {}) {
+  const explicit = String(
+    options.relayLabel
+    || process.env.BLOCKFORK_ARTIFACT_DELIVERY_RELAY_LABEL
+    || process.env.BLOCKFORK_OPENCLAW_RELAY_LABEL
+    || ''
+  ).trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const relays = await listOpenClawRelayConfigs();
+  const readyRelays = [];
+  for (const relay of relays) {
+    const staticReport = assessOpenClawRelayStaticChecks(relay);
+    if (!staticReport.blockers.length) {
+      readyRelays.push(relay);
+    }
+  }
+
+  const cleanbenchRelay = readyRelays.find((relay) => String(relay.relay_label || '') === 'cleanbench');
+  if (cleanbenchRelay) {
+    return cleanbenchRelay.relay_label;
+  }
+
+  return readyRelays.length ? String(readyRelays[0].relay_label || '') : '';
+}
+
+async function resolveAutomaticArtifactDeliveryRelayLabel(executionId, options = {}) {
+  const explicit = String(
+    options.relayLabel
+    || options.notification?.relay_label
+    || options.deliveryNotification?.relay_label
+    || options.artifact?.relay_label
+    || ''
+  ).trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const envRelayLabel = String(
+    process.env.BLOCKFORK_ARTIFACT_DELIVERY_RELAY_LABEL
+    || process.env.BLOCKFORK_OPENCLAW_RELAY_LABEL
+    || ''
+  ).trim();
+  if (envRelayLabel) {
+    return envRelayLabel;
+  }
+
+  return resolvePreferredManagedArtifactDeliveryRelayLabel({
+    ...options,
+    executionId,
+  });
+}
+
+function resolveOpenClawRelayWorkspaceRoot(relay = {}) {
+  const candidateRoots = [];
+  const stateDir = String(relay.state_dir || '').trim();
+  if (stateDir) {
+    candidateRoots.push(path.resolve(path.dirname(stateDir), 'workspace'));
+  }
+
+  const configPath = String(relay.config_path || '').trim();
+  if (configPath) {
+    candidateRoots.push(path.resolve(path.dirname(configPath), 'workspace'));
+  }
+
+  for (const candidateRoot of candidateRoots) {
+    if (!candidateRoot || !fs.existsSync(candidateRoot)) {
+      continue;
+    }
+    const stats = fs.statSync(candidateRoot);
+    if (!stats.isDirectory()) {
+      continue;
+    }
+    return {
+      ok: true,
+      workspace_root: candidateRoot,
+    };
+  }
+
+  return {
+    ok: false,
+    reason: 'relay_workspace_root_missing',
+    workspace_root: candidateRoots[0] || '',
+  };
+}
+
+function stageManagedArtifactDeliveryCopy(artifactPath, relay, executionId, options = {}) {
+  const sourcePath = String(artifactPath || '').trim();
+  if (!sourcePath || !fs.existsSync(sourcePath)) {
+    return { ok: false, reason: 'artifact_path_not_found' };
+  }
+
+  const sourceStats = fs.statSync(sourcePath);
+  if (!sourceStats.isFile() || Number(sourceStats.size || 0) <= 0) {
+    return { ok: false, reason: 'artifact_not_nonempty_file' };
+  }
+
+  const relayRoot = resolveOpenClawRelayWorkspaceRoot(relay || {});
+  if (!relayRoot.ok) {
+    return relayRoot;
+  }
+
+  const filenameCandidate = String(options.filename || path.basename(sourcePath)).trim();
+  const sanitized = sanitizeManagedArtifactFilename(filenameCandidate);
+  if (!sanitized.ok) {
+    return {
+      ok: false,
+      reason: sanitized.reason || 'artifact_invalid',
+    };
+  }
+
+  const deliveryDir = path.join(relayRoot.workspace_root, '.blockfork-artifact-deliveries', String(executionId || 'unknown'));
+  fs.mkdirSync(deliveryDir, { recursive: true });
+  const deliveryPath = path.join(deliveryDir, sanitized.filename);
+  const canonicalDeliveryPath = resolveCanonicalArtifactPath(deliveryPath);
+  if (!canonicalDeliveryPath.ok) {
+    return {
+      ok: false,
+      reason: canonicalDeliveryPath.reason || 'artifact_output_invalid',
+    };
+  }
+
+  if (!isPathWithinRoot(canonicalDeliveryPath.canonical_path, relayRoot.workspace_root)) {
+    return {
+      ok: false,
+      reason: 'artifact_delivery_path_outside_relay_workspace',
+    };
+  }
+
+  fs.mkdirSync(path.dirname(canonicalDeliveryPath.canonical_path), { recursive: true });
+  fs.copyFileSync(sourcePath, canonicalDeliveryPath.canonical_path);
+
+  const stagedStats = fs.statSync(canonicalDeliveryPath.canonical_path);
+  if (!stagedStats.isFile() || Number(stagedStats.size || 0) !== Number(sourceStats.size || 0)) {
+    try {
+      if (fs.existsSync(canonicalDeliveryPath.canonical_path)) {
+        fs.unlinkSync(canonicalDeliveryPath.canonical_path);
+      }
+    } catch (_) {}
+    return {
+      ok: false,
+      reason: 'artifact_delivery_copy_failed',
+    };
+  }
+
+  return {
+    ok: true,
+    relay_workspace_root: relayRoot.workspace_root,
+    artifact_path: canonicalDeliveryPath.canonical_path,
+    declared_path: canonicalDeliveryPath.declared_path,
+    source_path: sourcePath,
+  };
+}
+
+async function attemptAutomaticArtifactDeliveryForExecution(executionId, options = {}) {
+  const execution = await getExecutionById(executionId);
+  if (!execution) {
+    return { ok: false, required: true, reason: 'artifact_execution_missing' };
+  }
+
+  const task = await getTaskByExecutionId(executionId);
+  if (!task) {
+    return { ok: false, required: true, reason: 'artifact_execution_missing' };
+  }
+
+  if (String(task.task_kind || '') !== TASK_KINDS.ARTIFACT_TASK) {
+    return { ok: true, required: false, skipped: true };
+  }
+
+  const artifact = await getExecutionArtifactByExecutionId(executionId);
+  if (!artifact) {
+    return { ok: false, required: true, reason: 'artifact_execution_missing' };
+  }
+
+  if (String(artifact.verification_state || '') !== ARTIFACT_VERIFICATION_STATES.VERIFIED) {
+    return { ok: false, required: true, reason: 'artifact_not_verified' };
+  }
+
+  if (String(artifact.delivery_confirmed || 0) === '1') {
+    return { ok: true, required: true, skipped: true, reason: 'artifact_already_delivered' };
+  }
+
+  const assessment = options.assessment || await getVerifiedTaskArtifactAssessmentForExecutionId(executionId);
+  if (!assessment) {
+    return { ok: false, required: true, reason: 'artifact_semantic_verification_failed' };
+  }
+
+  const relayLabel = await resolveAutomaticArtifactDeliveryRelayLabel(executionId, {
+    ...options,
+    artifact,
+  });
+  if (!relayLabel) {
+    return { ok: false, required: true, reason: 'relay_not_ready' };
+  }
+
+  const relay = await getOpenClawRelayConfigByLabel(relayLabel);
+  if (!relay) {
+    return { ok: false, required: true, reason: 'relay_config_not_found' };
+  }
+
+  const staticReport = assessOpenClawRelayStaticChecks(relay);
+  if (staticReport.blockers.length) {
+    return {
+      ok: false,
+      required: true,
+      reason: 'relay_not_ready',
+      detail: staticReport.blockers.map((item) => item.detail).join('; ') || 'OpenClaw relay is not ready',
+    };
+  }
+
+  const sourcePath = String(options.artifactPath || artifact.canonical_path || '').trim();
+  const stagedCopy = stageManagedArtifactDeliveryCopy(sourcePath, relay, executionId, {
+    filename: options.filename || artifact.artifact_filename || path.basename(sourcePath),
+  });
+  if (!stagedCopy.ok) {
+    return {
+      ok: false,
+      required: true,
+      reason: stagedCopy.reason || 'artifact_delivery_copy_failed',
+    };
+  }
+
+  const ensured = options.deliveryNotification?.notification_id
+    ? { ok: true, notification: options.deliveryNotification }
+    : await ensureArtifactDeliveryNotificationForExecution(executionId, {
+      relayLabel,
+      timestamp: options.timestamp || getTimestamp(),
+    });
+  if (!ensured || ensured.ok === false) {
+    return {
+      ok: false,
+      required: true,
+      reason: ensured?.reason || 'artifact_delivery_not_ready',
+    };
+  }
+
+  const notificationRow = ensured.notification_id ? ensured : ensured.notification;
+  if (!notificationRow || !notificationRow.notification_id) {
+    return {
+      ok: false,
+      required: true,
+      reason: 'artifact_delivery_not_ready',
+    };
+  }
+
+  const dispatchResult = await dispatchArtifactDeliveryById(notificationRow.notification_id, {
+    relayLabel,
+    commandPath: relay.cli_bin || options.commandPath || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw',
+    dryRun: options.dryRun !== undefined ? Boolean(options.dryRun) : false,
+    timeoutMs: options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS,
+    maxRealSends: 1,
+    artifactPath: stagedCopy.artifact_path,
+    allowDelivered: false,
+    timestamp: options.timestamp || getTimestamp(),
+  });
+
+  return {
+    ok: dispatchResult.status === 'delivered',
+    required: true,
+    relayLabel,
+    relay,
+    notification: dispatchResult.notification || notificationRow || null,
+    attempt: dispatchResult.attempt || null,
+    delivery: dispatchResult,
+    stagedCopy,
+  };
+}
+
 async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
   const exactDeliveryId = String(deliveryId || '').trim();
   if (!exactDeliveryId && !String(options.artifactId || '').trim()) {
@@ -5769,6 +6043,7 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
   const timeoutMs = Math.max(1000, Number(options.timeoutMs || BLOCKFORK_OPENCLAW_CLI_TIMEOUT_MS));
   const dispatchTimestamp = options.timestamp || getTimestamp();
   const allowDelivered = Boolean(options.allowDelivered);
+  const artifactPathOverride = String(options.artifactPath || '').trim();
 
   if (!exactDeliveryId) {
     const ensured = await ensureArtifactDeliveryNotificationForExecution(String(options.artifactId || '').trim(), {
@@ -5811,6 +6086,32 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
           delivery_target: null,
         };
       }
+      if (String(notification.notification_kind || '') !== ARTIFACT_DELIVERY_NOTIFICATION_KIND) {
+        return {
+          ok: false,
+          status: 'blocked',
+          reason_code: 'not_artifact_delivery_notification',
+          reason_message: 'Notification is not an artifact delivery notification',
+          notification,
+          delivery_target: null,
+        };
+      }
+      const claimed = await claimStoredTaskNotificationByIdTx(db, exactDeliveryId, {
+        timestamp: dispatchTimestamp,
+        allowDelivered,
+        overrideEligibility: true,
+      });
+      if (!claimed.ok) {
+        return {
+          ok: false,
+          status: 'blocked',
+          reason_code: claimed.reason_code || 'not_claimable',
+          reason_message: claimed.reason_message || 'Artifact delivery notification is not claimable',
+          notification: claimed.notification || notification,
+          delivery_target: null,
+        };
+      }
+      notification = claimed.claimed_notification || notification;
       artifact = notification.artifact_id ? await getStoredExecutionArtifactByArtifactId(db, notification.artifact_id) : null;
       if (artifact) {
         execution = await getStoredExecutionById(db, artifact.execution_id);
@@ -5841,6 +6142,24 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
         };
       }
       notification = await getStoredTaskNotificationByArtifactIdTx(db, artifact.artifact_id);
+      if (notification) {
+        const claimed = await claimStoredTaskNotificationByIdTx(db, notification.notification_id, {
+          timestamp: dispatchTimestamp,
+          allowDelivered,
+          overrideEligibility: true,
+        });
+        if (!claimed.ok) {
+          return {
+            ok: false,
+            status: 'blocked',
+            reason_code: claimed.reason_code || 'not_claimable',
+            reason_message: claimed.reason_message || 'Artifact delivery notification is not claimable',
+            notification: claimed.notification || notification,
+            delivery_target: null,
+          };
+        }
+        notification = claimed.claimed_notification || notification;
+      }
     }
 
     if (!notification || !artifact) {
@@ -5922,6 +6241,42 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
       };
     }
 
+    const deliveryArtifactPath = artifactPathOverride || artifact.canonical_path;
+    if (artifactPathOverride && !fs.existsSync(artifactPathOverride)) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason_code: 'artifact_path_not_found',
+        reason_message: 'Artifact delivery override path was not found',
+        notification,
+        delivery_target: null,
+      };
+    }
+
+    if (artifactPathOverride) {
+      const overrideStats = fs.statSync(artifactPathOverride);
+      if (!overrideStats.isFile() || Number(overrideStats.size || 0) <= 0) {
+        return {
+          ok: false,
+          status: 'blocked',
+          reason_code: 'artifact_not_nonempty_file',
+          reason_message: 'Artifact delivery override path is not a non-empty file',
+          notification,
+          delivery_target: null,
+        };
+      }
+      if (Number(overrideStats.size || 0) > ARTIFACT_DELIVERY_MAX_BYTES) {
+        return {
+          ok: false,
+          status: 'blocked',
+          reason_code: 'artifact_file_too_large',
+          reason_message: 'Artifact delivery override path exceeds the delivery size limit',
+          notification,
+          delivery_target: null,
+        };
+      }
+    }
+
     const commandPath = commandPathOverride || relay.cli_bin || BLOCKFORK_OPENCLAW_CLI_BIN || 'openclaw';
     return {
       ok: true,
@@ -5937,6 +6292,7 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
       },
       relay,
       command_path: commandPath,
+      artifact_path: deliveryArtifactPath,
     };
   });
 
@@ -5978,7 +6334,7 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
     timeoutMs,
     env,
     startedAt: attemptStartedAt,
-    artifactPath: preflight.artifact.canonical_path,
+    artifactPath: preflight.artifact_path || preflight.artifact.canonical_path,
   });
 
   const attemptRecord = {
@@ -5986,7 +6342,7 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
     session_id: preflight.notification.session_id,
     task_id: preflight.notification.task_id,
     artifact_id: preflight.artifact.artifact_id,
-    artifact_path: preflight.artifact.canonical_path,
+    artifact_path: preflight.artifact_path || preflight.artifact.canonical_path,
     relay_label: relayLabel,
     media_kind: preflight.notification.media_kind || preflight.artifact.artifact_type || 'document',
     handled_by: adapterResult.stdout_json && typeof adapterResult.stdout_json === 'object'
@@ -6003,7 +6359,7 @@ async function dispatchArtifactDeliveryById(deliveryId, options = {}) {
     command_path: preflight.command_path,
     command_argv: buildOpenClawCliArtifactDeliveryArgs(preflight.notification, {
       dryRun,
-      artifactPath: preflight.artifact.canonical_path,
+      artifactPath: preflight.artifact_path || preflight.artifact.canonical_path,
     }),
     started_at: adapterResult.started_at || attemptStartedAt,
     finished_at: adapterResult.finished_at || getTimestamp(),
@@ -7825,6 +8181,7 @@ async function syncTaskArtifactAssessmentTx(db, executionId, options = {}) {
   }
 
   const timestamp = options.timestamp || getTimestamp();
+  const objectiveText = extractManagedCurrentTurnText(String(options.promptText || task.objective_text || ''));
   let artifactExists = 0;
   let artifactContent = '';
   let structureState = TASK_ARTIFACT_STRUCTURE_STATES.MISSING;
@@ -7839,7 +8196,7 @@ async function syncTaskArtifactAssessmentTx(db, executionId, options = {}) {
     artifact_type: artifact.artifact_type || 'text',
     content_hash: artifact.content_hash || '',
     byte_size: Number(artifact.byte_size || 0),
-    objective_text: task.objective_text || '',
+    objective_text: objectiveText,
     verification_state: artifact.verification_state || '',
     evidence_reason: '',
     structure_reason: '',
@@ -7864,15 +8221,15 @@ async function syncTaskArtifactAssessmentTx(db, executionId, options = {}) {
     notes.evidence_reason = error?.code || error?.message || 'artifact_read_failed';
   }
 
-  artifactFamily = inferArtifactFamily(task.objective_text || '', artifact.declared_path || '', artifactContent, options.completionText || '');
+  artifactFamily = inferArtifactFamily(objectiveText, artifact.declared_path || '', artifactContent, options.completionText || '');
   const structure = classifyArtifactStructure(artifactFamily, artifactContent, artifact.declared_path || '');
   structureState = structure.state;
   notes.structure_reason = structure.reason;
 
-  const alignment = classifyArtifactAlignment(artifactFamily, task.objective_text || '', artifactContent, options.completionText || '', structure);
+  const alignment = classifyArtifactAlignment(artifactFamily, objectiveText, artifactContent, options.completionText || '', structure);
   alignmentState = alignment.state;
   notes.alignment_reason = alignment.reason;
-  notes.keyword_hits = tokenizeTaskObjective(task.objective_text || '').filter((token) => artifactContent.toLowerCase().includes(token)).length;
+  notes.keyword_hits = tokenizeTaskObjective(objectiveText || '').filter((token) => artifactContent.toLowerCase().includes(token)).length;
 
   if (!artifactExists) {
     reasonCode = reasonCode || 'artifact_missing';
@@ -10672,26 +11029,54 @@ function extractManagedRequestPromptText(reqBody = {}) {
     }
   }
 
-  return parts.join('\n').trim();
+  return extractManagedCurrentTurnText(parts.join('\n').trim());
+}
+
+function extractManagedCurrentTurnText(promptText = '') {
+  const text = String(promptText || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  const markerPattern = /#\d+\s+[A-Z][a-z]{2}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+GMT[+-]\d{1,2}:\d\d\s+[^:\n]+:/g;
+  let lastMatch = null;
+  for (const match of text.matchAll(markerPattern)) {
+    lastMatch = match;
+  }
+
+  if (!lastMatch || !Number.isFinite(lastMatch.index)) {
+    return text;
+  }
+
+  const currentTurn = text.slice(lastMatch.index + lastMatch[0].length).trim();
+  return currentTurn || text;
+}
+
+function extractManagedArtifactFilenames(promptText = '') {
+  const text = extractManagedCurrentTurnText(promptText);
+  const filenames = [];
+  const seen = new Set();
+  const directPattern = /\b([A-Za-z0-9._-]+\.(?:md|markdown|txt|json|csv|yaml|yml|html|js|ts|py))\b/gi;
+
+  for (const match of text.matchAll(directPattern)) {
+    const candidate = String(match[1] || '').trim();
+    if (!candidate || seen.has(candidate.toLowerCase())) {
+      continue;
+    }
+    seen.add(candidate.toLowerCase());
+    filenames.push(candidate);
+  }
+
+  return filenames;
 }
 
 function extractManagedArtifactFilename(promptText = '') {
-  const text = String(promptText || '');
-  const namedMatch = text.match(/\b(?:named|name|called)\s+([A-Za-z0-9._-]+\.(?:md|markdown|txt|json|csv|yaml|yml|html|js|ts|py))\b/i);
-  if (namedMatch) {
-    return namedMatch[1];
-  }
-
-  const directMatch = text.match(/\b([A-Za-z0-9._-]+\.(?:md|markdown|txt|json|csv|yaml|yml|html|js|ts|py))\b/i);
-  if (directMatch) {
-    return directMatch[1];
-  }
-
-  return '';
+  const filenames = extractManagedArtifactFilenames(promptText);
+  return filenames[filenames.length - 1] || '';
 }
 
 function extractManagedArtifactBulletCount(promptText = '') {
-  const text = String(promptText || '');
+  const text = extractManagedCurrentTurnText(promptText);
   const bulletMatch = text.match(/\b(\d{1,2})\s*[- ]?bullet(?:s)?\b/i)
     || text.match(/\b(?:bullet(?:s)?\s*(?:count|count of|of)?\s*[:=]?\s*)(\d{1,2})\b/i);
   const count = Number(bulletMatch?.[1] || 0);
@@ -10699,6 +11084,17 @@ function extractManagedArtifactBulletCount(promptText = '') {
     return count;
   }
   return 5;
+}
+
+function extractManagedArtifactItemCount(promptText = '') {
+  const text = extractManagedCurrentTurnText(promptText);
+  const stepMatch = text.match(/\b(\d{1,2})\s*[- ]?step(?:s)?\b/i)
+    || text.match(/\b(?:step(?:s)?\s*(?:count|count of|of)?\s*[:=]?\s*)(\d{1,2})\b/i);
+  const stepCount = Number(stepMatch?.[1] || 0);
+  if (Number.isFinite(stepCount) && stepCount > 0 && stepCount <= 12) {
+    return stepCount;
+  }
+  return extractManagedArtifactBulletCount(promptText);
 }
 
 function humanizeManagedArtifactTitle(filename = '') {
@@ -10711,7 +11107,7 @@ function humanizeManagedArtifactTitle(filename = '') {
 }
 
 function extractManagedArtifactTopic(promptText = '') {
-  const text = String(promptText || '');
+  const text = extractManagedCurrentTurnText(promptText);
   const whyMatch = text.match(/\bwhy\s+(.+?)\s+matters\b/i);
   if (whyMatch?.[1]) {
     return whyMatch[1].trim().replace(/[.?!,;:]+$/g, '');
@@ -10765,14 +11161,17 @@ function looksLikeManagedArtifactContent(content = '', filename = '') {
 }
 
 function buildManagedMarkdownArtifactDraft(promptText = '', filename = '') {
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const promptLower = currentTurnText.toLowerCase();
   const title = humanizeManagedArtifactTitle(filename) || 'Project Summary';
-  const topic = extractManagedArtifactTopic(promptText);
-  const bulletCount = extractManagedArtifactBulletCount(promptText);
+  const topic = extractManagedArtifactTopic(currentTurnText);
+  const itemCount = extractManagedArtifactItemCount(currentTurnText);
   const topicSubject = topic
     ? topic.replace(/\s+/g, ' ').trim()
     : 'consistency';
   const subjectLine = topicSubject.charAt(0).toUpperCase() + topicSubject.slice(1);
-  const baseBullets = [
+
+  let baseBullets = [
     `${subjectLine} helps teams keep momentum when progress feels slow.`,
     'It reduces chaos by turning difficult work into repeatable steps.',
     'It builds trust because everyone can see steady effort over time.',
@@ -10782,22 +11181,59 @@ function buildManagedMarkdownArtifactDraft(promptText = '', filename = '') {
     'It helps small wins add up into visible progress.',
     'It makes the next step clearer when the work gets messy.',
   ];
-  const bullets = baseBullets.slice(0, Math.max(1, bulletCount));
-  while (bullets.length < bulletCount) {
-    bullets.push('It keeps the work steady and easier to trust over time.');
+
+  if (/\bdifference between\b/.test(promptLower) && /\bartifact creation\b/.test(promptLower) && /\bartifact verification\b/.test(promptLower) && /\bartifact delivery\b/.test(promptLower)) {
+    baseBullets = [
+      'Artifact creation is the step where the file is actually written and placed in the allowed workspace.',
+      'Artifact verification is the check that the file exists, matches the expected path, and meets the required structure.',
+      'Artifact delivery is the separate step that sends the verified file back through the relay to the user.',
+      'Keeping those steps separate prevents a successful send from being mistaken for verified content.',
+      'Treating each step independently makes recovery and retry logic much easier to trust.',
+      'The system stays safer when creation, verification, and delivery each have their own proof.',
+    ];
+  } else if (/\bwebsite\b/.test(promptLower) && /\bbuild\b/.test(promptLower) && /\bverify\b/.test(promptLower) && /\bpackage\b/.test(promptLower) && /\bdeliver\b/.test(promptLower)) {
+    baseBullets = [
+      'Define the website goal and the single deliverable before any files are written.',
+      'Build the website files inside the allowed workspace with a deterministic structure.',
+      'Verify the output by checking that the pages exist, render cleanly, and match the requested shape.',
+      'Package the verified files into the delivery path only after validation passes.',
+      'Deliver the package through the relay so the user receives the same verified artifact you created.',
+      'Keep creation, verification, packaging, and delivery separate so each step can be retried safely.',
+      'Record proof for every stage so the workflow stays auditable end to end.',
+    ];
+  } else if (/\bphase 5\b/.test(promptLower) && /\bsuccessfully achieved\b/.test(promptLower)) {
+    baseBullets = [
+      'In Phase 5, BlockFork now classifies artifact prompts at admission instead of treating them like generic chat.',
+      'It can create a real markdown file, verify it on disk, and persist durable artifact proof.',
+      'It can separate the assistant acknowledgement from the artifact content itself.',
+      'It can deliver a verified file back through the relay as a real Telegram document attachment.',
+      'It can keep artifact truth, verification truth, and delivery truth separate without fake success.',
+    ];
   }
 
-  return `# ${title}\n\n${bullets.map((line) => `- ${line}`).join('\n')}`;
+  const numberedMode = /\bstep\b/.test(promptLower) || /\bworkflow\b/.test(promptLower) || /\bplan\b/.test(promptLower);
+  const count = Math.max(1, itemCount);
+  const items = baseBullets.slice(0, count);
+  while (items.length < count) {
+    items.push('It keeps the work steady and easier to trust over time.');
+  }
+
+  const listText = numberedMode
+    ? items.map((line, index) => `${index + 1}. ${line}`).join('\n')
+    : items.map((line) => `- ${line}`).join('\n');
+
+  return `# ${title}\n\n${listText}`;
 }
 
 function buildManagedArtifactDraftText(promptText = '', completionText = '', options = {}) {
-  const filename = String(options.filename || extractManagedArtifactFilename(promptText) || '').trim();
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const filename = String(options.filename || extractManagedArtifactFilename(currentTurnText) || '').trim();
   const assistantText = String(options.assistantText || completionText || '').trim();
   if (looksLikeManagedArtifactContent(assistantText, filename)) {
     return assistantText;
   }
 
-  const promptLower = String(promptText || '').toLowerCase();
+  const promptLower = String(currentTurnText || '').toLowerCase();
   const wantsMarkdown = /\.md(markdown)?$/i.test(filename)
     || /\bmarkdown\b/.test(promptLower)
     || /\b(summary|report|notes)\b/.test(promptLower);
@@ -10897,15 +11333,25 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
     return { required: false, ok: true, skipped: true };
   }
 
-  const promptText = String(task.objective_text || '');
-  const rawFilename = String(options.filename || extractManagedArtifactFilename(task.objective_text || '') || 'requested-file.md').trim();
+  const promptText = extractManagedCurrentTurnText(String(options.promptText || task.objective_text || ''));
+  const requestedFilenames = extractManagedArtifactFilenames(promptText);
+  if (requestedFilenames.length > 1 && !options.allowMultipleArtifacts) {
+    return {
+      required: true,
+      ok: false,
+      reason: 'artifact_multiple_requests_unsupported',
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+    };
+  }
+
+  const rawFilename = String(options.filename || requestedFilenames[0] || extractManagedArtifactFilename(promptText) || 'requested-file.md').trim();
   const sanitizedFilename = sanitizeManagedArtifactFilename(rawFilename);
   if (!sanitizedFilename.ok) {
     return {
       required: true,
       ok: false,
       reason: sanitizedFilename.reason,
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
     };
   }
 
@@ -10926,7 +11372,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: 'artifact_output_invalid',
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
     };
   }
 
@@ -10936,7 +11382,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: rootSelection.reason,
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
     };
   }
 
@@ -10956,11 +11402,11 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: canonicalResolution.reason,
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
     };
   }
 
-  const artifactType = inferArtifactFamily(task.objective_text || '', finalPath, content, content);
+  const artifactType = inferArtifactFamily(promptText || task.objective_text || '', finalPath, content, content);
   const byteSize = Buffer.byteLength(content, 'utf8');
   const contentHash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
   const fileWrite = writeTextFileAtomically(canonicalResolution.canonical_path, content);
@@ -10969,7 +11415,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: fileWrite.reason || 'artifact_output_invalid',
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
     };
   }
 
@@ -10990,6 +11436,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       byteSize,
       requestId: options.requestId || execution.last_request_id || '',
       actorSource: options.actorSource || 'runtime',
+      promptText,
       timestamp: options.timestamp || getTimestamp(),
     });
     artifact = await updateExecutionArtifactVerification(executionId, ARTIFACT_VERIFICATION_STATES.VERIFIED, {
@@ -11005,6 +11452,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       byteSize,
       requestId: options.requestId || execution.last_request_id || '',
       actorSource: options.actorSource || 'runtime',
+      promptText,
       timestamp: options.timestamp || getTimestamp(),
     });
   } catch (error) {
@@ -11017,16 +11465,51 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: error?.code || error?.message || 'artifact_output_invalid',
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
     };
   }
 
+  await syncTaskArtifactAssessment(executionId, {
+    completionText: content,
+    promptText,
+    timestamp: options.timestamp || getTimestamp(),
+  }).catch(() => null);
+
   const assessment = await getTaskArtifactAssessmentByTaskId(task.task_id);
+  const shouldAutoDeliver = options.autoDeliver !== false;
+  let automaticDelivery = null;
+  const autoRelayLabel = shouldAutoDeliver
+    ? await resolveAutomaticArtifactDeliveryRelayLabel(executionId, {
+      ...options,
+      artifact,
+      assessment,
+    })
+    : String(options.relayLabel || '').trim();
+
   if (assessment && String(assessment.confidence_band || '') === TASK_ARTIFACT_CONFIDENCE_BANDS.HIGH) {
-    void ensureArtifactDeliveryNotificationForExecution(executionId, {
-      relayLabel: String(options.relayLabel || ''),
+    const deliveryNotification = await ensureArtifactDeliveryNotificationForExecution(executionId, {
+      relayLabel: autoRelayLabel,
       timestamp: options.timestamp || getTimestamp(),
     }).catch(() => null);
+    if (shouldAutoDeliver && deliveryNotification?.ok) {
+      automaticDelivery = await attemptAutomaticArtifactDeliveryForExecution(executionId, {
+        ...options,
+        relayLabel: autoRelayLabel,
+        assessment,
+        deliveryNotification: deliveryNotification.notification || null,
+        artifactPath: canonicalResolution.canonical_path,
+        filename: sanitizedFilename.filename,
+        artifact: artifact,
+      }).catch(() => null);
+      if (automaticDelivery && automaticDelivery.ok) {
+        artifact = await updateExecutionArtifactDeliveryStatus(executionId, {
+          deliveryRequested: true,
+          deliveryConfirmed: true,
+          reasonCode: 'artifact_delivery_confirmed',
+          timestamp: options.timestamp || getTimestamp(),
+        }).catch(() => artifact);
+      }
+    }
   }
   return {
     required: true,
@@ -11039,6 +11522,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
     artifactType,
     contentHash,
     byteSize,
+    automaticDelivery,
   };
 }
 
@@ -11046,6 +11530,35 @@ function buildManagedArtifactSuccessText(filename = '', artifactType = '') {
   const normalizedFilename = String(filename || '').trim();
   const noun = normalizedFilename || (artifactType ? `requested ${artifactType}` : 'requested artifact');
   return `I created ${noun} with the requested content.`;
+}
+
+function buildManagedArtifactResponseText(artifactOutcome = null, assistantText = '', options = {}) {
+  if (!artifactOutcome || !artifactOutcome.ok) {
+    return String(assistantText || '').trim();
+  }
+
+  const filename = String(artifactOutcome.filename || artifactOutcome.artifact?.artifact_filename || '').trim();
+  const delivery = artifactOutcome.automaticDelivery || null;
+  const delivered = Boolean(artifactOutcome.artifact?.delivery_confirmed)
+    || String(delivery?.delivery?.status || delivery?.status || '') === 'delivered'
+    || Boolean(delivery?.attempt?.success)
+    || Boolean(delivery?.attempt?.delivered_file_message_id || delivery?.attempt?.delivered_message_id);
+  const deliveryPending = delivery && !delivered && !delivery.skipped;
+  const deliveryFailed = Boolean(delivery && !delivered && !deliveryPending);
+
+  if (delivered) {
+    return filename ? `I created and delivered ${filename}.` : 'I created and delivered the requested artifact.';
+  }
+
+  if (deliveryPending) {
+    return filename ? `I created ${filename}. Delivery is pending.` : 'I created the requested artifact. Delivery is pending.';
+  }
+
+  if (deliveryFailed) {
+    return filename ? `I created ${filename}, but delivery failed. You can retry delivery.` : 'I created the requested artifact, but delivery failed. You can retry delivery.';
+  }
+
+  return filename ? buildManagedArtifactSuccessText(filename, artifactOutcome.artifactType || '') : buildManagedArtifactSuccessText('', artifactOutcome.artifactType || '');
 }
 
 async function attemptManagedArtifactMaterializationBeforeTerminalRecovery(executionId, completionText, options = {}) {
@@ -11628,6 +12141,12 @@ async function ensureArtifactDeliveryNotificationForExecution(executionId, optio
     const artifact = eligibility.artifact;
     const task = eligibility.task;
     const assessment = eligibility.assessment;
+    const relayLabel = await resolveAutomaticArtifactDeliveryRelayLabel(executionId, {
+      ...options,
+      artifact,
+      task,
+      assessment,
+    });
     const existing = await getStoredTaskNotificationByArtifactIdTx(db, artifact.artifact_id);
     const dedupeKey = `artifact_delivery:${artifact.artifact_id}`;
     const payload = {
@@ -11647,7 +12166,7 @@ async function ensureArtifactDeliveryNotificationForExecution(executionId, optio
       confidence_band: assessment?.confidence_band || '',
       structure_state: assessment?.structure_state || '',
       alignment_state: assessment?.alignment_state || '',
-      relay_label: String(options.relayLabel || ''),
+      relay_label: relayLabel,
       media_kind: eligibility.media_kind,
       delivery_requested: true,
       delivery_confirmed: Boolean(artifact.delivery_confirmed),
@@ -11668,7 +12187,7 @@ async function ensureArtifactDeliveryNotificationForExecution(executionId, optio
       artifact_id: artifact.artifact_id,
       artifact_path: artifact.canonical_path,
       media_kind: eligibility.media_kind,
-      relay_label: String(options.relayLabel || ''),
+      relay_label: relayLabel,
       task_kind: TASK_KINDS.ARTIFACT_TASK,
       notification_policy: TASK_NOTIFICATION_POLICIES.COMPLETION_ONLY,
       proactive_eligible: 0,
@@ -12905,7 +13424,7 @@ async function executeChatFlow(session, body, options = {}) {
   };
 }
 
-async function proxyNonStreamingChat(res, session, descriptor, upstream, billing = null, responseAlias = PUBLIC_MODEL_ALIAS) {
+async function proxyNonStreamingChat(res, session, descriptor, upstream, billing = null, responseAlias = PUBLIC_MODEL_ALIAS, requestBody = null) {
   if (!upstream.ok) {
     if (billing?.reserved) {
       await finalizeBillingRequest({
@@ -12985,9 +13504,31 @@ async function proxyNonStreamingChat(res, session, descriptor, upstream, billing
 
   const usage = extractUsageTokens(payload?.usage);
   incrementUsage(session, usage.totalTokens);
+  const activePromptText = extractManagedRequestPromptText(requestBody || {});
+  const managedArtifactOutcome = billing?.execution_id
+    ? await materializeVerifiedArtifactForExecution(billing.execution_id, stringifyTextContent(payload?.choices?.[0]?.message?.content ?? ''), {
+      requestId: billing.request_id,
+      actorSource: 'runtime',
+      autoDeliver: true,
+      promptText: activePromptText,
+    })
+    : null;
+  if (managedArtifactOutcome?.ok) {
+    const reconciledText = buildManagedArtifactResponseText(managedArtifactOutcome, stringifyTextContent(payload?.choices?.[0]?.message?.content ?? ''));
+    if (reconciledText && Array.isArray(payload?.choices) && payload.choices.length > 0) {
+      payload.choices = payload.choices.map((choice, index) => (index === 0 ? {
+        ...choice,
+        message: {
+          ...(choice?.message || {}),
+          content: reconciledText,
+        },
+      } : choice));
+    }
+  }
   return {
     payload: normalizeChatCompletionResponse(payload, responseAlias),
     usage,
+    requestBody,
   };
 }
 
@@ -13119,6 +13660,7 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
     ? await materializeVerifiedArtifactForExecution(billing.execution_id, assistantText, {
       requestId: billing.request_id,
       actorSource: 'runtime',
+      autoDeliver: true,
     })
     : null;
   if (managedArtifactVerificationOutcome?.required && !managedArtifactVerificationOutcome.ok) {
@@ -13187,6 +13729,7 @@ async function attemptLocalNonStreamRetry(req, res, session, descriptor, billing
       ? await materializeVerifiedArtifactForExecution(billing.execution_id, assistantText, {
         requestId: billing.request_id,
         actorSource: 'runtime',
+        autoDeliver: true,
       })
       : null);
   if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
@@ -13454,6 +13997,8 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
       ? await materializeVerifiedArtifactForExecution(billing.execution_id, state.text, {
         requestId: billing.request_id,
         actorSource: 'runtime',
+        autoDeliver: true,
+        promptText: extractManagedRequestPromptText(retryOptions.originalBody || req.body || {}),
       })
       : null;
     if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
@@ -13468,6 +14013,12 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         errorCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
         notes: managedArtifactOutcome.reason || 'artifact_output_invalid',
       };
+    }
+    if (managedArtifactOutcome?.ok) {
+      const reconciledText = buildManagedArtifactResponseText(managedArtifactOutcome, state.text);
+      if (reconciledText) {
+        state.text = reconciledText;
+      }
     }
     if (billing.execution_id && state.meaningfulOutputStarted) {
       const artifactError = await validateArtifactHonestyOrError(retryOptions.originalBody || req.body, state.text, {
@@ -13800,10 +14351,11 @@ function proxyStreamingChat(req, res, session, descriptor, upstream, upstreamCon
         {
           requestId: billing.request_id,
           actorSource: 'runtime',
+          promptText: extractManagedRequestPromptText(retryOptions.originalBody || req.body || {}),
         }
       );
       if (terminalRecoveryArtifactOutcome?.ok) {
-        state.text = terminalRecoveryArtifactOutcome.successText || state.text;
+        state.text = buildManagedArtifactResponseText(terminalRecoveryArtifactOutcome, state.text);
       }
     }
 
@@ -14009,6 +14561,8 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
       ? await materializeVerifiedArtifactForExecution(billing.execution_id, state.text, {
         requestId: billing.request_id,
         actorSource: 'runtime',
+        autoDeliver: true,
+        promptText: extractManagedRequestPromptText(retryOptions.originalBody || req.body || {}),
       })
       : null;
     if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
@@ -14023,6 +14577,12 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         errorCode: managedArtifactOutcome.reason || 'artifact_output_invalid',
         notes: managedArtifactOutcome.reason || 'artifact_output_invalid',
       };
+    }
+    if (managedArtifactOutcome?.ok) {
+      const reconciledText = buildManagedArtifactResponseText(managedArtifactOutcome, state.text);
+      if (reconciledText) {
+        state.text = reconciledText;
+      }
     }
     if (billing.execution_id && state.meaningfulOutputStarted) {
       const artifactError = await validateArtifactHonestyOrError(retryOptions.originalBody || req.body, state.text, {
@@ -14369,10 +14929,11 @@ function proxyStreamingResponses(req, res, session, descriptor, upstream, upstre
         {
           requestId: billing.request_id,
           actorSource: 'runtime',
+          promptText: extractManagedRequestPromptText(retryOptions.originalBody || req.body || {}),
         }
       );
       if (terminalRecoveryArtifactOutcome?.ok) {
-        state.text = terminalRecoveryArtifactOutcome.successText || state.text;
+        state.text = buildManagedArtifactResponseText(terminalRecoveryArtifactOutcome, state.text);
       }
     }
 
@@ -14654,7 +15215,7 @@ async function handleChatCompletion(req, res) {
     });
   }
 
-  const responseResult = await proxyNonStreamingChat(res, req.session, descriptor, upstream, billing, responseAlias);
+  const responseResult = await proxyNonStreamingChat(res, req.session, descriptor, upstream, billing, responseAlias, req.body);
   if (responseResult === undefined) {
     return undefined;
   }
@@ -14665,10 +15226,12 @@ async function handleChatCompletion(req, res) {
     ? await attemptManagedArtifactMaterializationBeforeTerminalRecovery(billing.execution_id, assistantText, {
       requestId: billing.request_id,
       actorSource: 'runtime',
+      autoDeliver: true,
+      promptText: extractManagedRequestPromptText(req.body || {}),
     })
     : null;
   if (terminalRecoveryArtifactOutcome?.ok) {
-    assistantText = terminalRecoveryArtifactOutcome.successText || assistantText;
+    assistantText = buildManagedArtifactResponseText(terminalRecoveryArtifactOutcome, assistantText);
     if (Array.isArray(responsePayload?.choices) && responsePayload.choices.length > 0) {
       responsePayload.choices = responsePayload.choices.map((choice, index) => (index === 0 ? {
         ...choice,
@@ -14683,6 +15246,7 @@ async function handleChatCompletion(req, res) {
     ? await materializeVerifiedArtifactForExecution(billing.execution_id, assistantText, {
       requestId: billing.request_id,
       actorSource: 'runtime',
+      autoDeliver: true,
     })
     : null;
   if (managedArtifactOutcome?.required && !managedArtifactOutcome.ok) {
@@ -15805,6 +16369,7 @@ module.exports = {
   getExecutionArtifactByExecutionId,
   getExecutionArtifactByArtifactId,
   getTaskArtifactAssessmentByTaskId,
+  syncTaskArtifactAssessment,
   getTaskNotificationByArtifactId,
   getToolFailureFactBySubjectId,
   materializeVerifiedArtifactForExecution,
@@ -15812,6 +16377,7 @@ module.exports = {
   updateExecutionArtifactDeliveryStatus,
   assessArtifactDeliveryEligibility,
   ensureArtifactDeliveryNotificationForExecution,
+  attemptAutomaticArtifactDeliveryForExecution,
   dispatchArtifactDeliveryById,
   assertArtifactPathWithinWorkspace,
   buildExecutionCapabilityRecord,
@@ -15827,6 +16393,15 @@ module.exports = {
   classifyExecutionBudgetFit,
   classifyContextPressure,
   summarizeTaskObjectiveFromBody,
+  extractManagedCurrentTurnText,
+  extractManagedArtifactFilenames,
+  extractManagedArtifactFilename,
+  extractManagedArtifactBulletCount,
+  extractManagedArtifactItemCount,
+  extractManagedArtifactTopic,
+  buildManagedMarkdownArtifactDraft,
+  buildManagedArtifactDraftText,
+  buildManagedArtifactResponseText,
   TASK_STATES,
   TASK_PROGRESS_CATEGORIES,
   TASK_NOTIFICATION_DELIVERY_STATES,
