@@ -8044,13 +8044,14 @@ function classifyArtifactStructure(family, content, declaredPath = '') {
     }
   }
 
-  if (lower.length >= 240 && (/\n#{1,3}\s+/m.test(text) || /\n[-*]\s+/m.test(text) || /\n\d+\.\s+/m.test(text))) {
-    return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'text_structured' };
+  const nonEmptyLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (nonEmptyLines.length >= 5 && lower.length >= 80) {
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.VALID, reason: 'text_document_structured' };
   }
-  if (lower.length >= 100) {
-    return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'text_partial' };
+  if (nonEmptyLines.length >= 3 && lower.length >= 50) {
+    return { state: TASK_ARTIFACT_STRUCTURE_STATES.PARTIAL, reason: 'text_document_partial' };
   }
-  return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'text_invalid' };
+  return { state: TASK_ARTIFACT_STRUCTURE_STATES.INVALID, reason: 'text_document_invalid' };
 }
 
 function classifyArtifactAlignment(family, objectiveText = '', content = '', completionText = '', structure = null) {
@@ -8062,7 +8063,7 @@ function classifyArtifactAlignment(family, objectiveText = '', content = '', com
     markdown: /\b(markdown|brief|summary|report|notes)\b/i.test(objectiveText),
     component: /\b(component|frontend|react|tsx|jsx|section)\b/i.test(objectiveText),
     json: /\b(json|manifest|config)\b/i.test(objectiveText),
-    text: /\b(summary|inspection|report|notes)\b/i.test(objectiveText),
+    text: /\b(summary|inspection|report|notes|note|text|workflow)\b/i.test(objectiveText),
   };
 
   const familyMatches = Boolean(familyExpectationMatches[family]) || family === 'text';
@@ -8427,7 +8428,17 @@ async function syncTaskArtifactAssessmentTx(db, executionId, options = {}) {
     notes.evidence_reason = error?.code || error?.message || 'artifact_read_failed';
   }
 
-  artifactFamily = inferArtifactFamily(objectiveText, artifact.declared_path || '', artifactContent, options.completionText || '');
+  const artifactType = String(artifact.artifact_type || '').trim().toLowerCase();
+  if (artifactType && artifactType !== 'text' && ['markdown', 'json', 'html', 'component'].includes(artifactType)) {
+    artifactFamily = artifactType;
+  } else {
+    const typeHint = inferManagedArtifactTypeFromFilename(artifact.artifact_filename || artifact.declared_path || '');
+    if (typeHint.ok) {
+      artifactFamily = typeHint.artifactType;
+    } else {
+      artifactFamily = inferArtifactFamily(objectiveText, artifact.declared_path || '', artifactContent, options.completionText || '');
+    }
+  }
   const structure = classifyArtifactStructure(artifactFamily, artifactContent, artifact.declared_path || '');
   structureState = structure.state;
   notes.structure_reason = structure.reason;
@@ -11731,7 +11742,7 @@ function extractManagedArtifactFilenames(promptText = '') {
   const text = extractManagedCurrentTurnText(promptText);
   const filenames = [];
   const seen = new Set();
-  const directPattern = /\b([A-Za-z0-9._-]+\.(?:md|markdown|txt|json|csv|yaml|yml|html|js|ts|py))\b/gi;
+  const directPattern = /\b([A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8})\b/gi;
 
   for (const match of text.matchAll(directPattern)) {
     const candidate = String(match[1] || '').trim();
@@ -11819,15 +11830,289 @@ function buildManagedAgentWorkflowBriefDraft(promptText = '', filename = '') {
   return `# ${title}\n\n${steps.map((line) => `- ${line}`).join('\n')}`;
 }
 
-function looksLikeManagedArtifactContent(content = '', filename = '') {
+function inferManagedArtifactTypeFromFilename(filename = '') {
+  const ext = String(path.extname(String(filename || '').trim()) || '').toLowerCase();
+  if (!ext) {
+    return { ok: false, reason: 'artifact_filename_missing', extension: '', artifactType: '' };
+  }
+
+  const artifactTypeByExtension = {
+    '.md': 'markdown',
+    '.markdown': 'markdown',
+    '.txt': 'text',
+    '.json': 'json',
+    '.html': 'html',
+    '.htm': 'html',
+  };
+  const artifactType = artifactTypeByExtension[ext] || '';
+  if (!artifactType) {
+    return { ok: false, reason: 'artifact_type_unsupported', extension: ext, artifactType: '' };
+  }
+
+  return { ok: true, extension: ext, artifactType };
+}
+
+function extractManagedRequestedFields(promptText = '') {
+  const text = extractManagedCurrentTurnText(promptText);
+  const clauseMatch = text.match(/\bfields?\s+for\s+(.+?)(?:[.!?]|$)/i);
+  const clause = String(clauseMatch?.[1] || '').trim();
+  if (!clause) {
+    return [];
+  }
+
+  return clause
+    .split(/,| and | or /i)
+    .map((part) => part.trim())
+    .map((part) => part.replace(/^[\s"'`([{]+|[\s"'`.,;:)\]}]+$/g, ''))
+    .filter((part) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(part))
+    .filter((part, index, list) => list.indexOf(part) === index);
+}
+
+function escapeManagedHtml(text = '') {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildManagedTextArtifactDraft(promptText = '', filename = '') {
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const promptLower = currentTurnText.toLowerCase();
+  const noteCountMatch = currentTurnText.match(/\b(\d{1,2})\s*(?:short\s+)?notes?\b/i);
+  const noteCount = Math.max(
+    1,
+    Number(noteCountMatch?.[1] || 0) || extractManagedArtifactBulletCount(currentTurnText)
+  );
+  const topic = extractManagedArtifactTopic(currentTurnText) || 'agent coordination';
+  const topicSubject = topic.replace(/\s+/g, ' ').trim() || 'agent coordination';
+  const subjectLine = topicSubject.charAt(0).toUpperCase() + topicSubject.slice(1);
+
+  let notes = [
+    `${subjectLine} starts with a clear plan so every step knows what it owns.`,
+    'The Context step keeps the current turn bound and avoids stale history.',
+    'The Writer step turns the active prompt into the requested artifact.',
+    'The Verifier step checks structure, alignment, and confidence before delivery.',
+    'The Delivery step sends the verified file through the relay and records proof separately.',
+    'Progress is easier to trust when each step leaves a durable record.',
+  ];
+
+  if (/\bagent workflow\b/.test(promptLower) || /\bplanner\b/.test(promptLower) || /\bverifier\b/.test(promptLower)) {
+    notes = [
+      'Planner locks the sequence before any file is written.',
+      'Context keeps the run tied to the current user turn.',
+      'Writer creates the requested artifact for the active turn.',
+      'Verifier checks the file before it can be delivered.',
+      'Delivery sends the verified file through the relay with proof.',
+      'Each step stays observable so recovery stays honest.',
+    ];
+  }
+
+  while (notes.length < noteCount) {
+    notes.push('BlockFork keeps the workflow steady by recording what happened.');
+  }
+
+  return notes.slice(0, noteCount).map((line, index) => `${index + 1}. ${line}`).join('\n');
+}
+
+function buildManagedJsonArtifactDraft(promptText = '', filename = '') {
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const promptLower = currentTurnText.toLowerCase();
+  const title = humanizeManagedArtifactTitle(filename) || 'BlockFork Agent Schema';
+  const requestedFields = extractManagedRequestedFields(currentTurnText);
+  const defaultFields = [
+    'agent_run_id',
+    'step_index',
+    'role',
+    'status',
+    'input',
+    'output',
+    'evidence',
+    'artifact_id',
+    'delivery_attempt_id',
+  ];
+  const fields = (requestedFields.length ? requestedFields : defaultFields).map((name, index) => ({
+    name,
+    type: /_id$/.test(name) ? 'string' : (/^(step_index|retry_count)$/.test(name) ? 'integer' : 'string'),
+    required: true,
+    description: /agent_run_id/.test(name)
+      ? 'Parent agent run identifier'
+      : /step_index/.test(name)
+        ? 'Ordered position of the step inside the run'
+        : /role/.test(name)
+          ? 'Logical sub-agent role'
+          : /status/.test(name)
+            ? 'Current lifecycle state'
+            : /input/.test(name)
+              ? 'Step input evidence'
+              : /output/.test(name)
+                ? 'Step output evidence'
+                : /evidence/.test(name)
+                  ? 'Proof recorded for the step'
+                  : /artifact_id/.test(name)
+                    ? 'Linked artifact identifier'
+                    : /delivery_attempt_id/.test(name)
+                      ? 'Linked delivery attempt identifier'
+                      : `Requested field ${index + 1}`,
+  }));
+
+  const stepRoles = ['planner', 'context', 'writer', 'verifier', 'delivery'];
+  const stepObjects = stepRoles.map((role, index) => ({
+    step_index: index + 1,
+    role,
+    status: 'completed',
+    input: `${role} input`,
+    output: `${role} output`,
+    evidence: `${role} evidence`,
+  }));
+
+  const payload = {
+    title,
+    description: promptLower.includes('agent workflow')
+      ? 'A durable JSON schema for an agent workflow run with sequential steps.'
+      : 'A JSON schema for a BlockFork artifact runtime output.',
+    artifact_type: 'json',
+    fields,
+    ordered_steps: stepObjects,
+    workflow: {
+      sequential: true,
+      step_roles: stepRoles,
+      current_turn_bound: true,
+      verification_before_delivery: true,
+    },
+  };
+
+  return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+function buildManagedHtmlArtifactDraft(promptText = '', filename = '') {
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const promptLower = currentTurnText.toLowerCase();
+  const title = humanizeManagedArtifactTitle(filename) || 'BlockFork Agent Runtime';
+  const heroTitle = promptLower.includes('agent workflow')
+    ? 'Verified Agent Workflow Runtime'
+    : 'BlockFork Artifact Runtime';
+  const intro = promptLower.includes('agent workflow')
+    ? 'Planner, Context, Writer, Verifier, and Delivery steps work together in a durable sequential run.'
+    : 'BlockFork turns requests into verified artifacts and delivers them with proof.';
+
+  const cards = [
+    {
+      title: 'Planner',
+      body: 'Locks the goal into a durable step plan before work starts.',
+    },
+    {
+      title: 'Verifier',
+      body: 'Checks structure, alignment, and confidence before delivery.',
+    },
+    {
+      title: 'Delivery',
+      body: 'Sends the verified file through the relay and records proof.',
+    },
+  ];
+
+  const cardMarkup = cards.map((card) => `
+        <article class="card">
+          <h3>${escapeManagedHtml(card.title)}</h3>
+          <p>${escapeManagedHtml(card.body)}</p>
+        </article>`).join('');
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeManagedHtml(title)}</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font-family: Arial, Helvetica, sans-serif; background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%); color: #102030; }
+    main { max-width: 1080px; margin: 0 auto; padding: 56px 24px 72px; }
+    .hero { padding: 40px; border-radius: 28px; background: #102030; color: #f7fbff; box-shadow: 0 20px 60px rgba(16, 32, 48, 0.16); }
+    .hero h1 { margin: 0 0 12px; font-size: clamp(2rem, 5vw, 3.75rem); line-height: 1.05; }
+    .hero p { margin: 0; max-width: 700px; font-size: 1.08rem; line-height: 1.7; color: rgba(247, 251, 255, 0.9); }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-top: 24px; }
+    .card { background: rgba(255, 255, 255, 0.95); border-radius: 22px; padding: 22px; border: 1px solid rgba(16, 32, 48, 0.08); box-shadow: 0 10px 30px rgba(16, 32, 48, 0.08); }
+    .card h3 { margin: 0 0 10px; font-size: 1.1rem; }
+    .card p { margin: 0; line-height: 1.65; color: #304050; }
+    .cta { margin-top: 24px; padding: 24px 28px; border-radius: 22px; background: linear-gradient(90deg, #265dff 0%, #1d8cf8 100%); color: #fff; }
+    .cta a { color: #fff; text-decoration: none; font-weight: 700; }
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: 1fr; }
+      .hero { padding: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>${escapeManagedHtml(heroTitle)}</h1>
+      <p>${escapeManagedHtml(intro)}</p>
+    </section>
+
+    <section class="grid" aria-label="features">${cardMarkup}
+    </section>
+
+    <section class="cta">
+      <p><strong>Next step:</strong> <a href="#top">Keep the artifact verified, delivered, and fully auditable.</a></p>
+    </section>
+  </main>
+</body>
+</html>
+`;
+}
+
+function buildManagedArtifactDraftForType(promptText = '', filename = '', artifactType = '', completionText = '') {
+  const currentTurnText = extractManagedCurrentTurnText(promptText);
+  const assistantText = String(completionText || '').trim();
+  const normalizedType = String(artifactType || '').trim().toLowerCase();
+  if (assistantText && looksLikeManagedArtifactContent(assistantText, filename, normalizedType)) {
+    return assistantText;
+  }
+
+  if (normalizedType === 'json') {
+    return buildManagedJsonArtifactDraft(currentTurnText, filename);
+  }
+
+  if (normalizedType === 'html') {
+    return buildManagedHtmlArtifactDraft(currentTurnText, filename);
+  }
+
+  if (normalizedType === 'text') {
+    return buildManagedTextArtifactDraft(currentTurnText, filename);
+  }
+
+  return buildManagedMarkdownArtifactDraft(currentTurnText, filename);
+}
+
+function looksLikeManagedArtifactContent(content = '', filename = '', artifactType = '') {
   const text = normalizeArtifactTextSample(content).trim();
   if (!text) {
     return false;
   }
 
+  const detectedType = String(artifactType || inferArtifactFamily('', filename, text, text) || '').trim().toLowerCase();
   const lower = text.toLowerCase();
   if (/\bi'?ve got the request\b/i.test(lower) || /\bi'?ll write up that summary\b/i.test(lower) || /\bgot the request\b/i.test(lower)) {
     return false;
+  }
+
+  if (detectedType === 'json') {
+    try {
+      const parsed = JSON.parse(text);
+      return Boolean(parsed && typeof parsed === 'object' && (Array.isArray(parsed) ? parsed.length > 0 : Object.keys(parsed).length > 0));
+    } catch (error) {
+      return false;
+    }
+  }
+
+  if (detectedType === 'html') {
+    return /<!doctype html/i.test(text) && /<html[\s>]/i.test(text) && /<head[\s>]/i.test(text) && /<body[\s>]/i.test(text);
+  }
+
+  if (detectedType === 'text') {
+    const nonEmptyLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return nonEmptyLines.length >= 3 && text.length >= 60;
   }
 
   const headingSignals = countMatches([
@@ -11928,14 +12213,18 @@ function buildManagedArtifactDraftText(promptText = '', completionText = '', opt
   const currentTurnText = extractManagedCurrentTurnText(promptText);
   const filename = String(options.filename || extractManagedArtifactFilename(currentTurnText) || '').trim();
   const assistantText = String(options.assistantText || completionText || '').trim();
-  if (looksLikeManagedArtifactContent(assistantText, filename)) {
+  const requestedType = inferManagedArtifactTypeFromFilename(filename);
+  if (looksLikeManagedArtifactContent(assistantText, filename, requestedType.ok ? requestedType.artifactType : '')) {
     return assistantText;
   }
 
+  if (requestedType.ok) {
+    return buildManagedArtifactDraftForType(currentTurnText, filename, requestedType.artifactType, assistantText);
+  }
+
   const promptLower = String(currentTurnText || '').toLowerCase();
-  const wantsMarkdown = /\.md(markdown)?$/i.test(filename)
-    || /\bmarkdown\b/.test(promptLower)
-    || /\b(summary|report|notes)\b/.test(promptLower);
+  const wantsMarkdown = /\bmarkdown\b/.test(promptLower)
+    || /\b(summary|report|notes|brief)\b/.test(promptLower);
 
   if (wantsMarkdown) {
     return buildManagedMarkdownArtifactDraft(promptText, filename);
@@ -12040,7 +12329,10 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: 'artifact_multiple_requests_unsupported',
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: 'artifact_multiple_requests_unsupported' }
+      ),
     };
   }
 
@@ -12051,7 +12343,23 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: sanitizedFilename.reason,
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: sanitizedFilename.reason, filename: rawFilename }
+      ),
+    };
+  }
+
+  const typeInfo = inferManagedArtifactTypeFromFilename(sanitizedFilename.filename);
+  if (!typeInfo.ok) {
+    return {
+      required: true,
+      ok: false,
+      reason: typeInfo.reason || 'artifact_type_unsupported',
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: typeInfo.reason || 'artifact_type_unsupported', filename: sanitizedFilename.filename }
+      ),
     };
   }
 
@@ -12061,6 +12369,7 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
   const draftedArtifactContent = buildManagedArtifactDraftText(promptText, completionText, {
     filename: sanitizedFilename.filename,
     assistantText: completionText,
+    artifactType: typeInfo.artifactType,
   });
   const content = String(
     explicitArtifactContent !== null
@@ -12072,7 +12381,10 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: 'artifact_output_invalid',
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: 'artifact_output_invalid', filename: sanitizedFilename.filename }
+      ),
     };
   }
 
@@ -12082,7 +12394,10 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: rootSelection.reason,
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: rootSelection.reason }
+      ),
     };
   }
 
@@ -12102,11 +12417,14 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: canonicalResolution.reason,
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: canonicalResolution.reason }
+      ),
     };
   }
 
-  const artifactType = inferArtifactFamily(promptText || task.objective_text || '', finalPath, content, content);
+  const artifactType = typeInfo.artifactType || inferArtifactFamily(promptText || task.objective_text || '', finalPath, content, content);
   const byteSize = Buffer.byteLength(content, 'utf8');
   const contentHash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
   const fileWrite = writeTextFileAtomically(canonicalResolution.canonical_path, content);
@@ -12115,7 +12433,10 @@ async function materializeVerifiedArtifactForExecution(executionId, completionTe
       required: true,
       ok: false,
       reason: fileWrite.reason || 'artifact_output_invalid',
-      fallbackText: buildManagedTerminalFallbackText({ messages: [{ role: 'user', content: promptText || task.objective_text || '' }] }),
+      fallbackText: buildManagedTerminalFallbackText(
+        { messages: [{ role: 'user', content: promptText || task.objective_text || '' }] },
+        { reason: fileWrite.reason || 'artifact_output_invalid', filename: sanitizedFilename.filename }
+      ),
     };
   }
 
@@ -12620,11 +12941,23 @@ function shouldBuildManagedArtifactFallbackText(promptText = '') {
 
 function buildManagedTerminalFallbackText(reqBody = {}, options = {}) {
   const promptText = extractManagedRequestPromptText(reqBody);
+  const reason = String(options.reason || '').trim();
+  const requestedFilename = extractManagedArtifactFilename(promptText);
+
+  if (reason === 'artifact_type_unsupported') {
+    const supportedTypes = '.md, .txt, .json, and .html';
+    const filenameText = requestedFilename ? ` ${requestedFilename}` : ' this file';
+    return `I can’t create${filenameText} yet. Supported file types are ${supportedTypes}.`;
+  }
+
+  if (reason === 'artifact_multiple_requests_unsupported') {
+    return 'I can only handle one file per request right now. Please send one filename at a time.';
+  }
+
   if (!shouldBuildManagedArtifactFallbackText(promptText)) {
     return '';
   }
 
-  const requestedFilename = extractManagedArtifactFilename(promptText);
   const fallbackFilename = requestedFilename || 'requested-file.md';
   const fallbackTitle = fallbackFilename.replace(/\.(md|markdown)$/i, '') || 'requested-file';
   const introText = String(options.introText || '').trim() || `I couldn't verify creation of ${fallbackFilename}, but here is a markdown draft you can save manually:`;

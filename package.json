@@ -49,6 +49,7 @@
     "task:verify:artifact-materialization-before-terminal-recovery": "bash scripts/verify-artifact-materialization-before-terminal-recovery.sh",
     "task:verify:artifact-response-reconciliation-and-recovery-ordering": "bash scripts/verify-artifact-response-reconciliation-and-recovery-ordering.sh",
     "task:verify:agent-run-and-sequential-step-runtime": "bash scripts/verify-agent-run-and-sequential-step-runtime.sh",
+    "task:verify:multi-type-artifact-runtime": "bash scripts/verify-multi-type-artifact-runtime.sh",
     "task:verify:current-turn-artifact-binding": "bash scripts/verify-current-turn-artifact-binding.sh",
     "task:verify:automatic-artifact-delivery-on-completion": "bash scripts/verify-automatic-artifact-delivery-on-completion.sh",
     "task:verify:inline-automatic-artifact-delivery-drain": "bash scripts/verify-inline-automatic-artifact-delivery-drain.sh",
